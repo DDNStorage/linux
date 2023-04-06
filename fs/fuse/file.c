@@ -2952,6 +2952,7 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 
 	if (io->async) {
 		bool blocking = io->blocking;
+		const bool is_ring = ff->fm->fc->ring.ready;
 
 		fuse_aio_complete(io, ret < 0 ? ret : 0, -1);
 
@@ -2959,7 +2960,13 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 		if (!blocking)
 			return -EIOCBQUEUED;
 
+		/* XXX Fix the scheduler / wait_for_completion()
+		 * Without the ring might be a negative impact */
+		if (is_ring)
+			migrate_disable();
 		wait_for_completion(&wait);
+		if (is_ring)
+			migrate_enable();
 		ret = fuse_get_res_by_io(io);
 	}
 
