@@ -211,7 +211,7 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		 (flags & (LOOKUP_EXCL | LOOKUP_REVAL))) {
 		struct fuse_entry_out outarg;
 		FUSE_ARGS(args);
-		struct fuse_forget_link *forget;
+		struct redfs_forget_link *forget;
 		u64 attr_version;
 
 		/* For negative dentries, always do a fresh lookup */
@@ -365,7 +365,7 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
 {
 	struct fuse_mount *fm = get_fuse_mount_super(sb);
 	FUSE_ARGS(args);
-	struct fuse_forget_link *forget;
+	struct redfs_forget_link *forget;
 	u64 attr_version;
 	int err;
 
@@ -529,7 +529,7 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	struct inode *inode;
 	struct fuse_mount *fm = get_fuse_mount(dir);
 	FUSE_ARGS(args);
-	struct fuse_forget_link *forget;
+	struct redfs_forget_link *forget;
 	struct fuse_create_in inarg;
 	struct fuse_open_out outopen;
 	struct fuse_entry_out outentry;
@@ -607,7 +607,7 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 			  &outentry.attr, entry_attr_timeout(&outentry), 0);
 	if (!inode) {
 		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
-		fuse_sync_release(NULL, ff, flags);
+		redfs_sync_release(NULL, ff, flags);
 		fuse_queue_forget(fm->fc, forget, outentry.nodeid, 1);
 		err = -ENOMEM;
 		goto out_err;
@@ -619,7 +619,7 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	err = finish_open(file, entry, generic_file_open);
 	if (err) {
 		fi = get_fuse_inode(inode);
-		fuse_sync_release(fi, ff, flags);
+		redfs_sync_release(fi, ff, flags);
 	} else {
 		file->private_data = ff;
 		fuse_finish_open(inode, file);
@@ -693,7 +693,7 @@ static int create_new_entry(struct fuse_mount *fm, struct fuse_args *args,
 	struct inode *inode;
 	struct dentry *d;
 	int err;
-	struct fuse_forget_link *forget;
+	struct redfs_forget_link *forget;
 	void *security_ctx = NULL;
 	u32 security_ctxlen;
 

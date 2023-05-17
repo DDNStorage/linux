@@ -26,7 +26,7 @@ static struct fuse_conn *fuse_ctl_file_conn_get(struct file *file)
 	mutex_lock(&fuse_mutex);
 	fc = file_inode(file)->i_private;
 	if (fc)
-		fc = fuse_conn_get(fc);
+		fc = redfs_conn_get(fc);
 	mutex_unlock(&fuse_mutex);
 	return fc;
 }
@@ -38,8 +38,8 @@ static ssize_t fuse_conn_abort_write(struct file *file, const char __user *buf,
 	if (fc) {
 		if (fc->abort_err)
 			fc->aborted = true;
-		fuse_abort_conn(fc);
-		fuse_conn_put(fc);
+		redfs_abort_conn(fc);
+		redfs_conn_put(fc);
 	}
 	return count;
 }
@@ -58,7 +58,7 @@ static ssize_t fuse_conn_waiting_read(struct file *file, char __user *buf,
 
 		value = atomic_read(&fc->num_waiting);
 		file->private_data = (void *)value;
-		fuse_conn_put(fc);
+		redfs_conn_put(fc);
 	}
 	size = sprintf(tmp, "%ld\n", (long)file->private_data);
 	return simple_read_from_buffer(buf, len, ppos, tmp, size);
@@ -111,7 +111,7 @@ static ssize_t fuse_conn_max_background_read(struct file *file,
 		return 0;
 
 	val = READ_ONCE(fc->max_background);
-	fuse_conn_put(fc);
+	redfs_conn_put(fc);
 
 	return fuse_conn_limit_read(file, buf, len, ppos, val);
 }
@@ -134,7 +134,7 @@ static ssize_t fuse_conn_max_background_write(struct file *file,
 			if (!fc->blocked)
 				wake_up(&fc->blocked_waitq);
 			spin_unlock(&fc->bg_lock);
-			fuse_conn_put(fc);
+			redfs_conn_put(fc);
 		}
 	}
 
@@ -153,7 +153,7 @@ static ssize_t fuse_conn_congestion_threshold_read(struct file *file,
 		return 0;
 
 	val = READ_ONCE(fc->congestion_threshold);
-	fuse_conn_put(fc);
+	redfs_conn_put(fc);
 
 	return fuse_conn_limit_read(file, buf, len, ppos, val);
 }
@@ -179,7 +179,7 @@ static ssize_t fuse_conn_congestion_threshold_write(struct file *file,
 	fc->congestion_threshold = val;
 	spin_unlock(&fc->bg_lock);
 	up_read(&fc->killsb);
-	fuse_conn_put(fc);
+	redfs_conn_put(fc);
 out:
 	return ret;
 }

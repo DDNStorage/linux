@@ -63,9 +63,9 @@ MODULE_PARM_DESC(max_user_congthresh,
 static struct file_system_type fuseblk_fs_type;
 #endif
 
-struct fuse_forget_link *fuse_alloc_forget(void)
+struct redfs_forget_link *fuse_alloc_forget(void)
 {
-	return kzalloc(sizeof(struct fuse_forget_link), GFP_KERNEL_ACCOUNT);
+	return kzalloc(sizeof(struct redfs_forget_link), GFP_KERNEL_ACCOUNT);
 }
 
 static struct inode *fuse_alloc_inode(struct super_block *sb)
@@ -477,7 +477,7 @@ static void fuse_umount_begin(struct super_block *sb)
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
 
 	if (!fc->no_force_umount)
-		fuse_abort_conn(fc);
+		redfs_abort_conn(fc);
 }
 
 static void fuse_send_destroy(struct fuse_mount *fm)
@@ -806,9 +806,9 @@ static void fuse_pqueue_init(struct fuse_pqueue *fpq)
 	fpq->connected = 1;
 }
 
-void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
-		    struct user_namespace *user_ns,
-		    const struct fuse_iqueue_ops *fiq_ops, void *fiq_priv)
+void redfs_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
+		     struct user_namespace *user_ns,
+		     const struct fuse_iqueue_ops *fiq_ops, void *fiq_priv)
 {
 	memset(fc, 0, sizeof(*fc));
 	spin_lock_init(&fc->lock);
@@ -840,9 +840,9 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	list_add(&fm->fc_entry, &fc->mounts);
 	fm->fc = fc;
 }
-EXPORT_SYMBOL_GPL(fuse_conn_init);
+EXPORT_SYMBOL_GPL(redfs_conn_init);
 
-void fuse_conn_put(struct fuse_conn *fc)
+void redfs_conn_put(struct fuse_conn *fc)
 {
 	if (refcount_dec_and_test(&fc->count)) {
 		struct fuse_iqueue *fiq = &fc->iq;
@@ -862,14 +862,14 @@ void fuse_conn_put(struct fuse_conn *fc)
 		fc->release(fc);
 	}
 }
-EXPORT_SYMBOL_GPL(fuse_conn_put);
+EXPORT_SYMBOL_GPL(redfs_conn_put);
 
-struct fuse_conn *fuse_conn_get(struct fuse_conn *fc)
+struct fuse_conn *redfs_conn_get(struct fuse_conn *fc)
 {
 	refcount_inc(&fc->count);
 	return fc;
 }
-EXPORT_SYMBOL_GPL(fuse_conn_get);
+EXPORT_SYMBOL_GPL(redfs_conn_get);
 
 static struct inode *fuse_get_root_inode(struct super_block *sb, unsigned mode)
 {
@@ -1213,7 +1213,7 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 	wake_up_all(&fc->blocked_waitq);
 }
 
-void fuse_send_init(struct fuse_mount *fm)
+void redfs_send_init(struct fuse_mount *fm)
 {
 	struct fuse_init_args *ia;
 	u64 flags;
@@ -1262,17 +1262,17 @@ void fuse_send_init(struct fuse_mount *fm)
 	ia->args.nocreds = true;
 	ia->args.end = process_init_reply;
 
-	if (fuse_simple_background(fm, &ia->args, GFP_KERNEL) != 0)
+	if (redfs_simple_background(fm, &ia->args, GFP_KERNEL) != 0)
 		process_init_reply(fm, &ia->args, -ENOTCONN);
 }
-EXPORT_SYMBOL_GPL(fuse_send_init);
+EXPORT_SYMBOL_GPL(redfs_send_init);
 
-void fuse_free_conn(struct fuse_conn *fc)
+void redfs_free_conn(struct fuse_conn *fc)
 {
 	WARN_ON(!list_empty(&fc->devices));
 	kfree_rcu(fc, rcu);
 }
-EXPORT_SYMBOL_GPL(fuse_free_conn);
+EXPORT_SYMBOL_GPL(redfs_free_conn);
 
 static int fuse_bdi_init(struct fuse_conn *fc, struct super_block *sb)
 {
@@ -1314,7 +1314,7 @@ static int fuse_bdi_init(struct fuse_conn *fc, struct super_block *sb)
 	return 0;
 }
 
-struct fuse_dev *fuse_dev_alloc(void)
+struct fuse_dev *redfs_dev_alloc(void)
 {
 	struct fuse_dev *fud;
 	struct list_head *pq;
@@ -1334,31 +1334,31 @@ struct fuse_dev *fuse_dev_alloc(void)
 
 	return fud;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_alloc);
+EXPORT_SYMBOL_GPL(redfs_dev_alloc);
 
-void fuse_dev_install(struct fuse_dev *fud, struct fuse_conn *fc)
+void redfs_dev_install(struct fuse_dev *fud, struct fuse_conn *fc)
 {
-	fud->fc = fuse_conn_get(fc);
+	fud->fc = redfs_conn_get(fc);
 	spin_lock(&fc->lock);
 	list_add_tail(&fud->entry, &fc->devices);
 	spin_unlock(&fc->lock);
 }
-EXPORT_SYMBOL_GPL(fuse_dev_install);
+EXPORT_SYMBOL_GPL(redfs_dev_install);
 
-struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc)
+struct fuse_dev *redfs_dev_alloc_install(struct fuse_conn *fc)
 {
 	struct fuse_dev *fud;
 
-	fud = fuse_dev_alloc();
+	fud = redfs_dev_alloc();
 	if (!fud)
 		return NULL;
 
-	fuse_dev_install(fud, fc);
+	redfs_dev_install(fud, fc);
 	return fud;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_alloc_install);
+EXPORT_SYMBOL_GPL(redfs_dev_alloc_install);
 
-void fuse_dev_free(struct fuse_dev *fud)
+void redfs_dev_free(struct fuse_dev *fud)
 {
 	struct fuse_conn *fc = fud->fc;
 
@@ -1367,12 +1367,12 @@ void fuse_dev_free(struct fuse_dev *fud)
 		list_del(&fud->entry);
 		spin_unlock(&fc->lock);
 
-		fuse_conn_put(fc);
+		redfs_conn_put(fc);
 	}
 	kfree(fud->pq.processing);
 	kfree(fud);
 }
-EXPORT_SYMBOL_GPL(fuse_dev_free);
+EXPORT_SYMBOL_GPL(redfs_dev_free);
 
 static void fuse_fill_attr_from_inode(struct fuse_attr *attr,
 				      const struct fuse_inode *fi)
@@ -1468,11 +1468,11 @@ static int fuse_get_tree_submount(struct fs_context *fsc)
 	if (!fm)
 		return -ENOMEM;
 
-	fm->fc = fuse_conn_get(fc);
+	fm->fc = redfs_conn_get(fc);
 	fsc->s_fs_info = fm;
 	sb = sget_fc(fsc, NULL, set_anon_super_fc);
 	if (fsc->s_fs_info)
-		fuse_mount_destroy(fm);
+		redfs_mount_destroy(fm);
 	if (IS_ERR(sb))
 		return PTR_ERR(sb);
 
@@ -1497,14 +1497,14 @@ static const struct fs_context_operations fuse_context_submount_ops = {
 	.get_tree	= fuse_get_tree_submount,
 };
 
-int fuse_init_fs_context_submount(struct fs_context *fsc)
+int redfs_init_fs_context_submount(struct fs_context *fsc)
 {
 	fsc->ops = &fuse_context_submount_ops;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(fuse_init_fs_context_submount);
+EXPORT_SYMBOL_GPL(redfs_init_fs_context_submount);
 
-int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
+int redfs_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
 {
 	struct fuse_dev *fud = NULL;
 	struct fuse_mount *fm = get_fuse_mount_super(sb);
@@ -1541,7 +1541,7 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
 
 	if (ctx->fudptr) {
 		err = -ENOMEM;
-		fud = fuse_dev_alloc_install(fc);
+		fud = redfs_dev_alloc_install(fc);
 		if (!fud)
 			goto err_free_dax;
 	}
@@ -1597,14 +1597,14 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
 	dput(root_dentry);
  err_dev_free:
 	if (fud)
-		fuse_dev_free(fud);
+		redfs_dev_free(fud);
  err_free_dax:
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_conn_free(fc);
  err:
 	return err;
 }
-EXPORT_SYMBOL_GPL(fuse_fill_super_common);
+EXPORT_SYMBOL_GPL(redfs_fill_super_common);
 
 static int fuse_fill_super(struct super_block *sb, struct fs_context *fsc)
 {
@@ -1619,17 +1619,17 @@ static int fuse_fill_super(struct super_block *sb, struct fs_context *fsc)
 	 * Require mount to happen from the same user namespace which
 	 * opened /dev/fuse to prevent potential attacks.
 	 */
-	if ((ctx->file->f_op != &fuse_dev_operations) ||
+	if ((ctx->file->f_op != &redfs_dev_operations) ||
 	    (ctx->file->f_cred->user_ns != sb->s_user_ns))
 		return -EINVAL;
 	ctx->fudptr = &ctx->file->private_data;
 
-	err = fuse_fill_super_common(sb, ctx);
+	err = redfs_fill_super_common(sb, ctx);
 	if (err)
 		return err;
 	/* file->private_data shall be visible on all CPUs after this */
 	smp_mb();
-	fuse_send_init(get_fuse_mount_super(sb));
+	redfs_send_init(get_fuse_mount_super(sb));
 	return 0;
 }
 
@@ -1667,8 +1667,8 @@ static int fuse_get_tree(struct fs_context *fsc)
 		return -ENOMEM;
 	}
 
-	fuse_conn_init(fc, fm, fsc->user_ns, &fuse_dev_fiq_ops, NULL);
-	fc->release = fuse_free_conn;
+	redfs_conn_init(fc, fm, fsc->user_ns, &redfs_dev_fiq_ops, NULL);
+	fc->release = redfs_free_conn;
 
 	fsc->s_fs_info = fm;
 
@@ -1692,7 +1692,7 @@ static int fuse_get_tree(struct fs_context *fsc)
 	 * connection
 	 */
 	fud = READ_ONCE(ctx->file->private_data);
-	if (ctx->file->f_op == &fuse_dev_operations && fud) {
+	if (ctx->file->f_op == &redfs_dev_operations && fud) {
 		fsc->sget_key = fud->fc;
 		sb = sget_fc(fsc, fuse_test_super, fuse_set_no_super);
 		err = PTR_ERR_OR_ZERO(sb);
@@ -1703,7 +1703,7 @@ static int fuse_get_tree(struct fs_context *fsc)
 	}
 out:
 	if (fsc->s_fs_info)
-		fuse_mount_destroy(fm);
+		redfs_mount_destroy(fm);
 	if (ctx->file)
 		fput(ctx->file);
 	return err;
@@ -1743,7 +1743,7 @@ static int fuse_init_fs_context(struct fs_context *fsc)
 	return 0;
 }
 
-bool fuse_mount_remove(struct fuse_mount *fm)
+bool redfs_mount_remove(struct fuse_mount *fm)
 {
 	struct fuse_conn *fc = fm->fc;
 	bool last = false;
@@ -1756,16 +1756,16 @@ bool fuse_mount_remove(struct fuse_mount *fm)
 
 	return last;
 }
-EXPORT_SYMBOL_GPL(fuse_mount_remove);
+EXPORT_SYMBOL_GPL(redfs_mount_remove);
 
-void fuse_conn_destroy(struct fuse_mount *fm)
+void redfs_conn_destroy(struct fuse_mount *fm)
 {
 	struct fuse_conn *fc = fm->fc;
 
 	if (fc->destroy)
 		fuse_send_destroy(fm);
 
-	fuse_abort_conn(fc);
+	redfs_abort_conn(fc);
 	fuse_wait_aborted(fc);
 
 	if (!list_empty(&fc->entry)) {
@@ -1775,7 +1775,7 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 		mutex_unlock(&fuse_mutex);
 	}
 }
-EXPORT_SYMBOL_GPL(fuse_conn_destroy);
+EXPORT_SYMBOL_GPL(redfs_conn_destroy);
 
 static void fuse_sb_destroy(struct super_block *sb)
 {
@@ -1783,24 +1783,24 @@ static void fuse_sb_destroy(struct super_block *sb)
 	bool last;
 
 	if (sb->s_root) {
-		last = fuse_mount_remove(fm);
+		last = redfs_mount_remove(fm);
 		if (last)
-			fuse_conn_destroy(fm);
+			redfs_conn_destroy(fm);
 	}
 }
 
-void fuse_mount_destroy(struct fuse_mount *fm)
+void redfs_mount_destroy(struct fuse_mount *fm)
 {
-	fuse_conn_put(fm->fc);
+	redfs_conn_put(fm->fc);
 	kfree(fm);
 }
-EXPORT_SYMBOL(fuse_mount_destroy);
+EXPORT_SYMBOL(redfs_mount_destroy);
 
 static void fuse_kill_sb_anon(struct super_block *sb)
 {
 	fuse_sb_destroy(sb);
 	kill_anon_super(sb);
-	fuse_mount_destroy(get_fuse_mount_super(sb));
+	redfs_mount_destroy(get_fuse_mount_super(sb));
 }
 
 static struct file_system_type fuse_fs_type = {
@@ -1818,7 +1818,7 @@ static void fuse_kill_sb_blk(struct super_block *sb)
 {
 	fuse_sb_destroy(sb);
 	kill_block_super(sb);
-	fuse_mount_destroy(get_fuse_mount_super(sb));
+	redfs_mount_destroy(get_fuse_mount_super(sb));
 }
 
 static struct file_system_type fuseblk_fs_type = {

@@ -297,7 +297,7 @@ static void virtio_fs_free_devs(struct virtio_fs *fs)
 		if (!fsvq->fud)
 			continue;
 
-		fuse_dev_free(fsvq->fud);
+		redfs_dev_free(fsvq->fud);
 		fsvq->fud = NULL;
 	}
 }
@@ -368,7 +368,7 @@ static void virtio_fs_request_dispatch_work(struct work_struct *work)
 
 		list_del_init(&req->list);
 		spin_unlock(&fsvq->lock);
-		fuse_request_end(req);
+		redfs_request_end(req);
 	}
 
 	/* Dispatch pending requests */
@@ -399,7 +399,7 @@ static void virtio_fs_request_dispatch_work(struct work_struct *work)
 			spin_unlock(&fsvq->lock);
 			pr_err("virtio-fs: virtio_fs_enqueue_req() failed %d\n",
 			       ret);
-			fuse_request_end(req);
+			redfs_request_end(req);
 		}
 	}
 }
@@ -499,8 +499,8 @@ static int copy_args_to_argbuf(struct fuse_req *req)
 
 	num_in = args->in_numargs - args->in_pages;
 	num_out = args->out_numargs - args->out_pages;
-	len = fuse_len_args(num_in, (struct fuse_arg *) args->in_args) +
-	      fuse_len_args(num_out, args->out_args);
+	len = redfs_len_args(num_in, (struct fuse_arg *) args->in_args) +
+	      redfs_len_args(num_out, args->out_args);
 
 	req->argbuf = kmalloc(len, GFP_ATOMIC);
 	if (!req->argbuf)
@@ -528,7 +528,7 @@ static void copy_args_from_argbuf(struct fuse_args *args, struct fuse_req *req)
 	remaining = req->out.h.len - sizeof(req->out.h);
 	num_in = args->in_numargs - args->in_pages;
 	num_out = args->out_numargs - args->out_pages;
-	offset = fuse_len_args(num_in, (struct fuse_arg *)args->in_args);
+	offset = redfs_len_args(num_in, (struct fuse_arg *)args->in_args);
 
 	for (i = 0; i < num_out; i++) {
 		unsigned int argsize = args->out_args[i].size;
@@ -591,7 +591,7 @@ static void virtio_fs_request_complete(struct fuse_req *req,
 	clear_bit(FR_SENT, &req->flags);
 	spin_unlock(&fpq->lock);
 
-	fuse_request_end(req);
+	redfs_request_end(req);
 	spin_lock(&fsvq->lock);
 	dec_in_flight_req(fsvq);
 	spin_unlock(&fsvq->lock);
@@ -974,15 +974,15 @@ static struct virtio_driver virtio_fs_driver = {
 static void virtio_fs_wake_forget_and_unlock(struct fuse_iqueue *fiq)
 __releases(fiq->lock)
 {
-	struct fuse_forget_link *link;
+	struct redfs_forget_link *link;
 	struct virtio_fs_forget *forget;
 	struct virtio_fs_forget_req *req;
 	struct virtio_fs *fs;
 	struct virtio_fs_vq *fsvq;
 	u64 unique;
 
-	link = fuse_dequeue_forget(fiq, 1, NULL);
-	unique = fuse_get_unique(fiq);
+	link = redfs_dequeue_forget(fiq, 1, NULL);
+	unique = redfs_get_unique(fiq);
 
 	fs = fiq->priv;
 	fsvq = &fs->vqs[VQ_HIPRIO];
@@ -1101,7 +1101,7 @@ static unsigned int sg_init_fuse_args(struct scatterlist *sg,
 	unsigned int total_sgs = 0;
 	unsigned int len;
 
-	len = fuse_len_args(numargs - argpages, args);
+	len = redfs_len_args(numargs - argpages, args);
 	if (len)
 		sg_init_one(&sg[total_sgs++], argbuf, len);
 
@@ -1242,7 +1242,7 @@ __releases(fiq->lock)
 	pr_debug("%s: opcode %u unique %#llx nodeid %#llx in.len %u out.len %u\n",
 		  __func__, req->in.h.opcode, req->in.h.unique,
 		 req->in.h.nodeid, req->in.h.len,
-		 fuse_len_args(req->args->out_numargs, req->args->out_args));
+		 redfs_len_args(req->args->out_numargs, req->args->out_args));
 
 	fsvq = &fs->vqs[queue_id];
 	ret = virtio_fs_enqueue_req(fsvq, req, false);
@@ -1318,7 +1318,7 @@ static int virtio_fs_fill_super(struct super_block *sb, struct fs_context *fsc)
 	for (i = 0; i < fs->nvqs; i++) {
 		struct virtio_fs_vq *fsvq = &fs->vqs[i];
 
-		fsvq->fud = fuse_dev_alloc();
+		fsvq->fud = redfs_dev_alloc();
 		if (!fsvq->fud)
 			goto err_free_fuse_devs;
 	}
@@ -1334,19 +1334,19 @@ static int virtio_fs_fill_super(struct super_block *sb, struct fs_context *fsc)
 		}
 		ctx->dax_dev = fs->dax_dev;
 	}
-	err = fuse_fill_super_common(sb, ctx);
+	err = redfs_fill_super_common(sb, ctx);
 	if (err < 0)
 		goto err_free_fuse_devs;
 
 	for (i = 0; i < fs->nvqs; i++) {
 		struct virtio_fs_vq *fsvq = &fs->vqs[i];
 
-		fuse_dev_install(fsvq->fud, fc);
+		redfs_dev_install(fsvq->fud, fc);
 	}
 
 	/* Previous unmount will stop all queues. Start these again */
 	virtio_fs_start_all_queues(fs);
-	fuse_send_init(fm);
+	redfs_send_init(fm);
 	mutex_unlock(&virtio_fs_mutex);
 	return 0;
 
@@ -1367,7 +1367,7 @@ static void virtio_fs_conn_destroy(struct fuse_mount *fm)
 	 * will free all memory ranges belonging to all inodes.
 	 */
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
-		fuse_dax_cancel_work(fc);
+		redfs_dax_cancel_work(fc);
 
 	/* Stop forget queue. Soon destroy will be sent */
 	spin_lock(&fsvq->lock);
@@ -1375,7 +1375,7 @@ static void virtio_fs_conn_destroy(struct fuse_mount *fm)
 	spin_unlock(&fsvq->lock);
 	virtio_fs_drain_all_queues(vfs);
 
-	fuse_conn_destroy(fm);
+	redfs_conn_destroy(fm);
 
 	/* fuse_conn_destroy() must have sent destroy. Stop all queues
 	 * and drain one more time and free fuse devices. Freeing fuse
@@ -1394,12 +1394,12 @@ static void virtio_kill_sb(struct super_block *sb)
 
 	/* If mount failed, we can still be called without any fc */
 	if (sb->s_root) {
-		last = fuse_mount_remove(fm);
+		last = redfs_mount_remove(fm);
 		if (last)
 			virtio_fs_conn_destroy(fm);
 	}
 	kill_anon_super(sb);
-	fuse_mount_destroy(fm);
+	redfs_mount_destroy(fm);
 }
 
 static int virtio_fs_test_super(struct super_block *sb,
@@ -1443,8 +1443,8 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
 	if (!fm)
 		goto out_err;
 
-	fuse_conn_init(fc, fm, fsc->user_ns, &virtio_fs_fiq_ops, fs);
-	fc->release = fuse_free_conn;
+	redfs_conn_init(fc, fm, fsc->user_ns, &virtio_fs_fiq_ops, fs);
+	fc->release = redfs_free_conn;
 	fc->delete_stale = true;
 	fc->auto_submounts = true;
 	fc->sync_fs = true;
@@ -1456,7 +1456,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
 	fsc->s_fs_info = fm;
 	sb = sget_fc(fsc, virtio_fs_test_super, set_anon_super_fc);
 	if (fsc->s_fs_info)
-		fuse_mount_destroy(fm);
+		redfs_mount_destroy(fm);
 	if (IS_ERR(sb))
 		return PTR_ERR(sb);
 
@@ -1493,7 +1493,7 @@ static int virtio_fs_init_fs_context(struct fs_context *fsc)
 	struct fuse_fs_context *ctx;
 
 	if (fsc->purpose == FS_CONTEXT_FOR_SUBMOUNT)
-		return fuse_init_fs_context_submount(fsc);
+		return redfs_init_fs_context_submount(fsc);
 
 	ctx = kzalloc(sizeof(struct fuse_fs_context), GFP_KERNEL);
 	if (!ctx)

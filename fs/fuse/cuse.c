@@ -96,7 +96,7 @@ static ssize_t cuse_read_iter(struct kiocb *kiocb, struct iov_iter *to)
 	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(kiocb);
 	loff_t pos = 0;
 
-	return fuse_direct_io(&io, to, &pos, FUSE_DIO_CUSE);
+	return redfs_direct_io(&io, to, &pos, FUSE_DIO_CUSE);
 }
 
 static ssize_t cuse_write_iter(struct kiocb *kiocb, struct iov_iter *from)
@@ -107,8 +107,8 @@ static ssize_t cuse_write_iter(struct kiocb *kiocb, struct iov_iter *from)
 	 * No locking or generic_write_checks(), the server is
 	 * responsible for locking and sanity checks.
 	 */
-	return fuse_direct_io(&io, from, &pos,
-			      FUSE_DIO_WRITE | FUSE_DIO_CUSE);
+	return redfs_direct_io(&io, from, &pos,
+			       FUSE_DIO_WRITE | FUSE_DIO_CUSE);
 }
 
 static int cuse_open(struct inode *inode, struct file *file)
@@ -121,7 +121,7 @@ static int cuse_open(struct inode *inode, struct file *file)
 	mutex_lock(&cuse_lock);
 	list_for_each_entry(pos, cuse_conntbl_head(devt), list)
 		if (pos->dev->devt == devt) {
-			fuse_conn_get(&pos->fc);
+			redfs_conn_get(&pos->fc);
 			cc = pos;
 			break;
 		}
@@ -135,9 +135,9 @@ static int cuse_open(struct inode *inode, struct file *file)
 	 * Generic permission check is already done against the chrdev
 	 * file, proceed to open.
 	 */
-	rc = fuse_do_open(&cc->fm, 0, file, 0);
+	rc = redfs_do_open(&cc->fm, 0, file, 0);
 	if (rc)
-		fuse_conn_put(&cc->fc);
+		redfs_conn_put(&cc->fc);
 	return rc;
 }
 
@@ -146,8 +146,8 @@ static int cuse_release(struct inode *inode, struct file *file)
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
 
-	fuse_sync_release(NULL, ff, file->f_flags);
-	fuse_conn_put(fm->fc);
+	redfs_sync_release(NULL, ff, file->f_flags);
+	redfs_conn_put(fm->fc);
 
 	return 0;
 }
@@ -162,7 +162,7 @@ static long cuse_file_ioctl(struct file *file, unsigned int cmd,
 	if (cc->unrestricted_ioctl)
 		flags |= FUSE_IOCTL_UNRESTRICTED;
 
-	return fuse_do_ioctl(file, cmd, arg, flags);
+	return redfs_do_ioctl(file, cmd, arg, flags);
 }
 
 static long cuse_file_compat_ioctl(struct file *file, unsigned int cmd,
@@ -175,7 +175,7 @@ static long cuse_file_compat_ioctl(struct file *file, unsigned int cmd,
 	if (cc->unrestricted_ioctl)
 		flags |= FUSE_IOCTL_UNRESTRICTED;
 
-	return fuse_do_ioctl(file, cmd, arg, flags);
+	return redfs_do_ioctl(file, cmd, arg, flags);
 }
 
 static const struct file_operations cuse_frontend_fops = {
@@ -186,7 +186,7 @@ static const struct file_operations cuse_frontend_fops = {
 	.release		= cuse_release,
 	.unlocked_ioctl		= cuse_file_ioctl,
 	.compat_ioctl		= cuse_file_compat_ioctl,
-	.poll			= fuse_file_poll,
+	.poll			= redfs_file_poll,
 	.llseek		= noop_llseek,
 };
 
@@ -418,7 +418,7 @@ err_unlock:
 err_region:
 	unregister_chrdev_region(devt, 1);
 err:
-	fuse_abort_conn(fc);
+	redfs_abort_conn(fc);
 	goto out;
 }
 
@@ -462,7 +462,7 @@ static int cuse_send_init(struct cuse_conn *cc)
 	ia->desc.length = ap->args.out_args[1].size;
 	ap->args.end = cuse_process_init_reply;
 
-	rc = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
+	rc = redfs_simple_background(fm, &ap->args, GFP_KERNEL);
 	if (rc) {
 		kfree(ia);
 err_free_page:
@@ -508,12 +508,12 @@ static int cuse_channel_open(struct inode *inode, struct file *file)
 	 * Limit the cuse channel to requests that can
 	 * be represented in file->f_cred->user_ns.
 	 */
-	fuse_conn_init(&cc->fc, &cc->fm, file->f_cred->user_ns,
-		       &fuse_dev_fiq_ops, NULL);
+	redfs_conn_init(&cc->fc, &cc->fm, file->f_cred->user_ns,
+		        &redfs_dev_fiq_ops, NULL);
 
 	cc->fc.release = cuse_fc_release;
-	fud = fuse_dev_alloc_install(&cc->fc);
-	fuse_conn_put(&cc->fc);
+	fud = redfs_dev_alloc_install(&cc->fc);
+	redfs_conn_put(&cc->fc);
 	if (!fud)
 		return -ENOMEM;
 
@@ -522,7 +522,7 @@ static int cuse_channel_open(struct inode *inode, struct file *file)
 	cc->fc.initialized = 1;
 	rc = cuse_send_init(cc);
 	if (rc) {
-		fuse_dev_free(fud);
+		redfs_dev_free(fud);
 		return rc;
 	}
 	file->private_data = fud;
@@ -560,7 +560,7 @@ static int cuse_channel_release(struct inode *inode, struct file *file)
 		cdev_del(cc->cdev);
 	}
 
-	rc = fuse_dev_release(inode, file);	/* puts the base reference */
+	rc = redfs_dev_release(inode, file);	/* puts the base reference */
 
 	return rc;
 }
@@ -589,7 +589,7 @@ static ssize_t cuse_class_abort_store(struct device *dev,
 {
 	struct cuse_conn *cc = dev_get_drvdata(dev);
 
-	fuse_abort_conn(&cc->fc);
+	redfs_abort_conn(&cc->fc);
 	return count;
 }
 static DEVICE_ATTR(abort, 0200, NULL, cuse_class_abort_store);
@@ -619,7 +619,7 @@ static int __init cuse_init(void)
 		INIT_LIST_HEAD(&cuse_conntbl[i]);
 
 	/* inherit and extend fuse_dev_operations */
-	cuse_channel_fops		= fuse_dev_operations;
+	cuse_channel_fops		= redfs_dev_operations;
 	cuse_channel_fops.owner		= THIS_MODULE;
 	cuse_channel_fops.open		= cuse_channel_open;
 	cuse_channel_fops.release	= cuse_channel_release;

@@ -144,8 +144,8 @@ static int fuse_copy_ioctl_iovec(struct fuse_conn *fc, struct iovec *dst,
  * limits ioctl data transfers to well-formed ioctls and is the forced
  * behavior for all FUSE servers.
  */
-long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
-		   unsigned int flags)
+long redfs_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
+		    unsigned int flags)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
@@ -328,7 +328,7 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 
 	return err ? err : outarg.result;
 }
-EXPORT_SYMBOL_GPL(fuse_do_ioctl);
+EXPORT_SYMBOL_GPL(redfs_do_ioctl);
 
 long fuse_ioctl_common(struct file *file, unsigned int cmd,
 		       unsigned long arg, unsigned int flags)
@@ -342,7 +342,7 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
 	if (fuse_is_bad(inode))
 		return -EIO;
 
-	return fuse_do_ioctl(file, cmd, arg, flags);
+	return redfs_do_ioctl(file, cmd, arg, flags);
 }
 
 long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)

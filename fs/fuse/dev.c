@@ -180,7 +180,7 @@ static void fuse_put_request(struct fuse_req *req)
 	}
 }
 
-unsigned int fuse_len_args(unsigned int numargs, struct fuse_arg *args)
+unsigned int redfs_len_args(unsigned int numargs, struct fuse_arg *args)
 {
 	unsigned nbytes = 0;
 	unsigned i;
@@ -190,14 +190,14 @@ unsigned int fuse_len_args(unsigned int numargs, struct fuse_arg *args)
 
 	return nbytes;
 }
-EXPORT_SYMBOL_GPL(fuse_len_args);
+EXPORT_SYMBOL_GPL(redfs_len_args);
 
-u64 fuse_get_unique(struct fuse_iqueue *fiq)
+u64 redfs_get_unique(struct fuse_iqueue *fiq)
 {
 	fiq->reqctr += FUSE_REQ_ID_STEP;
 	return fiq->reqctr;
 }
-EXPORT_SYMBOL_GPL(fuse_get_unique);
+EXPORT_SYMBOL_GPL(redfs_get_unique);
 
 static unsigned int fuse_req_hash(u64 unique)
 {
@@ -215,25 +215,25 @@ __releases(fiq->lock)
 	spin_unlock(&fiq->lock);
 }
 
-const struct fuse_iqueue_ops fuse_dev_fiq_ops = {
+const struct fuse_iqueue_ops redfs_dev_fiq_ops = {
 	.wake_forget_and_unlock		= fuse_dev_wake_and_unlock,
 	.wake_interrupt_and_unlock	= fuse_dev_wake_and_unlock,
 	.wake_pending_and_unlock	= fuse_dev_wake_and_unlock,
 };
-EXPORT_SYMBOL_GPL(fuse_dev_fiq_ops);
+EXPORT_SYMBOL_GPL(redfs_dev_fiq_ops);
 
 static void queue_request_and_unlock(struct fuse_iqueue *fiq,
 				     struct fuse_req *req)
 __releases(fiq->lock)
 {
 	req->in.h.len = sizeof(struct fuse_in_header) +
-		fuse_len_args(req->args->in_numargs,
-			      (struct fuse_arg *) req->args->in_args);
+		redfs_len_args(req->args->in_numargs,
+			       (struct fuse_arg *) req->args->in_args);
 	list_add_tail(&req->list, &fiq->pending);
 	fiq->ops->wake_pending_and_unlock(fiq);
 }
 
-void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
+void fuse_queue_forget(struct fuse_conn *fc, struct redfs_forget_link *forget,
 		       u64 nodeid, u64 nlookup)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
@@ -264,7 +264,7 @@ static void flush_bg_queue(struct fuse_conn *fc)
 		list_del(&req->list);
 		fc->active_background++;
 		spin_lock(&fiq->lock);
-		req->in.h.unique = fuse_get_unique(fiq);
+		req->in.h.unique = redfs_get_unique(fiq);
 		queue_request_and_unlock(fiq, req);
 	}
 }
@@ -277,7 +277,7 @@ static void flush_bg_queue(struct fuse_conn *fc)
  * the 'end' callback is called if given, else the reference to the
  * request is released
  */
-void fuse_request_end(struct fuse_req *req)
+void redfs_request_end(struct fuse_req *req)
 {
 	struct fuse_mount *fm = req->fm;
 	struct fuse_conn *fc = fm->fc;
@@ -329,7 +329,7 @@ void fuse_request_end(struct fuse_req *req)
 put_request:
 	fuse_put_request(req);
 }
-EXPORT_SYMBOL_GPL(fuse_request_end);
+EXPORT_SYMBOL_GPL(redfs_request_end);
 
 static int queue_interrupt(struct fuse_req *req)
 {
@@ -417,7 +417,7 @@ static void __fuse_request_send(struct fuse_req *req)
 		spin_unlock(&fiq->lock);
 		req->out.h.error = -ENOTCONN;
 	} else {
-		req->in.h.unique = fuse_get_unique(fiq);
+		req->in.h.unique = redfs_get_unique(fiq);
 		/* acquire extra reference, since request is still needed
 		   after fuse_request_end() */
 		__fuse_get_request(req);
@@ -545,7 +545,7 @@ static bool fuse_request_queue_background(struct fuse_req *req)
 	return queued;
 }
 
-int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
+int redfs_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			    gfp_t gfp_flags)
 {
 	struct fuse_req *req;
@@ -572,7 +572,7 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(fuse_simple_background);
+EXPORT_SYMBOL_GPL(redfs_simple_background);
 
 static int fuse_simple_notify_reply(struct fuse_mount *fm,
 				    struct fuse_args *args, u64 unique)
@@ -1073,12 +1073,12 @@ __releases(fiq->lock)
 	return err ? err : reqsize;
 }
 
-struct fuse_forget_link *fuse_dequeue_forget(struct fuse_iqueue *fiq,
-					     unsigned int max,
-					     unsigned int *countp)
+struct redfs_forget_link *redfs_dequeue_forget(struct fuse_iqueue *fiq,
+					      unsigned int max,
+					      unsigned int *countp)
 {
-	struct fuse_forget_link *head = fiq->forget_list_head.next;
-	struct fuse_forget_link **newhead = &head;
+	struct redfs_forget_link *head = fiq->forget_list_head.next;
+	struct redfs_forget_link **newhead = &head;
 	unsigned count;
 
 	for (count = 0; *newhead != NULL && count < max; count++)
@@ -1094,7 +1094,7 @@ struct fuse_forget_link *fuse_dequeue_forget(struct fuse_iqueue *fiq,
 
 	return head;
 }
-EXPORT_SYMBOL(fuse_dequeue_forget);
+EXPORT_SYMBOL(redfs_dequeue_forget);
 
 static int fuse_read_single_forget(struct fuse_iqueue *fiq,
 				   struct fuse_copy_state *cs,
@@ -1102,14 +1102,14 @@ static int fuse_read_single_forget(struct fuse_iqueue *fiq,
 __releases(fiq->lock)
 {
 	int err;
-	struct fuse_forget_link *forget = fuse_dequeue_forget(fiq, 1, NULL);
+	struct redfs_forget_link *forget = redfs_dequeue_forget(fiq, 1, NULL);
 	struct fuse_forget_in arg = {
 		.nlookup = forget->forget_one.nlookup,
 	};
 	struct fuse_in_header ih = {
 		.opcode = FUSE_FORGET,
 		.nodeid = forget->forget_one.nodeid,
-		.unique = fuse_get_unique(fiq),
+		.unique = redfs_get_unique(fiq),
 		.len = sizeof(ih) + sizeof(arg),
 	};
 
@@ -1136,11 +1136,11 @@ __releases(fiq->lock)
 	int err;
 	unsigned max_forgets;
 	unsigned count;
-	struct fuse_forget_link *head;
+	struct redfs_forget_link *head;
 	struct fuse_batch_forget_in arg = { .count = 0 };
 	struct fuse_in_header ih = {
 		.opcode = FUSE_BATCH_FORGET,
-		.unique = fuse_get_unique(fiq),
+		.unique = redfs_get_unique(fiq),
 		.len = sizeof(ih) + sizeof(arg),
 	};
 
@@ -1150,7 +1150,7 @@ __releases(fiq->lock)
 	}
 
 	max_forgets = (nbytes - ih.len) / sizeof(struct fuse_forget_one);
-	head = fuse_dequeue_forget(fiq, max_forgets, &count);
+	head = redfs_dequeue_forget(fiq, max_forgets, &count);
 	spin_unlock(&fiq->lock);
 
 	arg.count = count;
@@ -1160,7 +1160,7 @@ __releases(fiq->lock)
 		err = fuse_copy_one(cs, &arg, sizeof(arg));
 
 	while (head) {
-		struct fuse_forget_link *forget = head;
+		struct redfs_forget_link *forget = head;
 
 		if (!err) {
 			err = fuse_copy_one(cs, &forget->forget_one,
@@ -1276,7 +1276,7 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 		/* SETXATTR is special, since it may contain too large data */
 		if (args->opcode == FUSE_SETXATTR)
 			req->out.h.error = -E2BIG;
-		fuse_request_end(req);
+		redfs_request_end(req);
 		goto restart;
 	}
 	spin_lock(&fpq->lock);
@@ -1328,7 +1328,7 @@ out_end:
 	if (!test_bit(FR_PRIVATE, &req->flags))
 		list_del_init(&req->list);
 	spin_unlock(&fpq->lock);
-	fuse_request_end(req);
+	redfs_request_end(req);
 	return err;
 
  err_unlock:
@@ -1821,7 +1821,7 @@ static int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 {
 	unsigned reqsize = sizeof(struct fuse_out_header);
 
-	reqsize += fuse_len_args(args->out_numargs, args->out_args);
+	reqsize += redfs_len_args(args->out_numargs, args->out_args);
 
 	if (reqsize < nbytes || (reqsize > nbytes && !args->out_argvar))
 		return -EINVAL;
@@ -1932,7 +1932,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 		list_del_init(&req->list);
 	spin_unlock(&fpq->lock);
 
-	fuse_request_end(req);
+	redfs_request_end(req);
 out:
 	return err ? err : nbytes;
 
@@ -2082,7 +2082,7 @@ static void end_requests(struct list_head *head)
 		req->out.h.error = -ECONNABORTED;
 		clear_bit(FR_SENT, &req->flags);
 		list_del_init(&req->list);
-		fuse_request_end(req);
+		redfs_request_end(req);
 	}
 }
 
@@ -2119,7 +2119,7 @@ static void end_polls(struct fuse_conn *fc)
  * is OK, the request will in that case be removed from the list before we touch
  * it.
  */
-void fuse_abort_conn(struct fuse_conn *fc)
+void redfs_abort_conn(struct fuse_conn *fc)
 {
 	struct fuse_iqueue *fiq = &fc->iq;
 
@@ -2169,7 +2169,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 			clear_bit(FR_PENDING, &req->flags);
 		list_splice_tail_init(&fiq->pending, &to_end);
 		while (forget_pending(fiq))
-			kfree(fuse_dequeue_forget(fiq, 1, NULL));
+			kfree(redfs_dequeue_forget(fiq, 1, NULL));
 		wake_up_all(&fiq->waitq);
 		spin_unlock(&fiq->lock);
 		kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
@@ -2182,7 +2182,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->lock);
 	}
 }
-EXPORT_SYMBOL_GPL(fuse_abort_conn);
+EXPORT_SYMBOL_GPL(redfs_abort_conn);
 
 void fuse_wait_aborted(struct fuse_conn *fc)
 {
@@ -2191,7 +2191,7 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
 }
 
-int fuse_dev_release(struct inode *inode, struct file *file)
+int redfs_dev_release(struct inode *inode, struct file *file)
 {
 	struct fuse_dev *fud = fuse_get_dev(file);
 
@@ -2212,13 +2212,13 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 		/* Are we the last open device? */
 		if (atomic_dec_and_test(&fc->dev_count)) {
 			WARN_ON(fc->iq.fasync != NULL);
-			fuse_abort_conn(fc);
+			redfs_abort_conn(fc);
 		}
-		fuse_dev_free(fud);
+		redfs_dev_free(fud);
 	}
 	return 0;
 }
-EXPORT_SYMBOL_GPL(fuse_dev_release);
+EXPORT_SYMBOL_GPL(redfs_dev_release);
 
 static int fuse_dev_fasync(int fd, struct file *file, int on)
 {
@@ -2238,7 +2238,7 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
 	if (new->private_data)
 		return -EINVAL;
 
-	fud = fuse_dev_alloc_install(fc);
+	fud = redfs_dev_alloc_install(fc);
 	if (!fud)
 		return -ENOMEM;
 
@@ -2287,7 +2287,7 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	return res;
 }
 
-const struct file_operations fuse_dev_operations = {
+const struct file_operations redfs_dev_operations = {
 	.owner		= THIS_MODULE,
 	.open		= fuse_dev_open,
 	.llseek		= no_llseek,
@@ -2296,17 +2296,17 @@ const struct file_operations fuse_dev_operations = {
 	.write_iter	= fuse_dev_write,
 	.splice_write	= fuse_dev_splice_write,
 	.poll		= fuse_dev_poll,
-	.release	= fuse_dev_release,
+	.release	= redfs_dev_release,
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
 };
-EXPORT_SYMBOL_GPL(fuse_dev_operations);
+EXPORT_SYMBOL_GPL(redfs_dev_operations);
 
 static struct miscdevice fuse_miscdevice = {
 	.minor = FUSE_MINOR,
 	.name  = "fuse",
-	.fops = &fuse_dev_operations,
+	.fops = &redfs_dev_operations,
 };
 
 int __init fuse_dev_init(void)

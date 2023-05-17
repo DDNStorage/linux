@@ -116,8 +116,8 @@ static void fuse_file_put(struct fuse_file *ff, bool sync, bool isdir)
 			fuse_release_end(ff->fm, args, 0);
 		} else {
 			args->end = fuse_release_end;
-			if (fuse_simple_background(ff->fm, args,
-						   GFP_KERNEL | __GFP_NOFAIL))
+			if (redfs_simple_background(ff->fm, args,
+						    GFP_KERNEL | __GFP_NOFAIL))
 				fuse_release_end(ff->fm, args, -ENOTCONN);
 		}
 		kfree(ff);
@@ -166,8 +166,8 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 	return ff;
 }
 
-int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
-		 bool isdir)
+int redfs_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
+		  bool isdir)
 {
 	struct fuse_file *ff = fuse_file_open(fm, nodeid, file->f_flags, isdir);
 
@@ -176,7 +176,7 @@ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
 
 	return PTR_ERR_OR_ZERO(ff);
 }
-EXPORT_SYMBOL_GPL(fuse_do_open);
+EXPORT_SYMBOL_GPL(redfs_do_open);
 
 static void fuse_link_write_file(struct file *file)
 {
@@ -251,7 +251,7 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
 			goto out;
 	}
 
-	err = fuse_do_open(fm, get_node_id(inode), file, isdir);
+	err = redfs_do_open(fm, get_node_id(inode), file, isdir);
 	if (!err)
 		fuse_finish_open(inode, file);
 
@@ -344,8 +344,8 @@ static int fuse_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
-		       unsigned int flags)
+void redfs_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
+		        unsigned int flags)
 {
 	WARN_ON(refcount_read(&ff->count) > 1);
 	fuse_prepare_release(fi, ff, flags, FUSE_RELEASE);
@@ -355,7 +355,7 @@ void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
 	 */
 	fuse_file_put(ff, true, false);
 }
-EXPORT_SYMBOL_GPL(fuse_sync_release);
+EXPORT_SYMBOL_GPL(redfs_sync_release);
 
 /*
  * Scramble the ID space with XTEA, so that the value of the files_struct
@@ -756,7 +756,7 @@ static ssize_t fuse_async_req_send(struct fuse_mount *fm,
 
 	ia->ap.args.end = fuse_aio_complete_req;
 	ia->ap.args.may_block = io->should_dirty;
-	err = fuse_simple_background(fm, &ia->ap.args, GFP_KERNEL);
+	err = redfs_simple_background(fm, &ia->ap.args, GFP_KERNEL);
 	if (err)
 		fuse_aio_complete_req(fm, &ia->ap.args, err);
 
@@ -941,7 +941,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	if (fm->fc->async_read) {
 		ia->ff = fuse_file_get(ff);
 		ap->args.end = fuse_readpages_end;
-		err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
+		err = redfs_simple_background(fm, &ap->args, GFP_KERNEL);
 		if (!err)
 			return;
 	} else {
@@ -1433,8 +1433,8 @@ static int fuse_get_user_pages(struct fuse_args_pages *ap, struct iov_iter *ii,
 	return ret < 0 ? ret : 0;
 }
 
-ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
-		       loff_t *ppos, int flags)
+ssize_t redfs_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
+		        loff_t *ppos, int flags)
 {
 	int write = flags & FUSE_DIO_WRITE;
 	int cuse = flags & FUSE_DIO_CUSE;
@@ -1518,7 +1518,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 
 	return res > 0 ? res : err;
 }
-EXPORT_SYMBOL_GPL(fuse_direct_io);
+EXPORT_SYMBOL_GPL(redfs_direct_io);
 
 static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 				  struct iov_iter *iter,
@@ -1527,7 +1527,7 @@ static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 	ssize_t res;
 	struct inode *inode = file_inode(io->iocb->ki_filp);
 
-	res = fuse_direct_io(io, iter, ppos, 0);
+	res = redfs_direct_io(io, iter, ppos, 0);
 
 	fuse_invalidate_atime(inode);
 
@@ -1564,8 +1564,8 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
 			res = fuse_direct_IO(iocb, from);
 		} else {
-			res = fuse_direct_io(&io, from, &iocb->ki_pos,
-					     FUSE_DIO_WRITE);
+			res = redfs_direct_io(&io, from, &iocb->ki_pos,
+					      FUSE_DIO_WRITE);
 			fuse_write_update_attr(inode, iocb->ki_pos, res);
 		}
 	}
@@ -1672,10 +1672,10 @@ __acquires(fi->lock)
 	args->force = true;
 	args->nocreds = true;
 
-	err = fuse_simple_background(fm, args, GFP_ATOMIC);
+	err = redfs_simple_background(fm, args, GFP_ATOMIC);
 	if (err == -ENOMEM) {
 		spin_unlock(&fi->lock);
-		err = fuse_simple_background(fm, args, GFP_NOFS | __GFP_NOFAIL);
+		err = redfs_simple_background(fm, args, GFP_NOFS | __GFP_NOFAIL);
 		spin_lock(&fi->lock);
 	}
 
@@ -2744,7 +2744,7 @@ static void fuse_register_polled_file(struct fuse_conn *fc,
 	spin_unlock(&fc->lock);
 }
 
-__poll_t fuse_file_poll(struct file *file, poll_table *wait)
+__poll_t redfs_file_poll(struct file *file, poll_table *wait)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
@@ -2786,7 +2786,7 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait)
 	}
 	return EPOLLERR;
 }
-EXPORT_SYMBOL_GPL(fuse_file_poll);
+EXPORT_SYMBOL_GPL(redfs_file_poll);
 
 /*
  * This is called from fuse_handle_notify() on FUSE_NOTIFY_POLL and
@@ -2895,7 +2895,7 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
+		ret = redfs_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 	} else {
 		ret = __fuse_direct_read(io, iter, &pos);
@@ -3169,7 +3169,7 @@ static const struct file_operations fuse_file_operations = {
 	.splice_write	= iter_file_splice_write,
 	.unlocked_ioctl	= fuse_file_ioctl,
 	.compat_ioctl	= fuse_file_compat_ioctl,
-	.poll		= fuse_file_poll,
+	.poll		= redfs_file_poll,
 	.fallocate	= fuse_file_fallocate,
 	.copy_file_range = fuse_copy_file_range,
 };

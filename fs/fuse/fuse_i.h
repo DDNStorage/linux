@@ -58,9 +58,9 @@ extern unsigned max_user_bgreq;
 extern unsigned max_user_congthresh;
 
 /* One forget request */
-struct fuse_forget_link {
+struct redfs_forget_link {
 	struct fuse_forget_one forget_one;
-	struct fuse_forget_link *next;
+	struct redfs_forget_link *next;
 };
 
 /** FUSE inode */
@@ -76,7 +76,7 @@ struct fuse_inode {
 	u64 nlookup;
 
 	/** The request used for sending the FORGET message */
-	struct fuse_forget_link *forget;
+	struct redfs_forget_link *forget;
 
 	/** Time in jiffies until the file attributes are valid */
 	u64 i_time;
@@ -412,7 +412,7 @@ struct fuse_iqueue_ops {
 };
 
 /** /dev/fuse input queue operations */
-extern const struct fuse_iqueue_ops fuse_dev_fiq_ops;
+extern const struct fuse_iqueue_ops redfs_dev_fiq_ops;
 
 struct fuse_iqueue {
 	/** Connection established */
@@ -434,8 +434,8 @@ struct fuse_iqueue {
 	struct list_head interrupts;
 
 	/** Queue of pending forgets */
-	struct fuse_forget_link forget_list_head;
-	struct fuse_forget_link *forget_list_tail;
+	struct redfs_forget_link forget_list_head;
+	struct redfs_forget_link *forget_list_tail;
 
 	/** Batching of FORGET requests (positive indicates FORGET batch) */
 	int forget_batch;
@@ -946,7 +946,7 @@ static inline void fuse_sync_bucket_dec(struct fuse_sync_bucket *bucket)
 }
 
 /** Device operations */
-extern const struct file_operations fuse_dev_operations;
+extern const struct file_operations redfs_dev_operations;
 
 extern const struct dentry_operations fuse_dentry_operations;
 extern const struct dentry_operations fuse_root_dentry_operations;
@@ -964,14 +964,14 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
 /**
  * Send FORGET command
  */
-void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
+void fuse_queue_forget(struct fuse_conn *fc, struct redfs_forget_link *forget,
 		       u64 nodeid, u64 nlookup);
 
-struct fuse_forget_link *fuse_alloc_forget(void);
+struct redfs_forget_link *fuse_alloc_forget(void);
 
-struct fuse_forget_link *fuse_dequeue_forget(struct fuse_iqueue *fiq,
-					     unsigned int max,
-					     unsigned int *countp);
+struct redfs_forget_link *redfs_dequeue_forget(struct fuse_iqueue *fiq,
+					      unsigned int max,
+					      unsigned int *countp);
 
 /*
  * Initialize READ or READDIR request
@@ -1006,8 +1006,8 @@ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm);
 void fuse_file_free(struct fuse_file *ff);
 void fuse_finish_open(struct inode *inode, struct file *file);
 
-void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
-		       unsigned int flags);
+void redfs_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
+		        unsigned int flags);
 
 /**
  * Send RELEASE or RELEASEDIR request
@@ -1074,16 +1074,16 @@ void __exit fuse_ctl_cleanup(void);
  * Simple request sending that does request allocation and freeing
  */
 ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args);
-int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
-			   gfp_t gfp_flags);
+int redfs_simple_background(struct fuse_mount *fm, struct fuse_args *args,
+			    gfp_t gfp_flags);
 
 /**
  * End a finished request
  */
-void fuse_request_end(struct fuse_req *req);
+void redfs_request_end(struct fuse_req *req);
 
 /* Abort all requests */
-void fuse_abort_conn(struct fuse_conn *fc);
+void redfs_abort_conn(struct fuse_conn *fc);
 void fuse_wait_aborted(struct fuse_conn *fc);
 
 /**
@@ -1109,52 +1109,52 @@ void fuse_change_entry_timeout(struct dentry *entry, struct fuse_entry_out *o);
 /**
  * Acquire reference to fuse_conn
  */
-struct fuse_conn *fuse_conn_get(struct fuse_conn *fc);
+struct fuse_conn *redfs_conn_get(struct fuse_conn *fc);
 
 /**
  * Initialize fuse_conn
  */
-void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
+void redfs_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 		    struct user_namespace *user_ns,
 		    const struct fuse_iqueue_ops *fiq_ops, void *fiq_priv);
 
 /**
  * Release reference to fuse_conn
  */
-void fuse_conn_put(struct fuse_conn *fc);
+void redfs_conn_put(struct fuse_conn *fc);
 
-struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc);
-struct fuse_dev *fuse_dev_alloc(void);
-void fuse_dev_install(struct fuse_dev *fud, struct fuse_conn *fc);
-void fuse_dev_free(struct fuse_dev *fud);
-void fuse_send_init(struct fuse_mount *fm);
+struct fuse_dev *redfs_dev_alloc_install(struct fuse_conn *fc);
+struct fuse_dev *redfs_dev_alloc(void);
+void redfs_dev_install(struct fuse_dev *fud, struct fuse_conn *fc);
+void redfs_dev_free(struct fuse_dev *fud);
+void redfs_send_init(struct fuse_mount *fm);
 
 /**
  * Fill in superblock and initialize fuse connection
  * @sb: partially-initialized superblock to fill in
  * @ctx: mount context
  */
-int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx);
+int redfs_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx);
 
 /*
  * Remove the mount from the connection
  *
  * Returns whether this was the last mount
  */
-bool fuse_mount_remove(struct fuse_mount *fm);
+bool redfs_mount_remove(struct fuse_mount *fm);
 
 /*
  * Setup context ops for submounts
  */
-int fuse_init_fs_context_submount(struct fs_context *fsc);
+int redfs_init_fs_context_submount(struct fs_context *fsc);
 
 /*
  * Shut down the connection (possibly sending DESTROY request).
  */
-void fuse_conn_destroy(struct fuse_mount *fm);
+void redfs_conn_destroy(struct fuse_mount *fm);
 
 /* Drop the connection and free the fuse mount */
-void fuse_mount_destroy(struct fuse_mount *fm);
+void redfs_mount_destroy(struct fuse_mount *fm);
 
 /**
  * Add connection to control filesystem
@@ -1219,8 +1219,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
 			     u64 child_nodeid, struct qstr *name);
 
-int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
-		 bool isdir);
+int redfs_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
+		  bool isdir);
 
 /**
  * fuse_direct_io() flags
@@ -1232,14 +1232,14 @@ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
 /** CUSE pass fuse_direct_io() a file which f_mapping->host is not from FUSE */
 #define FUSE_DIO_CUSE  (1 << 1)
 
-ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
+ssize_t redfs_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		       loff_t *ppos, int flags);
-long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
-		   unsigned int flags);
+long redfs_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
+		    unsigned int flags);
 long fuse_ioctl_common(struct file *file, unsigned int cmd,
 		       unsigned long arg, unsigned int flags);
-__poll_t fuse_file_poll(struct file *file, poll_table *wait);
-int fuse_dev_release(struct inode *inode, struct file *file);
+__poll_t redfs_file_poll(struct file *file, poll_table *wait);
+int redfs_dev_release(struct inode *inode, struct file *file);
 
 bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written);
 
@@ -1275,13 +1275,13 @@ int fuse_readdir(struct file *file, struct dir_context *ctx);
 /**
  * Return the number of bytes in an arguments list
  */
-unsigned int fuse_len_args(unsigned int numargs, struct fuse_arg *args);
+unsigned int redfs_len_args(unsigned int numargs, struct fuse_arg *args);
 
 /**
  * Get the next unique ID for a request
  */
-u64 fuse_get_unique(struct fuse_iqueue *fiq);
-void fuse_free_conn(struct fuse_conn *fc);
+u64 redfs_get_unique(struct fuse_iqueue *fiq);
+void redfs_free_conn(struct fuse_conn *fc);
 
 /* dax.c */
 
@@ -1299,7 +1299,7 @@ void fuse_dax_inode_init(struct inode *inode, unsigned int flags);
 void fuse_dax_inode_cleanup(struct inode *inode);
 void fuse_dax_dontcache(struct inode *inode, unsigned int flags);
 bool fuse_dax_check_alignment(struct fuse_conn *fc, unsigned int map_alignment);
-void fuse_dax_cancel_work(struct fuse_conn *fc);
+void redfs_dax_cancel_work(struct fuse_conn *fc);
 
 /* ioctl.c */
 long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
