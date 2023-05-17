@@ -226,7 +226,8 @@ static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
 		__func__, ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
 		rreq->in.opcode, rreq->in.unique);
 
-	io_uring_cmd_done(ring_ent->cmd, 0, 0, issue_flags);
+	(void)issue_flags;
+	io_uring_cmd_done(ring_ent->cmd, 0, 0);
 	return;
 
 err:
@@ -626,8 +627,9 @@ __must_hold(&queue->lock)
 		if (ent->need_cmd_done) {
 			pr_devel("qid=%d tag=%d sending cmd_done\n",
 				queue->qid, ent->tag);
-			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0,
-					  IO_URING_F_UNLOCKED);
+
+			/* issue_flags = IO_URING_F_UNLOCKED */
+			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
 			ent->need_cmd_done = 0;
 		}
 
@@ -1049,8 +1051,9 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 			if (ent->need_cmd_done) {
 				pr_warn("fc=%p qid=%d tag=%d cmd not done\n",
 					fc, qid, tag);
-				io_uring_cmd_done(ent->cmd, -ENOTCONN, 0,
-						  IO_URING_F_UNLOCKED);
+
+				/* issue_flags = IO_URING_F_UNLOCKED */
+				io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
 				ent->need_cmd_done = 0;
 			}
 		}
@@ -1331,7 +1334,9 @@ out:
 			ring_ent->need_cmd_done = 0;
 			spin_unlock(&queue->lock);
 		}
-		io_uring_cmd_done(cmd, ret, 0, issue_flags);
+
+		(void) issue_flags;
+		io_uring_cmd_done(cmd, ret, 0);
 	}
 
 	return -EIOCBQUEUED;
