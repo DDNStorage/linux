@@ -82,7 +82,7 @@ static char *fuse_uring_alloc_queue_buf(int size, int node)
 		return ERR_PTR(-EINVAL);
 	}
 
-	buf = vmalloc_node_user(size, node);
+	buf = vmalloc_user(size);
 	return buf ? buf : ERR_PTR(-ENOMEM);
 }
 
