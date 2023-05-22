@@ -91,7 +91,7 @@ __must_hold(&queue->lock)
 
 	ent->state |= FRRS_FUSE_REQ_END;
 	ent->need_req_end = 0;
-	fuse_request_end(ent->fuse_req);
+	redfs_request_end(ent->fuse_req);
 	ent->fuse_req = NULL;
 	fuse_uring_bit_set(ent, is_bg, __func__);
 }
