@@ -78,7 +78,7 @@ void fuse_uring_end_requests(struct fuse_conn *fc)
 /*
  * Finalize a fuse request, then fetch and send the next entry, if available
  *
- * has lock/unlock/lock to avoid holding the lock on calling fuse_request_end
+ * has lock/unlock/lock to avoid holding the lock on calling redfs_request_end
  */
 static void
 fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
@@ -111,7 +111,7 @@ fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
 	if (set_err)
 		req->out.h.error = error;
 
-	fuse_request_end(ring_ent->fuse_req);
+	redfs_request_end(ring_ent->fuse_req);
 	ring_ent->fuse_req = NULL;
 
 	send = fuse_uring_ent_release_and_fetch(ring_ent);
@@ -466,7 +466,7 @@ __must_hold(&queue->lock)
 	if (ring_ent->state & FRRS_FREEING)
 		return;
 
-	/* Note: the bit in req->flag got already cleared in fuse_request_end */
+	/* Note: the bit in req->flag got already cleared in redfs_request_end */
 	ring_ent->rreq->flags = 0;
 	ring_ent->state = FRRS_FUSE_WAIT;
 }
