@@ -26,8 +26,9 @@
 #include <linux/pid_namespace.h>
 #include <uapi/linux/magic.h>
 
-MODULE_AUTHOR("Miklos Szeredi <miklos@szeredi.hu>");
-MODULE_DESCRIPTION("Filesystem in Userspace");
+MODULE_AUTHOR("Dharmendra Singh <dsingh@ddn.com>");
+MODULE_AUTHOR("Bernd Schubert <bschubert@ddn.com>");
+MODULE_DESCRIPTION("Filesystem by DDN STORAGE");
 MODULE_LICENSE("GPL");
 
 static struct kmem_cache *fuse_inode_cachep;
@@ -1815,13 +1816,13 @@ static void fuse_kill_sb_anon(struct super_block *sb)
 
 static struct file_system_type fuse_fs_type = {
 	.owner		= THIS_MODULE,
-	.name		= "fuse",
+	.name		= "redfs",
 	.fs_flags	= FS_HAS_SUBTYPE | FS_USERNS_MOUNT,
 	.init_fs_context = fuse_init_fs_context,
 	.parameters	= fuse_fs_parameters,
 	.kill_sb	= fuse_kill_sb_anon,
 };
-MODULE_ALIAS_FS("fuse");
+MODULE_ALIAS_FS("redfs");
 
 #ifdef CONFIG_BLOCK
 static void fuse_kill_sb_blk(struct super_block *sb)
@@ -1833,13 +1834,13 @@ static void fuse_kill_sb_blk(struct super_block *sb)
 
 static struct file_system_type fuseblk_fs_type = {
 	.owner		= THIS_MODULE,
-	.name		= "fuseblk",
+	.name		= "redfsblk",
 	.init_fs_context = fuse_init_fs_context,
 	.parameters	= fuse_fs_parameters,
 	.kill_sb	= fuse_kill_sb_blk,
 	.fs_flags	= FS_REQUIRES_DEV | FS_HAS_SUBTYPE,
 };
-MODULE_ALIAS_FS("fuseblk");
+MODULE_ALIAS_FS("redfsblk");
 
 static inline int register_fuseblk(void)
 {
@@ -1872,7 +1873,7 @@ static int __init fuse_fs_init(void)
 {
 	int err;
 
-	fuse_inode_cachep = kmem_cache_create("fuse_inode",
+	fuse_inode_cachep = kmem_cache_create("redfs_inode",
 			sizeof(struct fuse_inode), 0,
 			SLAB_HWCACHE_ALIGN|SLAB_ACCOUNT|SLAB_RECLAIM_ACCOUNT,
 			fuse_inode_init_once);
@@ -1917,7 +1918,7 @@ static int fuse_sysfs_init(void)
 {
 	int err;
 
-	fuse_kobj = kobject_create_and_add("fuse", fs_kobj);
+	fuse_kobj = kobject_create_and_add("redfs", fs_kobj);
 	if (!fuse_kobj) {
 		err = -ENOMEM;
 		goto out_err;

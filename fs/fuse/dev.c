@@ -24,9 +24,6 @@
 #include <linux/splice.h>
 #include <linux/sched.h>
 
-MODULE_ALIAS_MISCDEV(FUSE_MINOR);
-MODULE_ALIAS("devname:fuse");
-
 static struct kmem_cache *fuse_req_cachep;
 
 static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
@@ -2428,15 +2425,15 @@ const struct file_operations redfs_dev_operations = {
 EXPORT_SYMBOL_GPL(redfs_dev_operations);
 
 static struct miscdevice fuse_miscdevice = {
-	.minor = FUSE_MINOR,
-	.name  = "fuse",
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "red",
 	.fops = &redfs_dev_operations,
 };
 
 int __init fuse_dev_init(void)
 {
 	int err = -ENOMEM;
-	fuse_req_cachep = kmem_cache_create("fuse_request",
+	fuse_req_cachep = kmem_cache_create("redfs_request",
 					    sizeof(struct fuse_req),
 					    0, 0, NULL);
 	if (!fuse_req_cachep)
