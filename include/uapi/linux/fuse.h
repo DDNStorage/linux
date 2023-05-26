@@ -539,7 +539,7 @@ enum fuse_opcode {
 	FUSE_SETUPMAPPING	= 48,
 	FUSE_REMOVEMAPPING	= 49,
 	FUSE_SYNCFS		= 50,
-	FUSE_OPEN_ATOMIC	= 51,
+	FUSE_OPEN_ATOMIC	= 52,
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
 
