@@ -731,7 +731,7 @@ static ssize_t fuse_dax_direct_write(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 	ssize_t ret;
 
-	ret = fuse_direct_io(&io, from, &iocb->ki_pos, FUSE_DIO_WRITE);
+	ret = redfs_direct_io(&io, from, &iocb->ki_pos, FUSE_DIO_WRITE);
 
 	fuse_write_update_attr(inode, iocb->ki_pos, ret);
 	return ret;
@@ -1379,7 +1379,7 @@ bool fuse_dax_check_alignment(struct fuse_conn *fc, unsigned int map_alignment)
 	return true;
 }
 
-void fuse_dax_cancel_work(struct fuse_conn *fc)
+void redfs_dax_cancel_work(struct fuse_conn *fc)
 {
 	struct fuse_conn_dax *fcd = fc->dax;
 
@@ -1387,4 +1387,4 @@ void fuse_dax_cancel_work(struct fuse_conn *fc)
 		cancel_delayed_work_sync(&fcd->free_work);
 
 }
-EXPORT_SYMBOL_GPL(fuse_dax_cancel_work);
+EXPORT_SYMBOL_GPL(redfs_dax_cancel_work);
