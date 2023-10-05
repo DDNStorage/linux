@@ -36,7 +36,8 @@ MODULE_PARM_DESC(enable_uring,
 	"Enable uring userspace communication through uring.");
 
 static bool fuse_uring_ent_release_and_fetch(struct fuse_ring_ent *ring_ent);
-static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent);
+static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
+				    unsigned int issue_flags);
 
 static struct fuse_ring_queue *
 fuse_uring_get_queue(struct fuse_conn *fc, int qid)
@@ -116,8 +117,10 @@ fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
 	ring_ent->fuse_req = NULL;
 
 	send = fuse_uring_ent_release_and_fetch(ring_ent);
-	if (send)
-		fuse_uring_send_to_ring(ring_ent);
+	if (send) {
+		/* called within uring context - IO_URING_F_UNLOCKED not set */
+		fuse_uring_send_to_ring(ring_ent, 0);
+	}
 }
 
 /*
@@ -183,7 +186,8 @@ static int fuse_uring_copy_from_ring(struct fuse_conn *fc,
  * userspace will read it
  * This is comparable with classical read(/dev/fuse)
  */
-static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent)
+static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent,
+				    unsigned int issue_flags)
 {
 	struct fuse_conn *fc = ring_ent->queue->fc;
 	struct fuse_ring_req *rreq = ring_ent->rreq;
@@ -222,7 +226,7 @@ static void fuse_uring_send_to_ring(struct fuse_ring_ent *ring_ent)
 		__func__, ring_ent->queue->qid, ring_ent->tag, ring_ent->state,
 		rreq->in.opcode, rreq->in.unique);
 
-	io_uring_cmd_done(ring_ent->cmd, 0, 0);
+	io_uring_cmd_done(ring_ent->cmd, 0, 0, issue_flags);
 	return;
 
 err:
@@ -344,9 +348,29 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	int *queue_avail;
 	int cpu_off;
 
-	if (async && req->args->opcode == FUSE_READ &&
-	    req->args->out_args[0].size < FUSE_URING_MIN_RA_ASYNC_SIZE)
-		async = 0;
+	/* async has on a different core (see below) introduces context
+	 * switching - should be avoided for small requests
+	 */
+	if (async) {
+		size_t size;
+		switch (req->args->opcode) {
+		case FUSE_READ:
+			size = req->args->out_args[0].size;
+			break;
+		case FUSE_WRITE:
+			size = req->args->in_args[1].size;
+			break;
+		default:
+			/* FUSE_RELEASE - meta request - better served on the
+			 * current core and sync
+			 */
+			size = 0;
+		break;
+		}
+
+		if (size < FUSE_URING_MIN_ASYNC_SIZE)
+			async = 0;
+	}
 
 	pr_devel("opcode=%d out_size=%d async=%d\n",
 		req->args->opcode, req->args->out_args[0].size, async);
@@ -412,7 +436,7 @@ int fuse_uring_queue_fuse_req(struct fuse_conn *fc, struct fuse_req *req)
 	spin_unlock(&queue->lock);
 
 	if (ring_ent != NULL)
-		fuse_uring_send_to_ring(ring_ent);
+		fuse_uring_send_to_ring(ring_ent, IO_URING_F_UNLOCKED);
 
 	return 0;
 
@@ -622,7 +646,8 @@ __must_hold(&queue->lock)
 		if (ent->need_cmd_done) {
 			pr_devel("qid=%d tag=%d sending cmd_done\n",
 				queue->qid, ent->tag);
-			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
+			io_uring_cmd_done(ent->cmd, -ENOTCONN, 0,
+					  IO_URING_F_UNLOCKED);
 			ent->need_cmd_done = 0;
 		}
 
@@ -1044,7 +1069,8 @@ void fuse_uring_ring_destruct(struct fuse_conn *fc)
 			if (ent->need_cmd_done) {
 				pr_warn("fc=%p qid=%d tag=%d cmd not done\n",
 					fc, qid, tag);
-				io_uring_cmd_done(ent->cmd, -ENOTCONN, 0);
+				io_uring_cmd_done(ent->cmd, -ENOTCONN, 0,
+						  IO_URING_F_UNLOCKED);
 				ent->need_cmd_done = 0;
 			}
 		}
@@ -1325,7 +1351,7 @@ out:
 			ring_ent->need_cmd_done = 0;
 			spin_unlock(&queue->lock);
 		}
-		io_uring_cmd_done(cmd, ret, 0);
+		io_uring_cmd_done(cmd, ret, 0, issue_flags);
 	}
 
 	return -EIOCBQUEUED;
