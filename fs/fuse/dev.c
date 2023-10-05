@@ -325,7 +325,8 @@ void redfs_request_end(struct fuse_req *req)
 		/* Wake up waiter sleeping in request_wait_answer() */
 		if (fc->ring.ready) {
 			/* actually we would like to have wake_same_core */
-			wake_up_sync(&req->waitq);
+			// wake_up_sync(&req->waitq);
+			wake_up(&req->waitq);
 		} else
 			wake_up(&req->waitq);
 	}
