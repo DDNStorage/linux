@@ -2422,7 +2422,7 @@ EXPORT_SYMBOL_GPL(redfs_dev_operations);
 
 static struct miscdevice fuse_miscdevice = {
 	.minor = MISC_DYNAMIC_MINOR,
-	.name  = "red",
+	.name  = "redfs",
 	.fops = &redfs_dev_operations,
 };
 
