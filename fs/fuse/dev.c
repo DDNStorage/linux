@@ -550,9 +550,9 @@ static bool fuse_request_queue_background_uring(struct fuse_conn *fc,
 	struct fuse_iqueue *fiq = &fc->iq;
 	int err;
 
-	req->in.h.unique = fuse_get_unique(fiq);
+	req->in.h.unique = redfs_get_unique(fiq);
 	req->in.h.len = sizeof(struct fuse_in_header) +
-		fuse_len_args(req->args->in_numargs,
+		redfs_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
 
 	err = fuse_uring_queue_fuse_req(fc, req);
@@ -2412,7 +2412,7 @@ EXPORT_SYMBOL_GPL(redfs_dev_operations);
 
 static struct miscdevice fuse_miscdevice = {
 	.minor = MISC_DYNAMIC_MINOR,
-	.name  = "red",
+	.name  = "redfs",
 	.fops = &redfs_dev_operations,
 };
 

@@ -113,7 +113,7 @@ fuse_uring_req_end_and_get_next(struct fuse_ring_ent *ring_ent, bool set_err,
 	if (set_err)
 		req->out.h.error = error;
 
-	fuse_request_end(ring_ent->fuse_req);
+	redfs_request_end(ring_ent->fuse_req);
 	ring_ent->fuse_req = NULL;
 
 	send = fuse_uring_ent_release_and_fetch(ring_ent);
@@ -614,7 +614,7 @@ __must_hold(&queue->lock)
 
 	ent->state |= FRRS_FUSE_REQ_END;
 	ent->need_req_end = 0;
-	fuse_request_end(ent->fuse_req);
+	redfs_request_end(ent->fuse_req);
 	ent->fuse_req = NULL;
 	fuse_uring_bit_set(ent, async, __func__);
 }
