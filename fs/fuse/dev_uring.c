@@ -1016,6 +1016,9 @@ int fuse_uring_ioctl(struct file *file, struct fuse_uring_cfg *cfg)
 	if (fud == NULL)
 		return -ENODEV;
 
+	if (!enable_uring)
+		return -ENOTTY;
+
 	fc = fud->fc;
 
 	pr_devel("%s fc=%p flags=%x cmd=%d qid=%d nq=%d fg=%d async=%d\n",
