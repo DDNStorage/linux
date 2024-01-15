@@ -111,34 +111,73 @@ static bool fuse_file_is_direct_io(struct file *file)
 	return ff->open_flags & FOPEN_DIRECT_IO || file->f_flags & O_DIRECT;
 }
 
+/* Start cached io mode where parallel dio is not allowed */
+static bool fuse_file_cached_io_start(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool ok;
+
+	spin_lock(&fi->lock);
+	ok = fuse_inode_get_io_cache(fi);
+	spin_unlock(&fi->lock);
+	return ok;
+}
+
+static void fuse_file_cached_io_end(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	spin_lock(&fi->lock);
+	fuse_inode_put_io_cache(get_fuse_inode(inode));
+	spin_unlock(&fi->lock);
+}
+
+/* Start strictly uncached io mode where cache access is not allowed */
+static bool fuse_file_uncached_io_start(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool ok;
+
+	spin_lock(&fi->lock);
+	ok = fuse_inode_deny_io_cache(fi);
+	spin_unlock(&fi->lock);
+	return ok;
+}
+
+static void fuse_file_uncached_io_end(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool allow_cached_io;
+
+	spin_lock(&fi->lock);
+	allow_cached_io = fuse_inode_allow_io_cache(fi);
+	spin_unlock(&fi->lock);
+	if (allow_cached_io)
+		wake_up(&fi->direct_io_waitq);
+}
+
 /* Request access to submit new io to inode via open file */
-static bool fuse_file_io_open(struct file *file, struct inode *inode)
+static void fuse_file_io_open(struct file *file, struct inode *inode)
 {
 	struct fuse_file *ff = file->private_data;
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	bool ok = true;
 
 	if (!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode))
-		return true;
+		return;
 
 	/* Set explicit FOPEN_CACHE_IO flag for file open in caching mode */
 	if (!fuse_file_is_direct_io(file))
 		ff->open_flags |= FOPEN_CACHE_IO;
 
-	spin_lock(&fi->lock);
 	/* First caching file open enters caching inode io mode */
 	if (ff->open_flags & FOPEN_CACHE_IO) {
-		ok = fuse_inode_get_io_cache(fi);
-		if (!ok) {
+		/* First caching file open enters caching inode io mode */
+		if (!fuse_file_cached_io_start(inode)) {
 			/* fallback to open in direct io mode */
 			pr_debug("failed to open file in caching mode; falling back to direct io mode.\n");
 			ff->open_flags &= ~FOPEN_CACHE_IO;
 			ff->open_flags |= FOPEN_DIRECT_IO;
 		}
 	}
-	spin_unlock(&fi->lock);
-
-	return ok;
 }
 
 /* Request access to submit new io to inode via mmap */
@@ -178,16 +217,12 @@ static int fuse_file_io_mmap(struct fuse_file *ff, struct inode *inode)
 /* No more pending io and no new io possible to inode via open/mmapped file */
 static void fuse_file_io_release(struct fuse_file *ff, struct inode *inode)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
-
 	if (!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode))
 		return;
 
-	spin_lock(&fi->lock);
 	/* Last caching file close exits caching inode io mode */
 	if (ff->open_flags & FOPEN_CACHE_IO)
-		fuse_inode_put_io_cache(fi);
-	spin_unlock(&fi->lock);
+		fuse_file_cached_io_end(inode);
 }
 
 static void fuse_file_put(struct fuse_file *ff, bool sync, bool isdir)
@@ -1405,37 +1440,6 @@ static bool fuse_io_past_eof(struct kiocb *iocb, struct iov_iter *iter)
 }
 
 /*
- * New parallal dio allowed only if inode is not in caching mode and
- * denies new opens in caching mode.
- */
-static bool fuse_file_shared_dio_start(struct inode *inode)
-{
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	bool ok;
-
-	if (WARN_ON(!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode)))
-		return false;
-
-	spin_lock(&fi->lock);
-	ok = fuse_inode_deny_io_cache(fi);
-	spin_unlock(&fi->lock);
-	return ok;
-}
-
-/* Allow new opens in caching mode after last parallel dio end */
-static void fuse_file_shared_dio_end(struct inode *inode)
-{
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	bool allow_cached_io;
-
-	spin_lock(&fi->lock);
-	allow_cached_io = fuse_inode_allow_io_cache(fi);
-	spin_unlock(&fi->lock);
-	if (allow_cached_io)
-		wake_up(&fi->direct_io_waitq);
-}
-
-/*
  * @return true if an exclusive lock for direct IO writes is needed
  */
 static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from)
@@ -1488,12 +1492,14 @@ static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
 	} else {
 		inode_lock_shared(inode);
 		/*
-		 * Previous check was without inode lock and might have raced,
-		 * check again. fuse_file_shared_dio_start() should be performed
-		 * only after taking shared inode lock.
+		 * New parallal dio allowed only if inode is not in caching
+		 * mode and denies new opens in caching mode. This check
+		 * should be performed only after taking shared inode lock.
+		 * Previous past eof check was without inode lock and might
+		 * have raced, so check it again.
 		 */
 		if (fuse_io_past_eof(iocb, from) ||
-		    !fuse_file_shared_dio_start(inode)) {
+		    !fuse_file_uncached_io_start(inode)) {
 			inode_unlock_shared(inode);
 			inode_lock(inode);
 			*exclusive = true;
@@ -1506,7 +1512,8 @@ static void fuse_dio_unlock(struct inode *inode, bool exclusive)
 	if (exclusive) {
 		inode_unlock(inode);
 	} else {
-		fuse_file_shared_dio_end(inode);
+		/* Allow opens in caching mode after last parallel dio end */
+		fuse_file_uncached_io_end(inode);
 		inode_unlock_shared(inode);
 	}
 }
