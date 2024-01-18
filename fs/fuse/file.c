@@ -105,10 +105,100 @@ static void fuse_release_end(struct fuse_mount *fm, struct fuse_args *args,
 	kfree(ra);
 }
 
+static bool fuse_file_is_direct_io(struct file *file)
+{
+	struct fuse_file *ff = file->private_data;
+
+	return ff->open_flags & FOPEN_DIRECT_IO || file->f_flags & O_DIRECT;
+}
+
+/* Request access to submit new io to inode via open file */
+static bool fuse_file_io_open(struct file *file, struct inode *inode)
+{
+	struct fuse_file *ff = file->private_data;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool ok = true;
+
+	if (!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode))
+		return true;
+
+	/* Set explicit FOPEN_CACHE_IO flag for file open in caching mode */
+	if (!fuse_file_is_direct_io(file))
+		ff->open_flags |= FOPEN_CACHE_IO;
+
+	spin_lock(&fi->lock);
+	/* First caching file open enters caching inode io mode */
+	if (ff->open_flags & FOPEN_CACHE_IO) {
+		ok = fuse_inode_get_io_cache(fi);
+		if (!ok) {
+			/* fallback to open in direct io mode */
+			pr_debug("failed to open file in caching mode; falling back to direct io mode.\n");
+			ff->open_flags &= ~FOPEN_CACHE_IO;
+			ff->open_flags |= FOPEN_DIRECT_IO;
+		}
+	}
+	spin_unlock(&fi->lock);
+
+	return ok;
+}
+
+/* Request access to submit new io to inode via mmap */
+static int fuse_file_io_mmap(struct fuse_file *ff, struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (WARN_ON(!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode)))
+		return -ENODEV;
+
+	spin_lock(&fi->lock);
+	/*
+	 * First mmap of direct_io file enters caching inode io mode, blocks
+	 * new parallel dio writes and waits for the in-progress parallel dio
+	 * writes to complete.
+	 */
+	if (!(ff->open_flags & FOPEN_CACHE_IO)) {
+		while (!fuse_inode_get_io_cache(fi)) {
+			/*
+			 * Setting the bit advises new direct-io writes
+			 * to use an exclusive lock - without it the wait below
+			 * might be forever.
+			 */
+			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
+			spin_unlock(&fi->lock);
+			wait_event_interruptible(fi->direct_io_waitq,
+						 fuse_is_io_cache_allowed(fi));
+			spin_lock(&fi->lock);
+		}
+		ff->open_flags |= FOPEN_CACHE_IO;
+	}
+	spin_unlock(&fi->lock);
+
+	return 0;
+}
+
+/* No more pending io and no new io possible to inode via open/mmapped file */
+static void fuse_file_io_release(struct fuse_file *ff, struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode))
+		return;
+
+	spin_lock(&fi->lock);
+	/* Last caching file close exits caching inode io mode */
+	if (ff->open_flags & FOPEN_CACHE_IO)
+		fuse_inode_put_io_cache(fi);
+	spin_unlock(&fi->lock);
+}
+
 static void fuse_file_put(struct fuse_file *ff, bool sync, bool isdir)
 {
 	if (refcount_dec_and_test(&ff->count)) {
 		struct fuse_args *args = &ff->release_args->args;
+		struct inode *inode = ff->release_args->inode;
+
+		if (inode)
+			fuse_file_io_release(ff, inode);
 
 		if (isdir ? ff->fm->fc->no_opendir : ff->fm->fc->no_open) {
 			/* Do nothing when client does not implement 'open' */
@@ -199,6 +289,9 @@ void fuse_finish_open(struct inode *inode, struct file *file)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	/* The file open mode determines the inode io mode */
+	fuse_file_io_open(file, inode);
 
 	if (ff->open_flags & FOPEN_STREAM)
 		stream_open(inode, file);
@@ -1075,6 +1168,12 @@ static unsigned int fuse_write_flags(struct kiocb *iocb)
 	if (iocb->ki_flags & IOCB_SYNC)
 		flags |= O_SYNC;
 
+	/*
+	 * Note: If O_DIRECT should be ever added here,
+	 *       iocb->ki_flags & IOCB_DIRECT cannot be trusted when
+	 *       FOPEN_DIRECT_IO is set.
+	 */
+
 	return flags;
 }
 
@@ -1312,18 +1411,199 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 	return res;
 }
 
+static bool fuse_io_past_eof(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+
+	return iocb->ki_pos + iov_iter_count(iter) > i_size_read(inode);
+}
+
+/*
+ * New parallal dio allowed only if inode is not in caching mode and
+ * denies new opens in caching mode.
+ */
+static bool fuse_file_shared_dio_start(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool ok;
+
+	if (WARN_ON(!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode)))
+		return false;
+
+	spin_lock(&fi->lock);
+	ok = fuse_inode_deny_io_cache(fi);
+	spin_unlock(&fi->lock);
+	return ok;
+}
+
+/* Allow new opens in caching mode after last parallel dio end */
+static void fuse_file_shared_dio_end(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool allow_cached_io;
+
+	spin_lock(&fi->lock);
+	allow_cached_io = fuse_inode_allow_io_cache(fi);
+	spin_unlock(&fi->lock);
+	if (allow_cached_io)
+		wake_up(&fi->direct_io_waitq);
+}
+
+/*
+ * @return true if an exclusive lock for direct IO writes is needed
+ */
+static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct file *file = iocb->ki_filp;
+	struct fuse_file *ff = file->private_data;
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	/* the shared lock is about direct IO only */
+	if (!(iocb->ki_flags & IOCB_DIRECT))
+		return true;
+
+	/* server side has to advise that it supports parallel dio writes */
+	if (!(ff->open_flags & FOPEN_PARALLEL_DIRECT_WRITES))
+		return true;
+
+	/* append will need to know the eventual eof - always needs an
+	 * exclusive lock
+	 */
+	if (iocb->ki_flags & IOCB_APPEND)
+		return true;
+
+	/* shared locks are not allowed with parallel page cache IO */
+	if (test_bit(FUSE_I_CACHE_IO_MODE, &fi->state))
+		return false;
+
+	/* parallel dio beyond eof is at least for now not supported */
+	if (fuse_io_past_eof(iocb, from))
+		return true;
+
+	return false;
+}
+
+/*
+ *@exclusive is an in-out parameter. If set to true, the caller requests an
+ *           eclusive lock, if set to false a test is done if an exclusive
+ *           lock is needed.
+ */
+static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
+			  bool *exclusive)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+
+	if (!(*exclusive))
+		*exclusive = fuse_dio_wr_exclusive_lock(iocb, from);
+
+	if (*exclusive) {
+		inode_lock(inode);
+	} else {
+		inode_lock_shared(inode);
+		/*
+		 * Previous check was without inode lock and might have raced,
+		 * check again. fuse_file_shared_dio_start() should be performed
+		 * only after taking shared inode lock.
+		 */
+		if (fuse_io_past_eof(iocb, from) ||
+		    !fuse_file_shared_dio_start(inode)) {
+			inode_unlock_shared(inode);
+			inode_lock(inode);
+			*exclusive = true;
+		}
+	}
+}
+
+static void fuse_dio_unlock(struct inode *inode, bool exclusive)
+{
+	if (exclusive) {
+		inode_unlock(inode);
+	} else {
+		fuse_file_shared_dio_end(inode);
+		inode_unlock_shared(inode);
+	}
+}
+
+/**
+ * cap_inode_need_killpriv - Determine if inode change affects privileges
+ * @dentry: The inode/dentry in being changed with change marked ATTR_KILL_PRIV
+ *
+ * Determine if an inode having a change applied that's marked ATTR_KILL_PRIV
+ * affects the security markings on that inode, and if it is, should
+ * inode_killpriv() be invoked or the change rejected.
+ *
+ * Return: 1 if security.capability has a value, meaning inode_killpriv()
+ * is required, 0 otherwise, meaning inode_killpriv() is not required.
+ */
+int fuse_cap_inode_need_killpriv(struct dentry *dentry)
+{
+	struct inode *inode = d_backing_inode(dentry);
+	int error;
+
+	error = __vfs_getxattr(dentry, inode, XATTR_NAME_CAPS, NULL, 0);
+	return error > 0;
+}
+
+static inline int fuse_security_inode_need_killpriv(struct dentry *dentry)
+{
+	return fuse_cap_inode_need_killpriv(dentry);
+}
+
+
+/*
+ * Return mask of changes for notify_change() that need to be done as a
+ * response to write or truncate. Return 0 if nothing has to be changed.
+ * Negative value on error (change should be denied).
+ *
+ * XXX: workaround for missing file_needs_remove_privs export
+ */
+int fuse_dentry_needs_remove_privs(struct mnt_idmap *idmap,
+			      struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry);
+	int mask = 0;
+	int ret;
+
+	if (IS_NOSEC(inode))
+		return 0;
+
+	mask = setattr_should_drop_suidgid(idmap, inode);
+	ret = fuse_security_inode_need_killpriv(dentry);
+	if (ret < 0)
+		return ret;
+	if (ret)
+		mask |= ATTR_KILL_PRIV;
+	return mask;
+}
+
+/*
+ * XXX: Workaround for missing export - needs the patches in upstream
+ */
+int fuse_file_needs_remove_privs(struct file *file)
+{
+	struct dentry *dentry = file_dentry(file);
+
+	return fuse_dentry_needs_remove_privs(file_mnt_idmap(file), dentry);
+}
+
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
+	struct fuse_file *ff = file->private_data;
 	struct address_space *mapping = file->f_mapping;
 	ssize_t written = 0;
 	struct inode *inode = mapping->host;
 	ssize_t err;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	bool exclusive = false;
+	bool fopen_dio = !!(ff->open_flags & FOPEN_DIRECT_IO);
+	int remove_privs = 0;
 
-	if (fc->writeback_cache) {
+	if (fc->writeback_cache && !(iocb->ki_flags & IOCB_DIRECT)) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
-		err = fuse_update_attributes(mapping->host, file,
+		err = fuse_update_attributes(inode, file,
 					     STATX_SIZE | STATX_MODE);
 		if (err)
 			return err;
@@ -1338,35 +1618,62 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 writethrough:
-	inode_lock(inode);
+relock:
+	fuse_dio_lock(iocb, from , &exclusive);
 
 	err = generic_write_checks(iocb, from);
 	if (err <= 0)
 		goto out;
 
-	err = file_remove_privs(file);
-	if (err)
-		goto out;
+	/* traditionally FOPEN_DIRECT_IO does not do remove privileges */
+	if (!fopen_dio && !exclusive) {
+		remove_privs = fuse_file_needs_remove_privs(file);
+		if (remove_privs) {
+			fuse_dio_unlock(inode, exclusive);
+			exclusive = true;
+			goto relock;
+		}
+	} else {
+		remove_privs = 1;
+	}
+
+	if (remove_privs) {
+		/* needs the exclusive lock */
+		err = file_remove_privs(file);
+		if (err)
+			goto out;
+	}
 
 	err = file_update_time(file);
 	if (err)
 		goto out;
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
-		written = generic_file_direct_write(iocb, from);
+		ssize_t wr = generic_file_direct_write(iocb, from);
+		written = wr < 0 ? wr : written + wr;
 		if (written < 0 || !iov_iter_count(from))
 			goto out;
+
+		if (!exclusive) {
+			/* fallback to page IO needs the exclusive lock */
+			fuse_dio_unlock(inode, exclusive);
+			exclusive = true;
+
+			/* unlock might introduce races - redo checks */
+			goto relock;
+		}
+
 		written = direct_write_fallback(iocb, from, written,
 				fuse_perform_write(iocb, from));
 	} else {
 		written = fuse_perform_write(iocb, from);
 	}
 out:
-	inode_unlock(inode);
+	fuse_dio_unlock(inode, exclusive);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
 
-	return written ? written : err;
+	return err ? err : written;
 }
 
 static inline unsigned long fuse_get_user_addr(const struct iov_iter *ii)
@@ -1436,13 +1743,14 @@ static int fuse_get_user_pages(struct fuse_args_pages *ap, struct iov_iter *ii,
 	return ret < 0 ? ret : 0;
 }
 
-ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
-		       loff_t *ppos, int flags)
+ssize_t fuse_send_dio(struct fuse_io_priv *io, struct iov_iter *iter,
+		      loff_t *ppos, int flags)
 {
 	int write = flags & FUSE_DIO_WRITE;
 	int cuse = flags & FUSE_DIO_CUSE;
 	struct file *file = io->iocb->ki_filp;
-	struct inode *inode = file->f_mapping->host;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
 	struct fuse_file *ff = file->private_data;
 	struct fuse_conn *fc = ff->fm->fc;
 	size_t nmax = write ? fc->max_write : fc->max_read;
@@ -1454,7 +1762,6 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 	int err = 0;
 	struct fuse_io_args *ia;
 	unsigned int max_pages;
-
 	max_pages = iov_iter_npages(iter, fc->max_pages);
 	ia = fuse_io_alloc(io, max_pages);
 	if (!ia)
@@ -1521,7 +1828,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 
 	return res > 0 ? res : err;
 }
-EXPORT_SYMBOL_GPL(fuse_direct_io);
+EXPORT_SYMBOL_GPL(fuse_send_dio);
 
 static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 				  struct iov_iter *iter,
@@ -1530,7 +1837,7 @@ static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 	ssize_t res;
 	struct inode *inode = file_inode(io->iocb->ki_filp);
 
-	res = fuse_direct_io(io, iter, ppos, 0);
+	res = fuse_send_dio(io, iter, ppos, 0);
 
 	fuse_invalidate_atime(inode);
 
@@ -1550,65 +1857,6 @@ static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 		res = __fuse_direct_read(&io, to, &iocb->ki_pos);
 	}
-
-	return res;
-}
-
-static bool fuse_direct_write_extending_i_size(struct kiocb *iocb,
-					       struct iov_iter *iter)
-{
-	struct inode *inode = file_inode(iocb->ki_filp);
-
-	return iocb->ki_pos + iov_iter_count(iter) > i_size_read(inode);
-}
-
-static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
-{
-	struct inode *inode = file_inode(iocb->ki_filp);
-	struct file *file = iocb->ki_filp;
-	struct fuse_file *ff = file->private_data;
-	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
-	ssize_t res;
-	bool exclusive_lock =
-		!(ff->open_flags & FOPEN_PARALLEL_DIRECT_WRITES) ||
-		iocb->ki_flags & IOCB_APPEND ||
-		fuse_direct_write_extending_i_size(iocb, from);
-
-	/*
-	 * Take exclusive lock if
-	 * - Parallel direct writes are disabled - a user space decision
-	 * - Parallel direct writes are enabled and i_size is being extended.
-	 *   This might not be needed at all, but needs further investigation.
-	 */
-	if (exclusive_lock)
-		inode_lock(inode);
-	else {
-		inode_lock_shared(inode);
-
-		/* A race with truncate might have come up as the decision for
-		 * the lock type was done without holding the lock, check again.
-		 */
-		if (fuse_direct_write_extending_i_size(iocb, from)) {
-			inode_unlock_shared(inode);
-			inode_lock(inode);
-			exclusive_lock = true;
-		}
-	}
-
-	res = generic_write_checks(iocb, from);
-	if (res > 0) {
-		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
-			res = fuse_direct_IO(iocb, from);
-		} else {
-			res = fuse_direct_io(&io, from, &iocb->ki_pos,
-					     FUSE_DIO_WRITE);
-			fuse_write_update_attr(inode, iocb->ki_pos, res);
-		}
-	}
-	if (exclusive_lock)
-		inode_unlock(inode);
-	else
-		inode_unlock_shared(inode);
 
 	return res;
 }
@@ -1643,10 +1891,10 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (FUSE_IS_DAX(inode))
 		return fuse_dax_write_iter(iocb, from);
 
-	if (!(ff->open_flags & FOPEN_DIRECT_IO))
-		return fuse_cache_write_iter(iocb, from);
-	else
-		return fuse_direct_write_iter(iocb, from);
+	if (ff->open_flags & FOPEN_DIRECT_IO)
+		iocb->ki_flags |= IOCB_DIRECT;
+
+	return fuse_cache_write_iter(iocb, from);
 }
 
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
@@ -2455,19 +2703,44 @@ static const struct vm_operations_struct fuse_file_vm_ops = {
 static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct fuse_file *ff = file->private_data;
+	struct fuse_conn *fc = ff->fm->fc;
+	int rc;
 
 	/* DAX mmap is superior to direct_io mmap */
 	if (FUSE_IS_DAX(file_inode(file)))
 		return fuse_dax_mmap(file, vma);
 
+	/*
+	 * FOPEN_DIRECT_IO handling is special compared to O_DIRECT,
+	 * as does not allow MAP_SHARED mmap without FUSE_DIRECT_IO_ALLOW_MMAP.
+	 */
 	if (ff->open_flags & FOPEN_DIRECT_IO) {
-		/* Can't provide the coherency needed for MAP_SHARED */
-		if (vma->vm_flags & VM_MAYSHARE)
+		/*
+		 * Can't provide the coherency needed for MAP_SHARED
+		 * if FUSE_DIRECT_IO_ALLOW_MMAP isn't set.
+		 */
+		if ((vma->vm_flags & VM_MAYSHARE) && !fc->direct_io_allow_mmap)
 			return -ENODEV;
 
 		invalidate_inode_pages2(file->f_mapping);
 
-		return generic_file_mmap(file, vma);
+		/*
+		 * First mmap of direct_io file enters caching inode io mode.
+		 * Also waits for parallel dio writers to go into serial mode
+		 * (exclusive instead of shared lock).
+		 */
+		rc = fuse_file_io_mmap(ff, file_inode(file));
+		if (rc)
+			return rc;
+
+		if (!(vma->vm_flags & VM_MAYSHARE)) {
+			/* MAP_PRIVATE */
+			return generic_file_mmap(file, vma);
+		}
+	} else if (file->f_flags & O_DIRECT) {
+		rc = fuse_file_io_mmap(ff, file_inode(file));
+		if (rc)
+			return rc;
 	}
 
 	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
@@ -2934,7 +3207,7 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
+		ret = fuse_send_dio(io, iter, &pos, FUSE_DIO_WRITE);
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 	} else {
 		ret = __fuse_direct_read(io, iter, &pos);
@@ -3243,7 +3516,9 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	INIT_LIST_HEAD(&fi->write_files);
 	INIT_LIST_HEAD(&fi->queued_writes);
 	fi->writectr = 0;
+	fi->iocachectr = 0;
 	init_waitqueue_head(&fi->page_waitq);
+	init_waitqueue_head(&fi->direct_io_waitq);
 	fi->writepages = RB_ROOT;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
