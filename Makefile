@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 5
 SUBLEVEL = 3
-EXTRAVERSION =
+EXTRAVERSION = Ubuntu-hwe-6.5-6.5.0-9.9~22.04.2
 NAME = Hurr durr I'ma ninja sloth
 
 # *DOCUMENTATION*
