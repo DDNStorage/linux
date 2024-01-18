@@ -7,6 +7,8 @@
 */
 
 #include "fuse_i.h"
+#include "fuse_dev_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -25,20 +27,12 @@
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
 
-/* Ordinary requests have even IDs, while interrupts IDs are odd */
-#define FUSE_INT_REQ_BIT (1ULL << 0)
-#define FUSE_REQ_ID_STEP (1ULL << 1)
+static bool __read_mostly enable_uring;
+module_param(enable_uring, bool, 0644);
+MODULE_PARM_DESC(enable_uring,
+	"Enable uring userspace communication through uring.");
 
 static struct kmem_cache *fuse_req_cachep;
-
-static struct fuse_dev *fuse_get_dev(struct file *file)
-{
-	/*
-	 * Lockless access is OK, because file->private data is set
-	 * once during mount and is valid until the file is released.
-	 */
-	return READ_ONCE(file->private_data);
-}
 
 static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
 {
@@ -222,13 +216,29 @@ const struct fuse_iqueue_ops fuse_dev_fiq_ops = {
 };
 EXPORT_SYMBOL_GPL(fuse_dev_fiq_ops);
 
-static void queue_request_and_unlock(struct fuse_iqueue *fiq,
-				     struct fuse_req *req)
+
+static void queue_request_and_unlock(struct fuse_conn *fc,
+				     struct fuse_req *req, bool allow_uring)
 __releases(fiq->lock)
 {
+	struct fuse_iqueue *fiq = &fc->iq;
+
 	req->in.h.len = sizeof(struct fuse_in_header) +
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
+
+	if (allow_uring && fc->ring.ready) {
+		int res;
+
+		/* this lock is not needed at all for ring req handling */
+		spin_unlock(&fiq->lock);
+		res = fuse_uring_queue_fuse_req(fc, req);
+		if (!res)
+			return;
+
+		/* fallthrough, handled through /dev/fuse read/write */
+	}
+
 	list_add_tail(&req->list, &fiq->pending);
 	fiq->ops->wake_pending_and_unlock(fiq);
 }
@@ -265,7 +275,7 @@ static void flush_bg_queue(struct fuse_conn *fc)
 		fc->active_background++;
 		spin_lock(&fiq->lock);
 		req->in.h.unique = fuse_get_unique(fiq);
-		queue_request_and_unlock(fiq, req);
+		queue_request_and_unlock(fc, req, true);
 	}
 }
 
@@ -366,13 +376,34 @@ static void request_wait_answer(struct fuse_req *req)
 	struct fuse_conn *fc = req->fm->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
 	int err;
+	int prev_cpu = task_cpu(current);
+
+	/* When running over uring and core affined userspace threads, we
+	 * do not want to let migrate away the request submitting process.
+	 * Issue is that even after waking up on the right core, processes
+	 * that have submitted requests might get migrated away, because
+	 * the ring thread is still doing a bit of work or is in the process
+	 * to go to sleep. Assumption here is that processes are started on
+	 * the right core (i.e. idle cores) and can then stay on that core
+	 * when they come and do file system requests.
+	 * Another alternative way is to set SCHED_IDLE for ring threads,
+	 * but that would have an issue if there are other processes keeping
+	 * the cpu busy.
+	 * SCHED_IDLE or this hack here result in about factor 3.5 for
+	 * max meta request performance.
+	 *
+	 * Ideal would to tell the scheduler that ring threads are not disturbing
+	 * that migration away from it should very very rarely happen.
+	 */
+	if (fc->ring.ready)
+		migrate_disable();
 
 	if (!fc->no_interrupt) {
 		/* Any signal may interrupt this */
 		err = wait_event_interruptible(req->waitq,
 					test_bit(FR_FINISHED, &req->flags));
 		if (!err)
-			return;
+			goto out;
 
 		set_bit(FR_INTERRUPTED, &req->flags);
 		/* matches barrier in fuse_dev_do_read() */
@@ -386,7 +417,7 @@ static void request_wait_answer(struct fuse_req *req)
 		err = wait_event_killable(req->waitq,
 					test_bit(FR_FINISHED, &req->flags));
 		if (!err)
-			return;
+			goto out;
 
 		spin_lock(&fiq->lock);
 		/* Request is not yet in userspace, bail out */
@@ -395,7 +426,7 @@ static void request_wait_answer(struct fuse_req *req)
 			spin_unlock(&fiq->lock);
 			__fuse_put_request(req);
 			req->out.h.error = -EINTR;
-			return;
+			goto out;
 		}
 		spin_unlock(&fiq->lock);
 	}
@@ -405,11 +436,18 @@ static void request_wait_answer(struct fuse_req *req)
 	 * Wait it out.
 	 */
 	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
+
+out:
+	migrate_enable();
+	if (prev_cpu != task_cpu(current))
+		pr_debug("%s task=%p cpu from=%d to=%d\n",
+			__func__, current, prev_cpu, task_cpu(current));
 }
 
 static void __fuse_request_send(struct fuse_req *req)
 {
-	struct fuse_iqueue *fiq = &req->fm->fc->iq;
+	struct fuse_conn *fc = req->fm->fc;
+	struct fuse_iqueue *fiq = &fc->iq;
 
 	BUG_ON(test_bit(FR_BACKGROUND, &req->flags));
 	spin_lock(&fiq->lock);
@@ -421,7 +459,7 @@ static void __fuse_request_send(struct fuse_req *req)
 		/* acquire extra reference, since request is still needed
 		   after fuse_request_end() */
 		__fuse_get_request(req);
-		queue_request_and_unlock(fiq, req);
+		queue_request_and_unlock(fc, req, true);
 
 		request_wait_answer(req);
 		/* Pairs with smp_wmb() in fuse_request_end() */
@@ -491,6 +529,12 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 	if (args->force) {
 		atomic_inc(&fc->num_waiting);
 		req = fuse_request_alloc(fm, GFP_KERNEL | __GFP_NOFAIL);
+		if (unlikely(!req)) {
+			/* should only happen with uring on shutdown */
+			WARN_ON(!fc->ring.configured);
+			ret = -ENOTCONN;
+			goto err;
+		}
 
 		if (!args->nocreds)
 			fuse_force_creds(req);
@@ -518,16 +562,55 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 	}
 	fuse_put_request(req);
 
+err:
 	return ret;
 }
 
-static bool fuse_request_queue_background(struct fuse_req *req)
+static bool fuse_request_queue_background_uring(struct fuse_conn *fc,
+					       struct fuse_req *req)
+{
+	struct fuse_iqueue *fiq = &fc->iq;
+	int err;
+
+	req->in.h.unique = fuse_get_unique(fiq);
+	req->in.h.len = sizeof(struct fuse_in_header) +
+		fuse_len_args(req->args->in_numargs,
+			      (struct fuse_arg *) req->args->in_args);
+
+	err = fuse_uring_queue_fuse_req(fc, req);
+	if (!err) {
+		/* XXX remove and lets the users of that use per queue values -
+		 * avoid the shared spin lock...
+		 * Is this needed at all?
+		 */
+		spin_lock(&fc->bg_lock);
+		fc->num_background++;
+		fc->active_background++;
+
+
+		/* XXX block when per ring queues get occupied */
+		if (fc->num_background == fc->max_background)
+			fc->blocked = 1;
+		spin_unlock(&fc->bg_lock);
+	}
+
+	return err ? false : true;
+}
+
+/*
+ * @return true if queued
+ */
+static int fuse_request_queue_background(struct fuse_req *req)
 {
 	struct fuse_mount *fm = req->fm;
 	struct fuse_conn *fc = fm->fc;
 	bool queued = false;
 
 	WARN_ON(!test_bit(FR_BACKGROUND, &req->flags));
+
+	if (fc->ring.ready)
+		return fuse_request_queue_background_uring(fc, req);
+
 	if (!test_bit(FR_WAITING, &req->flags)) {
 		__set_bit(FR_WAITING, &req->flags);
 		atomic_inc(&fc->num_waiting);
@@ -580,7 +663,8 @@ static int fuse_simple_notify_reply(struct fuse_mount *fm,
 				    struct fuse_args *args, u64 unique)
 {
 	struct fuse_req *req;
-	struct fuse_iqueue *fiq = &fm->fc->iq;
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_iqueue *fiq = &fc->iq;
 	int err = 0;
 
 	req = fuse_get_req(fm, false);
@@ -594,7 +678,8 @@ static int fuse_simple_notify_reply(struct fuse_mount *fm,
 
 	spin_lock(&fiq->lock);
 	if (fiq->connected) {
-		queue_request_and_unlock(fiq, req);
+		/* uring for notify not supported yet */
+		queue_request_and_unlock(fc, req, false);
 	} else {
 		err = -ENODEV;
 		spin_unlock(&fiq->lock);
@@ -641,21 +726,7 @@ static int unlock_request(struct fuse_req *req)
 	return err;
 }
 
-struct fuse_copy_state {
-	int write;
-	struct fuse_req *req;
-	struct iov_iter *iter;
-	struct pipe_buffer *pipebufs;
-	struct pipe_buffer *currbuf;
-	struct pipe_inode_info *pipe;
-	unsigned long nr_segs;
-	struct page *pg;
-	unsigned len;
-	unsigned offset;
-	unsigned move_pages:1;
-};
-
-static void fuse_copy_init(struct fuse_copy_state *cs, int write,
+void fuse_copy_init(struct fuse_copy_state *cs, int write,
 			   struct iov_iter *iter)
 {
 	memset(cs, 0, sizeof(*cs));
@@ -666,6 +737,7 @@ static void fuse_copy_init(struct fuse_copy_state *cs, int write,
 /* Unmap and put previous page of userspace buffer */
 static void fuse_copy_finish(struct fuse_copy_state *cs)
 {
+
 	if (cs->currbuf) {
 		struct pipe_buffer *buf = cs->currbuf;
 
@@ -730,6 +802,10 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 			cs->pipebufs++;
 			cs->nr_segs++;
 		}
+	} else if (cs->is_uring) {
+		if (cs->ring.offset > cs->ring.buf_sz)
+			return -ERANGE;
+		cs->len = cs->ring.buf_sz - cs->ring.offset;
 	} else {
 		size_t off;
 		err = iov_iter_get_pages2(cs->iter, &page, PAGE_SIZE, 1, &off);
@@ -748,21 +824,35 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
 {
 	unsigned ncpy = min(*size, cs->len);
+
 	if (val) {
-		void *pgaddr = kmap_local_page(cs->pg);
-		void *buf = pgaddr + cs->offset;
+
+		void *pgaddr;
+		void *buf;
+
+		if (cs->is_uring) {
+			buf = cs->ring.buf + cs->ring.offset;
+			cs->ring.offset += ncpy;
+
+		} else {
+			pgaddr = kmap_local_page(cs->pg);
+			buf = pgaddr + cs->offset;
+		}
 
 		if (cs->write)
 			memcpy(buf, *val, ncpy);
 		else
 			memcpy(*val, buf, ncpy);
 
-		kunmap_local(pgaddr);
+		if (pgaddr)
+			kunmap_local(pgaddr);
+
 		*val += ncpy;
 	}
 	*size -= ncpy;
 	cs->len -= ncpy;
 	cs->offset += ncpy;
+
 	return ncpy;
 }
 
@@ -1010,9 +1100,9 @@ static int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size)
 }
 
 /* Copy request arguments to/from userspace buffer */
-static int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
-			  unsigned argpages, struct fuse_arg *args,
-			  int zeroing)
+int fuse_copy_args(struct fuse_copy_state *cs, unsigned int numargs,
+		   unsigned int argpages, struct fuse_arg *args,
+		   int zeroing)
 {
 	int err = 0;
 	unsigned i;
@@ -1819,10 +1909,15 @@ static struct fuse_req *request_find(struct fuse_pqueue *fpq, u64 unique)
 	return NULL;
 }
 
-static int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
-			 unsigned nbytes)
+int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
+		       unsigned int nbytes)
 {
-	unsigned reqsize = sizeof(struct fuse_out_header);
+
+	unsigned int reqsize = 0;
+
+	/* Uring has the out header outside of args */
+	if (!cs->is_uring)
+		reqsize = sizeof(struct fuse_out_header);
 
 	reqsize += fuse_len_args(args->out_numargs, args->out_args);
 
@@ -1922,7 +2017,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	if (oh.error)
 		err = nbytes != sizeof(oh) ? -EINVAL : 0;
 	else
-		err = copy_out_args(cs, req->args, nbytes);
+		err = fuse_copy_out_args(cs, req->args, nbytes);
 	fuse_copy_finish(cs);
 
 	spin_lock(&fpq->lock);
@@ -2077,7 +2172,7 @@ static __poll_t fuse_dev_poll(struct file *file, poll_table *wait)
 }
 
 /* Abort all requests on the given list (pending or processing) */
-static void end_requests(struct list_head *head)
+void fuse_dev_end_requests(struct list_head *head)
 {
 	while (!list_empty(head)) {
 		struct fuse_req *req;
@@ -2139,6 +2234,9 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		spin_unlock(&fc->bg_lock);
 
 		fuse_set_initialized(fc);
+
+		WRITE_ONCE(fc->ring.stop_requested, 1);
+
 		list_for_each_entry(fud, &fc->devices, entry) {
 			struct fuse_pqueue *fpq = &fud->pq;
 
@@ -2180,7 +2278,13 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		wake_up_all(&fc->blocked_waitq);
 		spin_unlock(&fc->lock);
 
-		end_requests(&to_end);
+		fuse_dev_end_requests(&to_end);
+
+		if (fc->ring.configured && !fc->ring.queues_stopped) {
+			fuse_uring_end_requests(fc);
+			fuse_uring_stop_queues(fc);
+		}
+
 	} else {
 		spin_unlock(&fc->lock);
 	}
@@ -2191,7 +2295,13 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 {
 	/* matches implicit memory barrier in fuse_drop_waiting() */
 	smp_mb();
+
 	wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
+
+	/* XXX use struct completion? */
+	if (fc->ring.nr_queues)
+		wait_event(fc->ring.stop_waitq,
+			   READ_ONCE(fc->ring.queues_stopped) == true);
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
@@ -2203,6 +2313,7 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 		struct fuse_pqueue *fpq = &fud->pq;
 		LIST_HEAD(to_end);
 		unsigned int i;
+		int dev_cnt;
 
 		spin_lock(&fpq->lock);
 		WARN_ON(!list_empty(&fpq->io));
@@ -2210,10 +2321,17 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 			list_splice_init(&fpq->processing[i], &to_end);
 		spin_unlock(&fpq->lock);
 
-		end_requests(&to_end);
+		fuse_dev_end_requests(&to_end);
 
-		/* Are we the last open device? */
-		if (atomic_dec_and_test(&fc->dev_count)) {
+		/*
+		 * Are we the last open device?
+		 * Or is this with io_uring and only ring devices left?
+		 * These devices will not receive a ->release() as long as
+		 * commands are not completed with io_uring_cmd_done
+		 */
+		dev_cnt = atomic_dec_return(&fc->dev_count);
+		if (dev_cnt == 0 ||
+		   (fc->ring.ready && dev_cnt == fc->ring.nr_queues)) {
 			WARN_ON(fc->iq.fasync != NULL);
 			fuse_abort_conn(fc);
 		}
@@ -2251,42 +2369,104 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
 	return 0;
 }
 
+static int fuse_dev_ioctl_clone(struct file *file, int oldfd)
+{
+	struct fd f;
+	struct fuse_dev *fud;
+	int res;
+
+	f = fdget(oldfd);
+	if (!f.file)
+		return -EINVAL;
+
+	/*
+	 * Check against file->f_op because CUSE
+	 * uses the same ioctl handler.
+	 */
+	if (f.file->f_op == file->f_op)
+		fud = fuse_get_dev(f.file);
+
+	res = -EINVAL;
+	if (fud) {
+		mutex_lock(&fuse_mutex);
+		res = fuse_device_clone(fud->fc, file);
+		mutex_unlock(&fuse_mutex);
+	}
+	fdput(f);
+
+	return res;
+}
+
+/**
+ * Configure the queue for t he given qid. First call will also initialize
+ * the ring for this connection.
+ */
+static int fuse_dev_uring_ioctl(struct file *file, unsigned long arg)
+{
+	struct fuse_dev *fud;
+	struct fuse_conn *fc;
+	int res;
+	struct fuse_uring_cfg cfg;
+
+	res = copy_from_user(&cfg, (void *)arg, sizeof(cfg));
+	if (res != 0)
+		return -EFAULT;
+
+	if (cfg.cmd == FUSE_URING_IOCTL_CMD_QUEUE_CFG) {
+		res = fuse_dev_ioctl_clone(file, cfg.qconf.control_fd);
+		if (res != 0)
+			return res;
+	}
+
+	fud = fuse_get_dev(file);
+	if (fud == NULL)
+		return -ENODEV;
+	fc = fud->fc;
+
+	switch (cfg.cmd) {
+		case FUSE_URING_IOCTL_CMD_RING_CFG:
+			mutex_lock(&fc->ring.start_stop_lock);
+			res = fuse_uring_conn_cfg(fc, &cfg.rconf);
+			mutex_unlock(&fc->ring.start_stop_lock);
+
+			if (res != 0)
+				return res;
+			break;
+
+		case FUSE_URING_IOCTL_CMD_QUEUE_CFG:
+			res = fuse_uring_queue_cfg(fc, &cfg.qconf);
+			break;
+
+		default:
+			res = -EINVAL;
+	}
+
+	return res;
+}
+
 static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 			   unsigned long arg)
 {
-	int res;
 	int oldfd;
-	struct fuse_dev *fud = NULL;
-	struct fd f;
+	int res;
 
 	switch (cmd) {
 	case FUSE_DEV_IOC_CLONE:
 		if (get_user(oldfd, (__u32 __user *)arg))
 			return -EFAULT;
 
-		f = fdget(oldfd);
-		if (!f.file)
-			return -EINVAL;
-
-		/*
-		 * Check against file->f_op because CUSE
-		 * uses the same ioctl handler.
-		 */
-		if (f.file->f_op == file->f_op)
-			fud = fuse_get_dev(f.file);
-
-		res = -EINVAL;
-		if (fud) {
-			mutex_lock(&fuse_mutex);
-			res = fuse_device_clone(fud->fc, file);
-			mutex_unlock(&fuse_mutex);
-		}
-		fdput(f);
+		res = fuse_dev_ioctl_clone(file, oldfd);
 		break;
+	case FUSE_DEV_IOC_URING:
+		if (!enable_uring)
+			return -ENOTTY;
+
+		return fuse_dev_uring_ioctl(file, arg);
 	default:
 		res = -ENOTTY;
 		break;
 	}
+
 	return res;
 }
 
@@ -2303,6 +2483,8 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
+	.mmap		= fuse_uring_mmap,
+	.uring_cmd	= fuse_uring_cmd,
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 

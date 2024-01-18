@@ -989,9 +989,76 @@ struct fuse_notify_retrieve_in {
 	uint64_t	dummy4;
 };
 
+enum fuse_uring_ioctl_cmd {
+	/* not correctly initialized when set */
+	FUSE_URING_IOCTL_CMD_INVALID    = 0,
+
+	/* Ioctl to prepare communucation with io-uring */
+	FUSE_URING_IOCTL_CMD_RING_CFG   = 1,
+
+	/* Ring queue configuration ioctl */
+	FUSE_URING_IOCTL_CMD_QUEUE_CFG  = 2,
+};
+
+enum fuse_uring_cfg_flags {
+	/* server/deamon side requests numa awareness */
+	FUSE_URING_WANT_NUMA = 1ul << 0,
+};
+
+struct fuse_uring_cfg {
+	/* struct flags */
+	uint64_t flags;
+
+	/* configuration command */
+	uint8_t cmd;
+
+	uint8_t padding[7];
+
+	union {
+		struct fuse_ring_config {
+			/* number of queues */
+			uint32_t nr_queues;
+
+			/* number of foreground entries per queue */
+			uint32_t fg_queue_depth;
+
+			/* number of background entries per queue */
+			uint32_t async_queue_depth;
+
+			/* argument (max data length) of a request */
+			uint32_t req_arg_len;
+
+			/*
+			 * buffer size userspace allocated per request buffer
+			 * from the mmaped queue buffer
+			 * */
+			uint32_t user_req_buf_sz;
+
+			/* ring config flags */
+			uint32_t numa_aware:1;
+		} rconf;
+
+		struct fuse_ring_queue_config {
+			/* mmaped buffser address */
+			uint64_t uaddr;
+
+			/* qid the command is for */
+			uint32_t qid;
+
+			/* /dev/fuse fd that initiated the mount. */
+			uint32_t control_fd;
+		} qconf;
+
+		/* space for future additions */
+		uint8_t union_size[128];
+	};
+};
+
 /* Device ioctls: */
 #define FUSE_DEV_IOC_MAGIC		229
 #define FUSE_DEV_IOC_CLONE		_IOR(FUSE_DEV_IOC_MAGIC, 0, uint32_t)
+#define FUSE_DEV_IOC_URING		_IOR(FUSE_DEV_IOC_MAGIC, 1, \
+					     struct fuse_uring_cfg)
 
 struct fuse_lseek_in {
 	uint64_t	fh;
@@ -1091,6 +1158,70 @@ struct fuse_ext_header {
 struct fuse_supp_groups {
 	uint32_t	nr_groups;
 	uint32_t	groups[];
+};
+
+/**
+ * Size of the ring buffer header
+ */
+#define FUSE_RING_HEADER_BUF_SIZE 4096
+#define FUSE_RING_MIN_IN_OUT_ARG_SIZE 4096
+
+/* Request is background type. Daemon side is free to use this information
+ * to handle foreground/background CQEs with different priorities.
+ */
+#define FUSE_RING_REQ_FLAG_ASYNC (1ull << 0)
+
+/**
+ * This structure mapped onto the
+ */
+struct fuse_ring_req {
+	union {
+		/* The first 4K are command data */
+		char ring_header[FUSE_RING_HEADER_BUF_SIZE];
+
+		struct {
+			uint64_t flags;
+
+			/* enum fuse_ring_buf_cmd */
+			uint32_t in_out_arg_len;
+			uint32_t padding;
+
+			/* kernel fills in, reads out */
+			union {
+				struct fuse_in_header in;
+				struct fuse_out_header out;
+			};
+		};
+	};
+
+	char in_out_arg[];
+};
+
+/**
+ * sqe commands to the kernel
+ */
+enum fuse_uring_cmd {
+	FUSE_URING_REQ_INVALID = 0,
+
+	/* submit sqe to kernel to get a request */
+	FUSE_URING_REQ_FETCH = 1,
+
+	/* commit result and fetch next request */
+	FUSE_URING_REQ_COMMIT_AND_FETCH = 2,
+};
+
+/**
+ * In the 80B command area of the SQE.
+ */
+struct fuse_uring_cmd_req {
+	/* queue the command is for (queue index) */
+	uint16_t qid;
+
+	/* queue entry (array index) */
+	uint16_t tag;
+
+	/* pointer to struct fuse_uring_buf_req */
+	uint32_t flags;
 };
 
 #endif /* _LINUX_FUSE_H */

@@ -7,6 +7,7 @@
 */
 
 #include "fuse_i.h"
+#include "dev_uring_i.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -216,6 +217,9 @@ void fuse_finish_open(struct inode *inode, struct file *file)
 	}
 	if ((file->f_mode & FMODE_WRITE) && fc->writeback_cache)
 		fuse_link_write_file(file);
+
+	if (ff->open_flags & FOPEN_PARALLEL_DIRECT_WRITES)
+		file->f_mode |= FMODE_DIO_PARALLEL_WRITE;
 }
 
 int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
@@ -770,6 +774,7 @@ static ssize_t fuse_async_req_send(struct fuse_mount *fm,
 
 	ia->ap.args.end = fuse_aio_complete_req;
 	ia->ap.args.may_block = io->should_dirty;
+	ia->ap.args.async_blocking = io->blocking;
 	err = fuse_simple_background(fm, &ia->ap.args, GFP_KERNEL);
 	if (err)
 		fuse_aio_complete_req(fm, &ia->ap.args, err);
@@ -933,11 +938,20 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
+	struct fuse_conn *fc = fm->fc;
 	struct fuse_args_pages *ap = &ia->ap;
 	loff_t pos = page_offset(ap->pages[0]);
 	size_t count = ap->num_pages << PAGE_SHIFT;
 	ssize_t res;
 	int err;
+	unsigned async = fc->async_read;
+
+	/* sync request stay longer on the same core - important with uring
+	 * Check here and not only in dev_uring.c as we have control in
+	 * fuse_simple_request if it should wake up on the same core,
+	 * avoids application core switching */
+	if (async && fc->ring.ready && count <= FUSE_URING_MIN_ASYNC_SIZE)
+		async = 0;
 
 	ap->args.out_pages = true;
 	ap->args.page_zeroing = true;
@@ -952,7 +966,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	ia->read.attr_ver = fuse_get_attr_version(fm->fc);
-	if (fm->fc->async_read) {
+	if (async) {
 		ia->ff = fuse_file_get(ff);
 		ap->args.end = fuse_readpages_end;
 		err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
@@ -2929,6 +2943,7 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 
 	if (io->async) {
 		bool blocking = io->blocking;
+		const bool is_ring = ff->fm->fc->ring.ready;
 
 		fuse_aio_complete(io, ret < 0 ? ret : 0, -1);
 
@@ -2936,7 +2951,13 @@ fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 		if (!blocking)
 			return -EIOCBQUEUED;
 
+		/* XXX Fix the scheduler / wait_for_completion()
+		 * Without the ring might be a negative impact */
+		if (is_ring)
+			migrate_disable();
 		wait_for_completion(&wait);
+		if (is_ring)
+			migrate_enable();
 		ret = fuse_get_res_by_io(io);
 	}
 
