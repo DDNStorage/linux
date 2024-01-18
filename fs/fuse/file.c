@@ -1511,6 +1511,69 @@ static void fuse_dio_unlock(struct inode *inode, bool exclusive)
 	}
 }
 
+/**
+ * cap_inode_need_killpriv - Determine if inode change affects privileges
+ * @dentry: The inode/dentry in being changed with change marked ATTR_KILL_PRIV
+ *
+ * Determine if an inode having a change applied that's marked ATTR_KILL_PRIV
+ * affects the security markings on that inode, and if it is, should
+ * inode_killpriv() be invoked or the change rejected.
+ *
+ * Return: 1 if security.capability has a value, meaning inode_killpriv()
+ * is required, 0 otherwise, meaning inode_killpriv() is not required.
+ */
+int fuse_cap_inode_need_killpriv(struct dentry *dentry)
+{
+	struct inode *inode = d_backing_inode(dentry);
+	int error;
+
+	error = __vfs_getxattr(dentry, inode, XATTR_NAME_CAPS, NULL, 0);
+	return error > 0;
+}
+
+static inline int fuse_security_inode_need_killpriv(struct dentry *dentry)
+{
+	return fuse_cap_inode_need_killpriv(dentry);
+}
+
+
+/*
+ * Return mask of changes for notify_change() that need to be done as a
+ * response to write or truncate. Return 0 if nothing has to be changed.
+ * Negative value on error (change should be denied).
+ *
+ * XXX: workaround for missing file_needs_remove_privs export
+ */
+int fuse_dentry_needs_remove_privs(struct mnt_idmap *idmap,
+			      struct dentry *dentry)
+{
+	struct inode *inode = d_inode(dentry);
+	int mask = 0;
+	int ret;
+
+	if (IS_NOSEC(inode))
+		return 0;
+
+	mask = setattr_should_drop_suidgid(idmap, inode);
+	ret = fuse_security_inode_need_killpriv(dentry);
+	if (ret < 0)
+		return ret;
+	if (ret)
+		mask |= ATTR_KILL_PRIV;
+	return mask;
+}
+
+/*
+ * XXX: Workaround for missing export - needs the patches in upstream
+ */
+int fuse_file_needs_remove_privs(struct file *file)
+{
+	struct dentry *dentry = file_dentry(file);
+
+	return fuse_dentry_needs_remove_privs(file_mnt_idmap(file), dentry);
+}
+
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1550,7 +1613,7 @@ relock:
 
 	/* traditionally FOPEN_DIRECT_IO does not do remove privileges */
 	if (!fopen_dio && !exclusive) {
-		remove_privs = file_needs_remove_privs(file);
+		remove_privs = fuse_file_needs_remove_privs(file);
 		if (remove_privs) {
 			fuse_dio_unlock(inode, exclusive);
 			exclusive = true;
