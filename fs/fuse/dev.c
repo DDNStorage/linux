@@ -376,13 +376,34 @@ static void request_wait_answer(struct fuse_req *req)
 	struct fuse_conn *fc = req->fm->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
 	int err;
+	int prev_cpu = task_cpu(current);
+
+	/* When running over uring and core affined userspace threads, we
+	 * do not want to let migrate away the request submitting process.
+	 * Issue is that even after waking up on the right core, processes
+	 * that have submitted requests might get migrated away, because
+	 * the ring thread is still doing a bit of work or is in the process
+	 * to go to sleep. Assumption here is that processes are started on
+	 * the right core (i.e. idle cores) and can then stay on that core
+	 * when they come and do file system requests.
+	 * Another alternative way is to set SCHED_IDLE for ring threads,
+	 * but that would have an issue if there are other processes keeping
+	 * the cpu busy.
+	 * SCHED_IDLE or this hack here result in about factor 3.5 for
+	 * max meta request performance.
+	 *
+	 * Ideal would to tell the scheduler that ring threads are not disturbing
+	 * that migration away from it should very very rarely happen.
+	 */
+	if (fc->ring.ready)
+		migrate_disable();
 
 	if (!fc->no_interrupt) {
 		/* Any signal may interrupt this */
 		err = wait_event_interruptible(req->waitq,
 					test_bit(FR_FINISHED, &req->flags));
 		if (!err)
-			return;
+			goto out;
 
 		set_bit(FR_INTERRUPTED, &req->flags);
 		/* matches barrier in fuse_dev_do_read() */
@@ -396,7 +417,7 @@ static void request_wait_answer(struct fuse_req *req)
 		err = wait_event_killable(req->waitq,
 					test_bit(FR_FINISHED, &req->flags));
 		if (!err)
-			return;
+			goto out;
 
 		spin_lock(&fiq->lock);
 		/* Request is not yet in userspace, bail out */
@@ -405,7 +426,7 @@ static void request_wait_answer(struct fuse_req *req)
 			spin_unlock(&fiq->lock);
 			__fuse_put_request(req);
 			req->out.h.error = -EINTR;
-			return;
+			goto out;
 		}
 		spin_unlock(&fiq->lock);
 	}
@@ -415,6 +436,12 @@ static void request_wait_answer(struct fuse_req *req)
 	 * Wait it out.
 	 */
 	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
+
+out:
+	migrate_enable();
+	if (prev_cpu != task_cpu(current))
+		pr_debug("%s task=%p cpu from=%d to=%d\n",
+			__func__, current, prev_cpu, task_cpu(current));
 }
 
 static void __fuse_request_send(struct fuse_req *req)
