@@ -376,6 +376,7 @@ static void request_wait_answer(struct fuse_req *req)
 	struct fuse_conn *fc = req->fm->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
 	int err;
+	bool migrate_disabled = false;
 	int prev_cpu = task_cpu(current);
 
 	/* When running over uring and core affined userspace threads, we
@@ -395,8 +396,10 @@ static void request_wait_answer(struct fuse_req *req)
 	 * Ideal would to tell the scheduler that ring threads are not disturbing
 	 * that migration away from it should very very rarely happen.
 	 */
-	if (fc->ring.ready)
+	if (fc->ring.ready) {
 		migrate_disable();
+		migrate_disabled = true;
+	}
 
 	if (!fc->no_interrupt) {
 		/* Any signal may interrupt this */
@@ -438,10 +441,11 @@ static void request_wait_answer(struct fuse_req *req)
 	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
 
 out:
-	migrate_enable();
 	if (prev_cpu != task_cpu(current))
 		pr_debug("%s task=%p cpu from=%d to=%d\n",
-			__func__, current, prev_cpu, task_cpu(current));
+		__func__, current, prev_cpu, task_cpu(current));
+	if (migrate_disabled)
+		migrate_enable();
 }
 
 static void __fuse_request_send(struct fuse_req *req)
