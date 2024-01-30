@@ -202,9 +202,12 @@ static int fuse_file_io_open(struct file *file, struct inode *inode)
 	if (WARN_ON(ff->io_opened))
 		goto fail;
 
-	err = iomode_flags ? -EINVAL : 0;
-	if (!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode))
-		goto fail;
+	if (!S_ISREG(inode->i_mode) || FUSE_IS_DAX(inode)) {
+		err = -EINVAL;
+		if (iomode_flags)
+			goto fail;
+		return 0;
+	}
 
 	/* Set explicit FOPEN_CACHE_IO flag for file open in caching mode */
 	if (!fuse_file_is_direct_io(file))
