@@ -25,7 +25,12 @@
 #include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/io_uring.h>
+
+/* linux-6.8 only */
+#if 0
 #include <linux/io_uring/cmd.h>
+#endif
+
 #include <linux/topology.h>
 
 /* default monitor interval for a dying daemon */
