@@ -990,6 +990,10 @@ struct fuse_conn {
 	struct fuse_ring *ring;
 #endif
 
+	/* The foffset alignment in PAGE */
+	unsigned int alignment_pages;
+
+
 	/** Only used if the connection opts into request timeouts */
 	struct {
 		/* Worker for checking if any requests have timed out */

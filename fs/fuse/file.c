@@ -2071,6 +2071,7 @@ static struct fuse_writepage_args *fuse_writepage_args_setup(struct folio *folio
 struct fuse_fill_wb_data {
 	struct fuse_writepage_args *wpa;
 	struct fuse_file *ff;
+	struct inode *inode;
 	unsigned int max_folios;
 	/*
 	 * nr_bytes won't overflow since fuse_writepage_need_send() caps
@@ -2118,14 +2119,17 @@ static void fuse_writepages_send(struct inode *inode,
 	spin_unlock(&fi->lock);
 }
 
+
 static bool fuse_writepage_need_send(struct fuse_conn *fc, loff_t pos,
 				     unsigned len, struct fuse_args_pages *ap,
-				     struct fuse_fill_wb_data *data)
+				     struct fuse_fill_wb_data *data,
+				     u64 end_pos)
 {
 	struct folio *prev_folio;
 	struct fuse_folio_desc prev_desc;
 	unsigned bytes = data->nr_bytes + len;
 	loff_t prev_pos;
+	pgoff_t page_index;
 
 	WARN_ON(!ap->num_folios);
 
@@ -2148,6 +2152,24 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, loff_t pos,
 	if (ap->num_folios == data->max_folios &&
 	    !fuse_pages_realloc(data, fc->max_pages))
 		return true;
+
+	/* Reached alignment */
+	if (fc->alignment_pages) {
+		unsigned int total_pages = (bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		page_index = pos >> PAGE_SHIFT;
+
+		if (!(page_index % fc->alignment_pages)) {
+			pgoff_t end_page_index = (end_pos + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+			/* we are at a point where we would write aligned
+			 * check if we potentially could reach the next alignment */
+			if (page_index + fc->alignment_pages > end_page_index)
+				return true;
+
+			if (total_pages + fc->alignment_pages > fc->max_pages)
+				return true;
+		}
+	}
 
 	return false;
 }
@@ -2172,7 +2194,7 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 			return -EIO;
 	}
 
-	if (wpa && fuse_writepage_need_send(fc, pos, len, ap, data)) {
+	if (wpa && fuse_writepage_need_send(fc, pos, len, ap, data, end_pos)) {
 		fuse_writepages_send(inode, data);
 		data->wpa = NULL;
 		data->nr_bytes = 0;
@@ -2227,7 +2249,9 @@ static int fuse_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_fill_wb_data data = {};
+	struct fuse_fill_wb_data data = {
+		.inode = inode,
+	};
 	struct iomap_writepage_ctx wpc = {
 		.inode = inode,
 		.iomap.type = IOMAP_MAPPED,
@@ -2249,105 +2273,9 @@ static int fuse_writepages(struct address_space *mapping,
 static int fuse_launder_folio(struct folio *folio)
 {
 	int err = 0;
-	struct fuse_fill_wb_data data = {};
-	struct iomap_writepage_ctx wpc = {
+	struct fuse_fill_wb_data data = {
 		.inode = folio->mapping->host,
-		.iomap.type = IOMAP_MAPPED,
-		.ops = &fuse_writeback_ops,
-		.wb_ctx	= &data,
 	};
-
-	if (folio_clear_dirty_for_io(folio)) {
-		err = iomap_writeback_folio(&wpc, folio);
-		err = fuse_iomap_writeback_submit(&wpc, err);
-		if (!err)
-			folio_wait_writeback(folio);
-	}
-	return err;
-}
-
-/*
- * Write back dirty data/metadata now (there may not be any suitable
- * open files later for data)
- */
-static void fuse_vma_close(struct vm_area_struct *vma)
-{
-	pgoff_t index = pos >> PAGE_SHIFT;
-	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
-	struct page *page;
-	loff_t fsize;
-	int err = -ENOMEM;
-
-	WARN_ON(!fc->writeback_cache);
-
-	page = grab_cache_page_write_begin(mapping, index);
-	if (!page)
-		goto error;
-
-	fuse_wait_on_page_writeback(mapping->host, page->index);
-
-	if (PageUptodate(page) || len == PAGE_SIZE)
-		goto success;
-	/*
-	 * Check if the start this page comes after the end of file, in which
-	 * case the readpage can be optimized away.
-	 */
-	fsize = i_size_read(mapping->host);
-	if (fsize <= (pos & PAGE_MASK)) {
-		size_t off = pos & ~PAGE_MASK;
-		if (off)
-			zero_user_segment(page, 0, off);
-		goto success;
-	}
-	err = fuse_do_readpage(file, page);
-	if (err)
-		goto cleanup;
-success:
-	*pagep = page;
-	return 0;
-
-cleanup:
-	unlock_page(page);
-	put_page(page);
-error:
-	return err;
-}
-
-static int fuse_write_end(struct file *file, struct address_space *mapping,
-		loff_t pos, unsigned len, unsigned copied,
-		struct page *page, void *fsdata)
-{
-	struct inode *inode = page->mapping->host;
-
-	/* Haven't copied anything?  Skip zeroing, size extending, dirtying. */
-	if (!copied)
-		goto unlock;
-
-	pos += copied;
-	if (!PageUptodate(page)) {
-		/* Zero any unwritten bytes at the end of the page */
-		size_t endoff = pos & ~PAGE_MASK;
-		if (endoff)
-			zero_user_segment(page, endoff, PAGE_SIZE);
-		SetPageUptodate(page);
-	}
-
-	if (pos > inode->i_size)
-		i_size_write(inode, pos);
-
-	set_page_dirty(page);
-
-unlock:
-	unlock_page(page);
-	put_page(page);
-
-	return copied;
-}
-
-static int fuse_launder_folio(struct folio *folio)
-{
-	int err = 0;
-	struct fuse_fill_wb_data data = {};
 	struct iomap_writepage_ctx wpc = {
 		.inode = folio->mapping->host,
 		.iomap.type = IOMAP_MAPPED,
