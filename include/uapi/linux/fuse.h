@@ -437,6 +437,8 @@ struct fuse_file_lock {
  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
  * FUSE_INVAL_INODE_ENTRY: invalidate inode aliases when doing inode invalidation
  * FUSE_EXPIRE_INODE_ENTRY: expire inode aliases when doing inode invalidation
+ * FUSE_ALIGN_PG_ORDER: page order (power of 2 exponent for number of pages) for
+ *			optimal io-size alignment
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -484,6 +486,9 @@ struct fuse_file_lock {
 #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
 #define FUSE_ALLOW_IDMAP	(1ULL << 40)
 #define FUSE_OVER_IO_URING	(1ULL << 41)
+
+#define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
+
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
 #define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)
 
@@ -903,6 +908,9 @@ struct fuse_init_in {
 #define FUSE_COMPAT_INIT_OUT_SIZE 8
 #define FUSE_COMPAT_22_INIT_OUT_SIZE 24
 
+/*
+ * align_page_order: Number of pages for optimal IO, or a multiple of that
+ */
 struct fuse_init_out {
 	uint32_t	major;
 	uint32_t	minor;
@@ -916,7 +924,9 @@ struct fuse_init_out {
 	uint16_t	map_alignment;
 	uint32_t	flags2;
 	uint32_t	max_stack_depth;
-	uint32_t	unused[6];
+	uint8_t		align_page_order;
+	uint8_t		padding[3];
+	uint32_t	unused[5];
 };
 
 #define CUSE_INIT_INFO_MAX 4096

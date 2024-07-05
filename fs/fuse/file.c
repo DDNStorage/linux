@@ -2087,7 +2087,8 @@ static void fuse_writepages_send(struct fuse_fill_wb_data *data)
 
 static bool fuse_writepage_need_send(struct fuse_conn *fc, struct folio *folio,
 				     struct fuse_args_pages *ap,
-				     struct fuse_fill_wb_data *data)
+				     struct fuse_fill_wb_data *data,
+				     struct writeback_control *wbc)
 {
 	WARN_ON(!ap->num_folios);
 
@@ -2106,6 +2107,17 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct folio *folio,
 	/* Need to grow the pages array?  If so, did the expansion fail? */
 	if (ap->num_folios == data->max_folios && !fuse_pages_realloc(data))
 		return true;
+
+	/* Reached alignment */
+	if (fc->alignment_pages && !(folio->index % fc->alignment_pages)) {
+		/* we are at a point where we would write aligned
+		 * check if we potentially could reach the next alignment */
+		if (folio->index + fc->alignment_pages > wbc->range_end)
+			return true;
+
+		if (ap->num_folios + fc->alignment_pages > fc->max_pages)
+			return true;
+	}
 
 	return false;
 }
@@ -2128,7 +2140,7 @@ static int fuse_writepages_fill(struct folio *folio,
 			goto out_unlock;
 	}
 
-	if (wpa && fuse_writepage_need_send(fc, folio, ap, data)) {
+	if (wpa && fuse_writepage_need_send(fc, folio, ap, data, wbc)) {
 		fuse_writepages_send(data);
 		data->wpa = NULL;
 	}
