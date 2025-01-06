@@ -813,6 +813,9 @@ struct fuse_conn {
 	/* Is statx not implemented by fs? */
 	unsigned int no_statx:1;
 
+	/* Use io_uring for communication */
+	unsigned int io_uring;
+
 	/** The number of requests waiting for completion */
 	atomic_t num_waiting;
 
