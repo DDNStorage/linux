@@ -1361,8 +1361,8 @@ static void fuse_uring_send_in_task(struct io_uring_cmd *cmd,
 				    unsigned int issue_flags)
 {
 	struct fuse_ring_ent *ent = uring_cmd_to_ring_ent(cmd);
-	struct fuse_ring_queue *queue = ent->queue;
 	int err;
+	struct fuse_ring_queue *queue = ent->queue;
 
 	if (!(issue_flags & IO_URING_F_TASK_DEAD)) {
 		err = fuse_uring_prepare_send(ent);
@@ -1431,8 +1431,20 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 		if (WARN_ON_ONCE(ent->state != FRRS_FUSE_REQ))
 			goto err;
 
-		uring_cmd_set_ring_ent(cmd, ent);
-		io_uring_cmd_complete_in_task(cmd, fuse_uring_send_in_task);
+		/* If this is an io-uring task we don't know the issue_flags */
+		if (!ent->header_pages && !current->io_uring) {
+			uring_cmd_set_ring_ent(cmd, ent);
+			io_uring_cmd_complete_in_task(cmd,
+						      fuse_uring_send_in_task);
+		} else {
+			err = fuse_uring_prepare_send(ent);
+			if (err) {
+				fuse_uring_next_fuse_req(ent, queue,
+							 IO_URING_F_UNLOCKED);
+				return;
+			}
+			fuse_uring_send(ent, cmd, 0, IO_URING_F_UNLOCKED);
+		}
 	}
 
 	return;
