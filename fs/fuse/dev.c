@@ -7,8 +7,6 @@
 */
 
 #include "fuse_i.h"
-#include "fuse_dev_i.h"
-#include "dev_uring_i.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -27,14 +25,20 @@
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
 
-#ifdef CONFIG_FUSE_IO_URING
-static bool __read_mostly enable_uring;
-module_param(enable_uring, bool, 0644);
-MODULE_PARM_DESC(enable_uring,
-		 "Enable uring userspace communication through uring.");
-#endif
+/* Ordinary requests have even IDs, while interrupts IDs are odd */
+#define FUSE_INT_REQ_BIT (1ULL << 0)
+#define FUSE_REQ_ID_STEP (1ULL << 1)
 
 static struct kmem_cache *fuse_req_cachep;
+
+static struct fuse_dev *fuse_get_dev(struct file *file)
+{
+	/*
+	 * Lockless access is OK, because file->private data is set
+	 * once during mount and is valid until the file is released.
+	 */
+	return READ_ONCE(file->private_data);
+}
 
 static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
 {
@@ -218,24 +222,13 @@ const struct fuse_iqueue_ops fuse_dev_fiq_ops = {
 };
 EXPORT_SYMBOL_GPL(fuse_dev_fiq_ops);
 
-
-static void queue_request_and_unlock(struct fuse_conn *fc,
-				     struct fuse_req *req, bool allow_uring)
+static void queue_request_and_unlock(struct fuse_iqueue *fiq,
+				     struct fuse_req *req)
 __releases(fiq->lock)
 {
-	struct fuse_iqueue *fiq = &fc->iq;
-
 	req->in.h.len = sizeof(struct fuse_in_header) +
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
-
-	if (allow_uring && fuse_uring_ready(fc)) {
-		/* this lock is not needed at all for ring req handling */
-		spin_unlock(&fiq->lock);
-		fuse_uring_queue_fuse_req(fc, req);
-		return;
-	}
-
 	list_add_tail(&req->list, &fiq->pending);
 	fiq->ops->wake_pending_and_unlock(fiq);
 }
@@ -272,7 +265,7 @@ static void flush_bg_queue(struct fuse_conn *fc)
 		fc->active_background++;
 		spin_lock(&fiq->lock);
 		req->in.h.unique = fuse_get_unique(fiq);
-		queue_request_and_unlock(fc, req, true);
+		queue_request_and_unlock(fiq, req);
 	}
 }
 
@@ -416,8 +409,7 @@ static void request_wait_answer(struct fuse_req *req)
 
 static void __fuse_request_send(struct fuse_req *req)
 {
-	struct fuse_conn *fc = req->fm->fc;
-	struct fuse_iqueue *fiq = &fc->iq;
+	struct fuse_iqueue *fiq = &req->fm->fc->iq;
 
 	BUG_ON(test_bit(FR_BACKGROUND, &req->flags));
 	spin_lock(&fiq->lock);
@@ -429,7 +421,7 @@ static void __fuse_request_send(struct fuse_req *req)
 		/* acquire extra reference, since request is still needed
 		   after fuse_request_end() */
 		__fuse_get_request(req);
-		queue_request_and_unlock(fc, req, true);
+		queue_request_and_unlock(fiq, req);
 
 		request_wait_answer(req);
 		/* Pairs with smp_wmb() in fuse_request_end() */
@@ -499,10 +491,6 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 	if (args->force) {
 		atomic_inc(&fc->num_waiting);
 		req = fuse_request_alloc(fm, GFP_KERNEL | __GFP_NOFAIL);
-		if (unlikely(!req)) {
-			ret = -ENOTCONN;
-			goto err;
-		}
 
 		if (!args->nocreds)
 			fuse_force_creds(req);
@@ -530,55 +518,16 @@ ssize_t fuse_simple_request(struct fuse_mount *fm, struct fuse_args *args)
 	}
 	fuse_put_request(req);
 
-err:
 	return ret;
 }
 
-static bool fuse_request_queue_background_uring(struct fuse_conn *fc,
-					       struct fuse_req *req)
-{
-	struct fuse_iqueue *fiq = &fc->iq;
-	int err;
-
-	req->in.h.unique = fuse_get_unique(fiq);
-	req->in.h.len = sizeof(struct fuse_in_header) +
-		fuse_len_args(req->args->in_numargs,
-			      (struct fuse_arg *) req->args->in_args);
-
-	err = fuse_uring_queue_fuse_req(fc, req);
-	if (!err) {
-		/* XXX remove and lets the users of that use per queue values -
-		 * avoid the shared spin lock...
-		 * Is this needed at all?
-		 */
-		spin_lock(&fc->bg_lock);
-		fc->num_background++;
-		fc->active_background++;
-
-
-		/* XXX block when per ring queues get occupied */
-		if (fc->num_background == fc->max_background)
-			fc->blocked = 1;
-		spin_unlock(&fc->bg_lock);
-	}
-
-	return err ? false : true;
-}
-
-/*
- * @return true if queued
- */
-static int fuse_request_queue_background(struct fuse_req *req)
+static bool fuse_request_queue_background(struct fuse_req *req)
 {
 	struct fuse_mount *fm = req->fm;
 	struct fuse_conn *fc = fm->fc;
 	bool queued = false;
 
 	WARN_ON(!test_bit(FR_BACKGROUND, &req->flags));
-
-	if (fuse_uring_ready(fc))
-		return fuse_request_queue_background_uring(fc, req);
-
 	if (!test_bit(FR_WAITING, &req->flags)) {
 		__set_bit(FR_WAITING, &req->flags);
 		atomic_inc(&fc->num_waiting);
@@ -631,8 +580,7 @@ static int fuse_simple_notify_reply(struct fuse_mount *fm,
 				    struct fuse_args *args, u64 unique)
 {
 	struct fuse_req *req;
-	struct fuse_conn *fc = fm->fc;
-	struct fuse_iqueue *fiq = &fc->iq;
+	struct fuse_iqueue *fiq = &fm->fc->iq;
 	int err = 0;
 
 	req = fuse_get_req(fm, false);
@@ -646,8 +594,7 @@ static int fuse_simple_notify_reply(struct fuse_mount *fm,
 
 	spin_lock(&fiq->lock);
 	if (fiq->connected) {
-		/* uring for notify not supported yet */
-		queue_request_and_unlock(fc, req, false);
+		queue_request_and_unlock(fiq, req);
 	} else {
 		err = -ENODEV;
 		spin_unlock(&fiq->lock);
@@ -694,8 +641,22 @@ static int unlock_request(struct fuse_req *req)
 	return err;
 }
 
-void fuse_copy_init(struct fuse_copy_state *cs, int write,
-		    struct iov_iter *iter)
+struct fuse_copy_state {
+	int write;
+	struct fuse_req *req;
+	struct iov_iter *iter;
+	struct pipe_buffer *pipebufs;
+	struct pipe_buffer *currbuf;
+	struct pipe_inode_info *pipe;
+	unsigned long nr_segs;
+	struct page *pg;
+	unsigned len;
+	unsigned offset;
+	unsigned move_pages:1;
+};
+
+static void fuse_copy_init(struct fuse_copy_state *cs, int write,
+			   struct iov_iter *iter)
 {
 	memset(cs, 0, sizeof(*cs));
 	cs->write = write;
@@ -769,15 +730,6 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 			cs->pipebufs++;
 			cs->nr_segs++;
 		}
-	} else if (cs->is_uring) {
-		cs->pg = cs->ring.pages[cs->ring.page_idx++];
-		/*
-		 * non stricly needed, just to avoid a uring exception in
-		 * fuse_copy_finish
-		 */
-		get_page(cs->pg);
-		cs->len = PAGE_SIZE;
-		cs->offset = 0;
 	} else {
 		size_t off;
 		err = iov_iter_get_pages2(cs->iter, &page, PAGE_SIZE, 1, &off);
@@ -811,9 +763,6 @@ static int fuse_copy_do(struct fuse_copy_state *cs, void **val, unsigned *size)
 	*size -= ncpy;
 	cs->len -= ncpy;
 	cs->offset += ncpy;
-	if (cs->is_uring)
-		cs->ring.offset += ncpy;
-
 	return ncpy;
 }
 
@@ -1061,9 +1010,9 @@ static int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size)
 }
 
 /* Copy request arguments to/from userspace buffer */
-int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
-		   unsigned argpages, struct fuse_arg *args,
-		   int zeroing)
+static int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
+			  unsigned argpages, struct fuse_arg *args,
+			  int zeroing)
 {
 	int err = 0;
 	unsigned i;
@@ -1826,62 +1775,6 @@ copy_finish:
 	return err;
 }
 
-/*
- * Resending all processing queue requests.
- *
- * During a FUSE daemon panics and failover, it is possible for some inflight
- * requests to be lost and never returned. As a result, applications awaiting
- * replies would become stuck forever. To address this, we can use notification
- * to trigger resending of these pending requests to the FUSE daemon, ensuring
- * they are properly processed again.
- *
- * Please note that this strategy is applicable only to idempotent requests or
- * if the FUSE daemon takes careful measures to avoid processing duplicated
- * non-idempotent requests.
- */
-static void fuse_resend(struct fuse_conn *fc)
-{
-	struct fuse_dev *fud;
-	struct fuse_req *req, *next;
-	struct fuse_iqueue *fiq = &fc->iq;
-	LIST_HEAD(to_queue);
-	unsigned int i;
-
-	spin_lock(&fc->lock);
-	if (!fc->connected) {
-		spin_unlock(&fc->lock);
-		return;
-	}
-
-	list_for_each_entry(fud, &fc->devices, entry) {
-		struct fuse_pqueue *fpq = &fud->pq;
-
-		spin_lock(&fpq->lock);
-		for (i = 0; i < FUSE_PQ_HASH_SIZE; i++)
-			list_splice_tail_init(&fpq->processing[i], &to_queue);
-		spin_unlock(&fpq->lock);
-	}
-	spin_unlock(&fc->lock);
-
-	list_for_each_entry_safe(req, next, &to_queue, list) {
-		set_bit(FR_PENDING, &req->flags);
-		clear_bit(FR_SENT, &req->flags);
-		/* mark the request as resend request */
-		req->in.h.unique |= FUSE_UNIQUE_RESEND;
-	}
-
-	spin_lock(&fiq->lock);
-	/* iq and pq requests are both oldest to newest */
-	list_splice(&to_queue, &fiq->pending);
-	fiq->ops->wake_pending_and_unlock(fiq);
-}
-
-static int fuse_notify_resend(struct fuse_conn *fc)
-{
-	fuse_resend(fc);
-	return 0;
-}
-
 static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 		       unsigned int size, struct fuse_copy_state *cs)
 {
@@ -1907,9 +1800,6 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 	case FUSE_NOTIFY_DELETE:
 		return fuse_notify_delete(fc, size, cs);
 
-	case FUSE_NOTIFY_RESEND:
-		return fuse_notify_resend(fc);
-
 	default:
 		fuse_copy_finish(cs);
 		return -EINVAL;
@@ -1929,18 +1819,10 @@ static struct fuse_req *request_find(struct fuse_pqueue *fpq, u64 unique)
 	return NULL;
 }
 
-int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
-		       unsigned nbytes)
+static int copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
+			 unsigned nbytes)
 {
-
-	unsigned int reqsize = 0;
-
-	/*
-	 * Uring has the out header outside of args
-	 * XXX: This uring exception will probably change
-	 */
-	if (!cs->is_uring)
-		reqsize = sizeof(struct fuse_out_header);
+	unsigned reqsize = sizeof(struct fuse_out_header);
 
 	reqsize += fuse_len_args(args->out_numargs, args->out_args);
 
@@ -2040,7 +1922,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
 	if (oh.error)
 		err = nbytes != sizeof(oh) ? -EINVAL : 0;
 	else
-		err = fuse_copy_out_args(cs, req->args, nbytes);
+		err = copy_out_args(cs, req->args, nbytes);
 	fuse_copy_finish(cs);
 
 	spin_lock(&fpq->lock);
@@ -2195,7 +2077,7 @@ static __poll_t fuse_dev_poll(struct file *file, poll_table *wait)
 }
 
 /* Abort all requests on the given list (pending or processing) */
-void fuse_dev_end_requests(struct list_head *head)
+static void end_requests(struct list_head *head)
 {
 	while (!list_empty(head)) {
 		struct fuse_req *req;
@@ -2256,10 +2138,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		fc->connected = 0;
 		spin_unlock(&fc->bg_lock);
 
-		fuse_uring_set_stopped(fc);
-
 		fuse_set_initialized(fc);
-
 		list_for_each_entry(fud, &fc->devices, entry) {
 			struct fuse_pqueue *fpq = &fud->pq;
 
@@ -2301,13 +2180,7 @@ void fuse_abort_conn(struct fuse_conn *fc)
 		wake_up_all(&fc->blocked_waitq);
 		spin_unlock(&fc->lock);
 
-		fuse_dev_end_requests(&to_end);
-
-		/*
-		 * fc->lock must not be taken to avoid conflicts with io-uring
-		 * locks
-		 */
-		fuse_uring_abort(fc);
+		end_requests(&to_end);
 	} else {
 		spin_unlock(&fc->lock);
 	}
@@ -2319,8 +2192,6 @@ void fuse_wait_aborted(struct fuse_conn *fc)
 	/* matches implicit memory barrier in fuse_drop_waiting() */
 	smp_mb();
 	wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
-
-	fuse_uring_wait_stopped_queues(fc);
 }
 
 int fuse_dev_release(struct inode *inode, struct file *file)
@@ -2332,8 +2203,6 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 		struct fuse_pqueue *fpq = &fud->pq;
 		LIST_HEAD(to_end);
 		unsigned int i;
-		int dev_cnt;
-		bool abort_conn = false;
 
 		spin_lock(&fpq->lock);
 		WARN_ON(!list_empty(&fpq->io));
@@ -2341,38 +2210,10 @@ int fuse_dev_release(struct inode *inode, struct file *file)
 			list_splice_init(&fpq->processing[i], &to_end);
 		spin_unlock(&fpq->lock);
 
-		fuse_dev_end_requests(&to_end);
+		end_requests(&to_end);
 
-		/* Are we the last open device?  */
-		dev_cnt = atomic_dec_return(&fc->dev_count);
-		if (dev_cnt == 0)
-			abort_conn = true;
-
-#ifdef CONFIG_FUSE_IO_URING
-		/*
-		 * Or is this with io_uring and only ring devices left?
-		 * These devices will not receive a ->release() as long as
-		 * there are io_uring_cmd's waiting and not completed
-		 * with io_uring_cmd_done yet
-		 */
-		if (fuse_uring_configured(fc)) {
-			struct fuse_dev *list_dev;
-			bool all_uring = true;
-
-			spin_lock(&fc->lock);
-			list_for_each_entry(list_dev, &fc->devices, entry) {
-				if (list_dev == fud)
-					continue;
-				if (!list_dev->ring_q)
-					all_uring = false;
-			}
-			spin_unlock(&fc->lock);
-			if (all_uring)
-				abort_conn = true;
-		}
-#endif
-
-		if (abort_conn) {
+		/* Are we the last open device? */
+		if (atomic_dec_and_test(&fc->dev_count)) {
 			WARN_ON(fc->iq.fasync != NULL);
 			fuse_abort_conn(fc);
 		}
@@ -2410,132 +2251,43 @@ static int fuse_device_clone(struct fuse_conn *fc, struct file *new)
 	return 0;
 }
 
-static long _fuse_dev_ioctl_clone(struct file *file, int oldfd)
+static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
+			   unsigned long arg)
 {
 	int res;
+	int oldfd;
 	struct fuse_dev *fud = NULL;
 	struct fd f;
 
-	f = fdget(oldfd);
-	if (!f.file)
-		return -EINVAL;
-
-	/*
-	 * Check against file->f_op because CUSE
-	 * uses the same ioctl handler.
-	 */
-	if (f.file->f_op == file->f_op)
-		fud = fuse_get_dev(f.file);
-
-	res = -EINVAL;
-	if (fud) {
-		mutex_lock(&fuse_mutex);
-		res = fuse_device_clone(fud->fc, file);
-		mutex_unlock(&fuse_mutex);
-	}
-
-	fdput(f);
-	return res;
-}
-
-static long fuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
-{
-	int oldfd;
-
-	if (get_user(oldfd, argp))
-		return -EFAULT;
-
-	return _fuse_dev_ioctl_clone(file, oldfd);
-}
-
-static long fuse_dev_ioctl_backing_open(struct file *file,
-					struct fuse_backing_map __user *argp)
-{
-	struct fuse_dev *fud = fuse_get_dev(file);
-	struct fuse_backing_map map;
-
-	if (!fud)
-		return -EPERM;
-
-	if (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
-		return -EOPNOTSUPP;
-
-	if (copy_from_user(&map, argp, sizeof(map)))
-		return -EFAULT;
-
-	return fuse_backing_open(fud->fc, &map);
-}
-
-static long fuse_dev_ioctl_backing_close(struct file *file, __u32 __user *argp)
-{
-	struct fuse_dev *fud = fuse_get_dev(file);
-	int backing_id;
-
-	if (!fud)
-		return -EPERM;
-
-	if (!IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
-		return -EOPNOTSUPP;
-
-	if (get_user(backing_id, argp))
-		return -EFAULT;
-
-	return fuse_backing_close(fud->fc, backing_id);
-}
-
-#ifdef CONFIG_FUSE_IO_URING
-static long fuse_uring_queue_ioc(struct file *file, __u32 __user *argp)
-{
-	int res = 0;
-	struct fuse_dev *fud;
-	struct fuse_conn *fc;
-	struct fuse_ring_queue_config qcfg;
-
-	res = copy_from_user(&qcfg, (void *)argp, sizeof(qcfg));
-	if (res != 0)
-		return -EFAULT;
-
-	res = _fuse_dev_ioctl_clone(file, qcfg.control_fd);
-	if (res != 0)
-		return res;
-
-	fud = fuse_get_dev(file);
-	if (fud == NULL)
-		return -ENODEV;
-	fc = fud->fc;
-
-	fud->ring_q = fuse_uring_get_queue(fc->ring, qcfg.qid);
-
-	return 0;
-}
-#endif
-
-static long
-fuse_dev_ioctl(struct file *file, unsigned int cmd,
-	       unsigned long arg)
-{
-	void __user *argp = (void __user *)arg;
-
 	switch (cmd) {
 	case FUSE_DEV_IOC_CLONE:
-		return fuse_dev_ioctl_clone(file, argp);
+		if (get_user(oldfd, (__u32 __user *)arg))
+			return -EFAULT;
 
-	case FUSE_DEV_IOC_BACKING_OPEN:
-		return fuse_dev_ioctl_backing_open(file, argp);
+		f = fdget(oldfd);
+		if (!f.file)
+			return -EINVAL;
 
-	case FUSE_DEV_IOC_BACKING_CLOSE:
-		return fuse_dev_ioctl_backing_close(file, argp);
+		/*
+		 * Check against file->f_op because CUSE
+		 * uses the same ioctl handler.
+		 */
+		if (f.file->f_op == file->f_op)
+			fud = fuse_get_dev(f.file);
 
-#ifdef CONFIG_FUSE_IO_URING
-	case FUSE_DEV_IOC_URING_CFG:
-		return fuse_uring_conn_cfg(file, argp);
-
-	case FUSE_DEV_IOC_URING_QUEUE_CFG:
-		return fuse_uring_queue_ioc(file, argp);
-#endif
+		res = -EINVAL;
+		if (fud) {
+			mutex_lock(&fuse_mutex);
+			res = fuse_device_clone(fud->fc, file);
+			mutex_unlock(&fuse_mutex);
+		}
+		fdput(f);
+		break;
 	default:
-		return -ENOTTY;
+		res = -ENOTTY;
+		break;
 	}
+	return res;
 }
 
 const struct file_operations fuse_dev_operations = {
@@ -2551,9 +2303,6 @@ const struct file_operations fuse_dev_operations = {
 	.fasync		= fuse_dev_fasync,
 	.unlocked_ioctl = fuse_dev_ioctl,
 	.compat_ioctl   = compat_ptr_ioctl,
-#ifdef CONFIG_FUSE_IO_URING
-	.uring_cmd	= fuse_uring_cmd,
-#endif
 };
 EXPORT_SYMBOL_GPL(fuse_dev_operations);
 
