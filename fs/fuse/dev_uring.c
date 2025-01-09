@@ -1407,18 +1407,26 @@ static struct fuse_ring_queue *fuse_uring_task_to_queue(struct fuse_ring *ring)
 	return queue;
 }
 
-static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent)
+static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg)
 {
+	struct fuse_ring_queue *queue = ent->queue;
 	struct io_uring_cmd *cmd = ent->cmd;
+	int err;
+
 	err = -EIO;
 	if (WARN_ON_ONCE(ent->state != FRRS_FUSE_REQ))
 		goto err;
 
-	/* If this is an io-uring task we don't know the issue_flags */
-	if (!ent->header_pages && !current->io_uring) {
+	/*
+	 * If this is an io-uring task we don't know the issue_flags.
+	 * bg requests might be page cache IO and these might run in
+	 * spin-lock context, but io_uring_cmd_done takes a mutex lock.
+	 */
+	if (!ent->header_pages || current->io_uring || bg) {
 		uring_cmd_set_ring_ent(cmd, ent);
 		io_uring_cmd_complete_in_task(cmd, fuse_uring_send_in_task);
 	} else {
+		/* send directly without the uring task */
 		err = fuse_uring_prepare_send(ent);
 		if (err) {
 			fuse_uring_next_fuse_req(ent, queue,
@@ -1427,6 +1435,10 @@ static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent)
 		}
 		fuse_uring_send(ent, cmd, 0, IO_URING_F_UNLOCKED);
 	}
+
+	return;
+err:
+	fuse_uring_req_end(ent, true, err);
 }
 
 /* queue a fuse request and send it if a ring entry is available */
@@ -1460,7 +1472,7 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	spin_unlock(&queue->lock);
 
 	if (ent)
-		fuse_uring_dispatch_ent(ent);
+		fuse_uring_dispatch_ent(ent, false);
 
 	return;
 
@@ -1511,7 +1523,7 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 		fuse_uring_add_req_to_ring_ent(ent, req);
 
 		spin_unlock(&queue->lock);
-		fuse_uring_dispatch_ent(ent);
+		fuse_uring_dispatch_ent(ent, true);
 	} else {
 		spin_unlock(&queue->lock);
 	}
