@@ -21,6 +21,10 @@ MODULE_PARM_DESC(enable_uring,
 #define FUSE_RING_HEADER_PG 0
 #define FUSE_RING_PAYLOAD_PG 1
 
+#ifndef IO_URING_F_TASK_DEAD
+#define IO_URING_F_TASK_DEAD (1 << 13)
+#endif
+
 bool fuse_uring_enabled(void)
 {
 	return enable_uring;
@@ -31,6 +35,14 @@ struct fuse_uring_pdu {
 };
 
 static const struct fuse_iqueue_ops fuse_io_uring_ops;
+
+static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
+{
+	BUILD_BUG_ON(cmd_sz > sizeof_field(struct io_uring_cmd, pdu));
+}
+#define io_uring_cmd_to_pdu(cmd, pdu_type)                \
+	(io_uring_cmd_private_sz_check(sizeof(pdu_type)), \
+	 ((pdu_type *)&(cmd)->pdu))
 
 static void uring_cmd_set_ring_ent(struct io_uring_cmd *cmd,
 				   struct fuse_ring_ent *ring_ent)
@@ -1395,6 +1407,28 @@ static struct fuse_ring_queue *fuse_uring_task_to_queue(struct fuse_ring *ring)
 	return queue;
 }
 
+static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent)
+{
+	struct io_uring_cmd *cmd = ent->cmd;
+	err = -EIO;
+	if (WARN_ON_ONCE(ent->state != FRRS_FUSE_REQ))
+		goto err;
+
+	/* If this is an io-uring task we don't know the issue_flags */
+	if (!ent->header_pages && !current->io_uring) {
+		uring_cmd_set_ring_ent(cmd, ent);
+		io_uring_cmd_complete_in_task(cmd, fuse_uring_send_in_task);
+	} else {
+		err = fuse_uring_prepare_send(ent);
+		if (err) {
+			fuse_uring_next_fuse_req(ent, queue,
+						 IO_URING_F_UNLOCKED);
+			return;
+		}
+		fuse_uring_send(ent, cmd, 0, IO_URING_F_UNLOCKED);
+	}
+}
+
 /* queue a fuse request and send it if a ring entry is available */
 void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 {
@@ -1425,27 +1459,8 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 		list_add_tail(&req->list, &queue->fuse_req_queue);
 	spin_unlock(&queue->lock);
 
-	if (ent) {
-		struct io_uring_cmd *cmd = ent->cmd;
-		err = -EIO;
-		if (WARN_ON_ONCE(ent->state != FRRS_FUSE_REQ))
-			goto err;
-
-		/* If this is an io-uring task we don't know the issue_flags */
-		if (!ent->header_pages && !current->io_uring) {
-			uring_cmd_set_ring_ent(cmd, ent);
-			io_uring_cmd_complete_in_task(cmd,
-						      fuse_uring_send_in_task);
-		} else {
-			err = fuse_uring_prepare_send(ent);
-			if (err) {
-				fuse_uring_next_fuse_req(ent, queue,
-							 IO_URING_F_UNLOCKED);
-				return;
-			}
-			fuse_uring_send(ent, cmd, 0, IO_URING_F_UNLOCKED);
-		}
-	}
+	if (ent)
+		fuse_uring_dispatch_ent(ent);
 
 	return;
 
@@ -1493,14 +1508,13 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 	req = list_first_entry_or_null(&queue->fuse_req_queue, struct fuse_req,
 				       list);
 	if (ent && req) {
-		struct io_uring_cmd *cmd = ent->cmd;
-
 		fuse_uring_add_req_to_ring_ent(ent, req);
 
-		uring_cmd_set_ring_ent(cmd, ent);
-		io_uring_cmd_complete_in_task(cmd, fuse_uring_send_in_task);
+		spin_unlock(&queue->lock);
+		fuse_uring_dispatch_ent(ent);
+	} else {
+		spin_unlock(&queue->lock);
 	}
-	spin_unlock(&queue->lock);
 
 	return true;
 }
