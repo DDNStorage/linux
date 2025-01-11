@@ -771,6 +771,7 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ring_ent,
 {
 	int err = 0;
 	struct fuse_ring_queue *queue = ring_ent->queue;
+	struct io_uring_cmd *cmd;
 
 	err = fuse_uring_prepare_send(ring_ent);
 	if (err)
@@ -778,22 +779,29 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ring_ent,
 
 	spin_lock(&queue->lock);
 	ring_ent->state = FRRS_USERSPACE;
+	cmd = ring_ent->cmd;
+	ring_ent->cmd = NULL;
 	list_move(&ring_ent->list, &queue->ent_in_userspace);
 	spin_unlock(&queue->lock);
 
-	io_uring_cmd_done(ring_ent->cmd, 0, 0, issue_flags);
-	ring_ent->cmd = NULL;
+	io_uring_cmd_done(cmd, 0, 0, issue_flags);
 	return 0;
 }
 
 /*
  * Make a ring entry available for fuse_req assignment
  */
-static void fuse_uring_ent_avail(struct fuse_ring_ent *ring_ent,
-				 struct fuse_ring_queue *queue)
+static int fuse_uring_ent_avail(struct fuse_ring_ent *ring_ent,
+				struct fuse_ring_queue *queue)
 {
+	if (WARN_ON_ONCE(ring_ent->state != FRRS_COMMIT))
+		return -EINVAL;
+	if (WARN_ON_ONCE(!ring_ent->cmd))
+		return -EINVAL;
 	list_move(&ring_ent->list, &queue->ent_avail_queue);
 	ring_ent->state = FRRS_AVAILABLE;
+
+	return 0;
 }
 
 /* Used to find the request on SQE commit */
@@ -903,7 +911,12 @@ static void fuse_uring_next_fuse_req(struct fuse_ring_ent *ring_ent,
 
 retry:
 	spin_lock(&queue->lock);
-	fuse_uring_ent_avail(ring_ent, queue);
+	err = fuse_uring_ent_avail(ring_ent, queue);
+	if (err) {
+		pr_err("qid=%d ring-req=%p invalid state %d\n", queue->qid,
+		       ring_ent, ring_ent->state);
+		return;
+	}
 	has_next = fuse_uring_ent_assign_req(ring_ent);
 	spin_unlock(&queue->lock);
 
@@ -1032,20 +1045,27 @@ static bool is_ring_ready(struct fuse_ring *ring, int current_qid)
 /*
  * fuse_uring_req_fetch command handling
  */
-static void fuse_uring_do_register(struct fuse_ring_ent *ring_ent,
-				   struct io_uring_cmd *cmd,
-				   unsigned int issue_flags)
+static int fuse_uring_do_register(struct fuse_ring_ent *ring_ent,
+				  struct io_uring_cmd *cmd,
+				  unsigned int issue_flags)
 {
 	struct fuse_ring_queue *queue = ring_ent->queue;
 	struct fuse_ring *ring = queue->ring;
 	struct fuse_conn *fc = ring->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
 
-	fuse_uring_prepare_cancel(ring_ent->cmd, issue_flags, ring_ent);
+	fuse_uring_prepare_cancel(cmd, issue_flags, ring_ent);
 
 	spin_lock(&queue->lock);
-	fuse_uring_ent_avail(ring_ent, queue);
+	ring_ent->cmd = cmd;
+	ring_ent->state = FRRS_COMMIT;
+	int err = fuse_uring_ent_avail(ring_ent, queue);
 	spin_unlock(&queue->lock);
+	if (err) {
+		pr_err("qid=%d ring-req=%p invalid state %d\n", queue->qid,
+		       ring_ent, ring_ent->state);
+		return err;
+	}
 
 	if (!ring->ready) {
 		bool ready = is_ring_ready(ring, queue->qid);
@@ -1056,6 +1076,8 @@ static void fuse_uring_do_register(struct fuse_ring_ent *ring_ent,
 			wake_up_all(&fc->blocked_waitq);
 		}
 	}
+
+	return 0;
 }
 
 /*
@@ -1220,7 +1242,6 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
 	ent->queue = queue;
 	ent->headers = iov[0].iov_base;
 	ent->payload = iov[1].iov_base;
-	ent->cmd = cmd;
 
 	err = fuse_uring_pin_pages(ent);
 	if (err) {
@@ -1275,9 +1296,9 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
 	if (IS_ERR(ring_ent))
 		return PTR_ERR(ring_ent);
 
-	fuse_uring_do_register(ring_ent, cmd, issue_flags);
+	err = fuse_uring_do_register(ring_ent, cmd, issue_flags);
 
-	return 0;
+	return err;
 }
 
 /*
@@ -1357,11 +1378,11 @@ static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
 
 	spin_lock(&queue->lock);
 	ent->state = FRRS_USERSPACE;
+	ent->cmd = NULL;
 	list_move(&ent->list, &queue->ent_in_userspace);
 	spin_unlock(&queue->lock);
 
 	io_uring_cmd_done(cmd, ret, 0, issue_flags);
-	ent->cmd = NULL;
 }
 
 /*
@@ -1415,6 +1436,9 @@ static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg)
 
 	err = -EIO;
 	if (WARN_ON_ONCE(ent->state != FRRS_FUSE_REQ))
+		goto err;
+
+	if (WARN_ON_ONCE(!cmd))
 		goto err;
 
 	/*
