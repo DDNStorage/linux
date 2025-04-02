@@ -47,6 +47,10 @@
 /** Maximum of max_pages received in init_out */
 extern unsigned int fuse_max_pages_limit;
 
+/* Ordinary requests have even IDs, while interrupts IDs are odd */
+#define FUSE_INT_REQ_BIT (1ULL << 0)
+#define FUSE_REQ_ID_STEP (1ULL << 1)
+
 /** List of active connections */
 extern struct list_head fuse_conn_list;
 
@@ -493,7 +497,7 @@ struct fuse_iqueue {
 	wait_queue_head_t waitq;
 
 	/** The next unique request id */
-	u64 reqctr;
+	atomic64_t reqctr;
 
 	/** The list of pending requests */
 	struct list_head pending;
@@ -1071,6 +1075,14 @@ static inline void fuse_sync_bucket_dec(struct fuse_sync_bucket *bucket)
 	rcu_read_unlock();
 }
 
+/**
+ * Get the next unique ID for a request
+ */
+static inline u64 fuse_get_unique(struct fuse_iqueue *fiq)
+{
+	return atomic64_add_return(FUSE_REQ_ID_STEP, &fiq->reqctr);
+}
+
 /** Device operations */
 extern const struct file_operations fuse_dev_operations;
 
@@ -1421,10 +1433,6 @@ int fuse_readdir(struct file *file, struct dir_context *ctx);
  */
 unsigned int fuse_len_args(unsigned int numargs, struct fuse_arg *args);
 
-/**
- * Get the next unique ID for a request
- */
-u64 fuse_get_unique(struct fuse_iqueue *fiq);
 void fuse_free_conn(struct fuse_conn *fc);
 
 /* dax.c */
