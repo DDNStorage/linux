@@ -738,6 +738,219 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ent,
 }
 
 /*
+ * Checks for errors and stores it into the request
+ */
+static int fuse_uring_out_header_has_err(struct fuse_out_header *oh,
+					 struct fuse_req *req,
+					 struct fuse_conn *fc)
+{
+	int err;
+
+	err = -EINVAL;
+	if (oh->unique == 0) {
+		/* Not supported through io-uring yet */
+		pr_warn_once("notify through fuse-io-uring not supported\n");
+		goto err;
+	}
+
+	if (oh->error <= -ERESTARTSYS || oh->error > 0)
+		goto err;
+
+	if (oh->error) {
+		err = oh->error;
+		goto err;
+	}
+
+	err = -ENOENT;
+	if ((oh->unique & ~FUSE_INT_REQ_BIT) != req->in.h.unique) {
+		pr_warn_ratelimited("unique mismatch, expected: %llu got %llu\n",
+				    req->in.h.unique,
+				    oh->unique & ~FUSE_INT_REQ_BIT);
+		goto err;
+	}
+
+	/*
+	 * Is it an interrupt reply ID?
+	 * XXX: Not supported through fuse-io-uring yet, it should not even
+	 *      find the request - should not happen.
+	 */
+	WARN_ON_ONCE(oh->unique & FUSE_INT_REQ_BIT);
+
+	err = 0;
+err:
+	return err;
+}
+
+static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
+				     struct fuse_req *req,
+				     struct fuse_ring_ent *ent)
+{
+	struct fuse_copy_state cs;
+	struct fuse_args *args = req->args;
+	struct iov_iter iter;
+	int err;
+	struct fuse_uring_ent_in_out ring_in_out;
+
+	err = copy_from_user(&ring_in_out, &ent->headers->ring_ent_in_out,
+			     sizeof(ring_in_out));
+	if (err)
+		return -EFAULT;
+
+	err = import_ubuf(ITER_SOURCE, ent->payload, ring->max_payload_sz,
+			  &iter);
+	if (err)
+		return err;
+
+	fuse_copy_init(&cs, 0, &iter);
+	cs.is_uring = 1;
+	cs.req = req;
+
+	return fuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
+}
+
+ /*
+  * Copy data from the req to the ring buffer
+  */
+static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
+				   struct fuse_ring_ent *ent)
+{
+	struct fuse_copy_state cs;
+	struct fuse_args *args = req->args;
+	struct fuse_in_arg *in_args = args->in_args;
+	int num_args = args->in_numargs;
+	int err;
+	struct iov_iter iter;
+	struct fuse_uring_ent_in_out ent_in_out = {
+		.flags = 0,
+		.commit_id = req->in.h.unique,
+	};
+
+	err = import_ubuf(ITER_DEST, ent->payload, ring->max_payload_sz, &iter);
+	if (err) {
+		pr_info_ratelimited("fuse: Import of user buffer failed\n");
+		return err;
+	}
+
+	fuse_copy_init(&cs, 1, &iter);
+	cs.is_uring = 1;
+	cs.req = req;
+
+	if (num_args > 0) {
+		/*
+		 * Expectation is that the first argument is the per op header.
+		 * Some op code have that as zero size.
+		 */
+		if (args->in_args[0].size > 0) {
+			err = copy_to_user(&ent->headers->op_in, in_args->value,
+					   in_args->size);
+			if (err) {
+				pr_info_ratelimited(
+					"Copying the header failed.\n");
+				return -EFAULT;
+			}
+		}
+		in_args++;
+		num_args--;
+	}
+
+	/* copy the payload */
+	err = fuse_copy_args(&cs, num_args, args->in_pages,
+			     (struct fuse_arg *)in_args, 0);
+	if (err) {
+		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
+		return err;
+	}
+
+	ent_in_out.payload_sz = cs.ring.copied_sz;
+	err = copy_to_user(&ent->headers->ring_ent_in_out, &ent_in_out,
+			   sizeof(ent_in_out));
+	return err ? -EFAULT : 0;
+}
+
+static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
+				   struct fuse_req *req)
+{
+	struct fuse_ring_queue *queue = ent->queue;
+	struct fuse_ring *ring = queue->ring;
+	int err;
+
+	err = -EIO;
+	if (WARN_ON(ent->state != FRRS_FUSE_REQ)) {
+		pr_err("qid=%d ring-req=%p invalid state %d on send\n",
+		       queue->qid, ent, ent->state);
+		return err;
+	}
+
+	err = -EINVAL;
+	if (WARN_ON(req->in.h.unique == 0))
+		return err;
+
+	/* copy the request */
+	err = fuse_uring_args_to_ring(ring, req, ent);
+	if (unlikely(err)) {
+		pr_info_ratelimited("Copy to ring failed: %d\n", err);
+		return err;
+	}
+
+	/* copy fuse_in_header */
+	err = copy_to_user(&ent->headers->in_out, &req->in.h,
+			   sizeof(req->in.h));
+	if (err) {
+		err = -EFAULT;
+		return err;
+	}
+
+	return 0;
+}
+
+static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
+				   struct fuse_req *req)
+{
+	int err;
+
+	err = fuse_uring_copy_to_ring(ent, req);
+	if (!err)
+		set_bit(FR_SENT, &req->flags);
+	else
+		fuse_uring_req_end(ent, req, err);
+
+	return err;
+}
+
+static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
+			    ssize_t ret, unsigned int issue_flags)
+{
+	struct fuse_ring_queue *queue = ent->queue;
+
+	spin_lock(&queue->lock);
+	ent->state = FRRS_USERSPACE;
+	list_move(&ent->list, &queue->ent_in_userspace);
+	ent->cmd = NULL;
+	spin_unlock(&queue->lock);
+
+	io_uring_cmd_done(cmd, ret, 0, issue_flags);
+}
+
+/*
+ * Write data to the ring buffer and send the request to userspace,
+ * userspace will read it
+ * This is comparable with classical read(/dev/fuse)
+ */
+static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ent,
+					struct fuse_req *req,
+					unsigned int issue_flags)
+{
+	int err;
+
+	err = fuse_uring_prepare_send(ent, req);
+	if (err)
+		return err;
+
+	fuse_uring_send(ent, ent->cmd, 0, issue_flags);
+	return 0;
+}
+
+/*
  * Make a ring entry available for fuse_req assignment
  */
 static void fuse_uring_ent_avail(struct fuse_ring_ent *ent,
