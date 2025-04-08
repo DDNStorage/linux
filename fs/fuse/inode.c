@@ -39,7 +39,7 @@ DECLARE_WAIT_QUEUE_HEAD(fuse_dev_waitq);
 
 static int set_global_limit(const char *val, const struct kernel_param *kp);
 
-unsigned int fuse_max_pages_limit = 256;
+unsigned int fuse_max_pages_limit = 4097;
 /* default is no timeout */
 unsigned int fuse_default_req_timeout;
 unsigned int fuse_max_req_timeout;
