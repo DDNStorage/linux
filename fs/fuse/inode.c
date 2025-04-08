@@ -36,7 +36,7 @@ DEFINE_MUTEX(fuse_mutex);
 
 static int set_global_limit(const char *val, const struct kernel_param *kp);
 
-unsigned int fuse_max_pages_limit = 256;
+unsigned int fuse_max_pages_limit = 4097;
 
 unsigned max_user_bgreq;
 module_param_call(max_user_bgreq, set_global_limit, param_get_uint,
