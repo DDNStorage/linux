@@ -18,6 +18,20 @@ MODULE_PARM_DESC(enable_uring,
 
 #define FUSE_URING_IOV_SEGS 2 /* header and payload */
 
+/* redfs only to allow patch backports */
+#define IO_URING_F_TASK_DEAD (1 << 13)
+
+#ifndef io_uring_cmd_to_pdu
+static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
+{
+	BUILD_BUG_ON(cmd_sz > sizeof_field(struct io_uring_cmd, pdu));
+}
+/* red specific backport */
+#define io_uring_cmd_to_pdu(cmd, pdu_type) ( \
+	io_uring_cmd_private_sz_check(sizeof(pdu_type)), \
+	((pdu_type *)&(cmd)->pdu) \
+)
+#endif
 
 bool fuse_uring_enabled(void)
 {
