@@ -188,6 +188,9 @@ void fuse_uring_destruct(struct fuse_conn *fc)
 		if (!queue)
 			continue;
 
+		/* memory barrier to ensure we see the latest list state */
+		smp_rmb();
+
 		WARN_ON(!list_empty(&queue->ent_avail_queue));
 		WARN_ON(!list_empty(&queue->ent_w_req_queue));
 		WARN_ON(!list_empty(&queue->ent_commit_queue));
