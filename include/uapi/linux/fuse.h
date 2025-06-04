@@ -429,6 +429,8 @@ struct fuse_file_lock {
  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
  * FUSE_INVAL_INODE_ENTRY: invalidate inode aliases when doing inode invalidation
  * FUSE_EXPIRE_INODE_ENTRY: expire inode aliases when doing inode invalidation
+ * FUSE_URING_REDUCED_Q: Client (kernel) supports less queues - Server is free
+ *			 to register between 1 and nr-core io-uring queues
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -473,6 +475,9 @@ struct fuse_file_lock {
 /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
 #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
 #define FUSE_OVER_IO_URING	(1ULL << 41)
+
+#define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
+#define FUSE_URING_REDUCED_Q	(1ULL << 59)
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
 #define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)
 
