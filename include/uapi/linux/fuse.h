@@ -439,6 +439,8 @@ struct fuse_file_lock {
  * FUSE_EXPIRE_INODE_ENTRY: expire inode aliases when doing inode invalidation
  * FUSE_ALIGN_PG_ORDER: page order (power of 2 exponent for number of pages) for
  *			optimal io-size alignment
+ * FUSE_URING_REDUCED_Q: Client (kernel) supports less queues - Server is free
+ *			 to register between 1 and nr-core io-uring queues
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -488,7 +490,7 @@ struct fuse_file_lock {
 #define FUSE_OVER_IO_URING	(1ULL << 41)
 
 #define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
-
+#define FUSE_URING_REDUCED_Q	(1ULL << 59)
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
 #define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)
 
