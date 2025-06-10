@@ -43,6 +43,9 @@ static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
 )
 #endif
 
+/* Number of queued fuse requests until a queue is considered full */
+#define FUSE_URING_QUEUE_THRESHOLD 5
+
 bool fuse_uring_enabled(void)
 {
 	return enable_uring;
@@ -244,6 +247,23 @@ static void fuse_uring_destruct_q_masks(struct fuse_ring *ring)
 	}
 }
 
+static void fuse_ring_destruct_q_masks(struct fuse_ring *ring)
+{
+	free_cpumask_var(ring->avail_q_mask);
+	if (ring->per_numa_avail_q_mask) {
+		for (int node = 0; node < ring->nr_numa_nodes; node++)
+			free_cpumask_var(ring->per_numa_avail_q_mask[node]);
+		kfree(ring->per_numa_avail_q_mask);
+	}
+
+	free_cpumask_var(ring->registered_q_mask);
+	if (ring->numa_registered_q_mask) {
+		for (int node = 0; node < ring->nr_numa_nodes; node++)
+			free_cpumask_var(ring->numa_registered_q_mask[node]);
+		kfree(ring->numa_registered_q_mask);
+	}
+}
+
 void fuse_uring_destruct(struct fuse_conn *fc)
 {
 	struct fuse_ring *ring = fc->ring;
@@ -279,6 +299,7 @@ void fuse_uring_destruct(struct fuse_conn *fc)
 	}
 
 	fuse_uring_destruct_q_masks(ring);
+	fuse_ring_destruct_q_masks(ring);
 	kfree(ring->queues);
 	kfree(ring);
 	fc->ring = NULL;
@@ -319,6 +340,38 @@ static int fuse_uring_create_q_masks(struct fuse_ring *ring, size_t nr_queues)
 	return 0;
 }
 
+static int fuse_ring_create_q_masks(struct fuse_ring *ring, int nr_queues)
+{
+	if (!zalloc_cpumask_var(&ring->avail_q_mask, GFP_KERNEL_ACCOUNT))
+		return -ENOMEM;
+
+	if (!zalloc_cpumask_var(&ring->registered_q_mask, GFP_KERNEL_ACCOUNT))
+		return -ENOMEM;
+
+	ring->per_numa_avail_q_mask = kmalloc_array(ring->nr_numa_nodes,
+						    sizeof(struct cpumask *),
+						    GFP_KERNEL_ACCOUNT);
+	if (!ring->per_numa_avail_q_mask)
+		return -ENOMEM;
+	for (int node = 0; node < ring->nr_numa_nodes; node++)
+		if (!zalloc_cpumask_var(&ring->per_numa_avail_q_mask[node],
+					GFP_KERNEL_ACCOUNT))
+			return -ENOMEM;
+
+	ring->numa_registered_q_mask = kmalloc_array(ring->nr_numa_nodes,
+						     sizeof(struct cpumask *),
+						     GFP_KERNEL_ACCOUNT);
+	if (!ring->numa_registered_q_mask)
+		return -ENOMEM;
+	for (int node = 0; node < ring->nr_numa_nodes; node++) {
+		if (!zalloc_cpumask_var(&ring->numa_registered_q_mask[node],
+					GFP_KERNEL_ACCOUNT))
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
 /*
  * Basic ring setup for this connection based on the provided configuration
  */
@@ -348,6 +401,10 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 	if (err)
 		goto out_err;
 
+	err = fuse_ring_create_q_masks(ring, nr_queues);
+	if (err)
+		goto out_err;
+
 	spin_lock(&fc->lock);
 	if (fc->ring) {
 		/* race, another thread created the ring in the meantime */
@@ -368,6 +425,7 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 
 out_err:
 	fuse_uring_destruct_q_masks(ring);
+	fuse_ring_destruct_q_masks(ring);
 	kfree(ring->queues);
 	kfree(ring);
 	return res;
@@ -415,6 +473,7 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 
 	queue->qid = qid;
 	queue->ring = ring;
+	queue->numa_node = cpu_to_node(qid);
 	spin_lock_init(&queue->lock);
 
 	INIT_LIST_HEAD(&queue->ent_avail_queue);
@@ -625,6 +684,16 @@ void fuse_uring_stop_queues(struct fuse_ring *ring)
 
 		fuse_uring_abort_end_queue_requests(queue);
 		fuse_uring_teardown_entries(queue);
+
+		cpumask_clear_cpu(qid, ring->registered_q_mask);
+		cpumask_clear_cpu(qid, ring->avail_q_mask);
+		for (node = 0; node < ring->nr_numa_nodes; node++) {
+			/* Clear the queue from all masks */
+			cpumask_clear_cpu(qid,
+					  ring->numa_registered_q_mask[node]);
+			cpumask_clear_cpu(qid,
+					  ring->per_numa_avail_q_mask[node]);
+		}
 	}
 
 	/* Reset all queue masks, we won't process any more IO */
@@ -973,9 +1042,18 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ent,
 static void fuse_uring_ent_avail(struct fuse_ring_ent *ent,
 				 struct fuse_ring_queue *queue)
 {
+	struct fuse_ring *ring = queue->ring;
+	int node = queue->numa_node;
+
 	WARN_ON_ONCE(!ent->cmd);
 	list_move(&ent->list, &queue->ent_avail_queue);
 	ent->state = FRRS_AVAILABLE;
+
+	if (list_is_singular(&queue->ent_avail_queue) &&
+	    queue->nr_reqs <= FUSE_URING_QUEUE_THRESHOLD) {
+		cpumask_set_cpu(queue->qid, ring->avail_q_mask);
+		cpumask_set_cpu(queue->qid, ring->per_numa_avail_q_mask[node]);
+	}
 }
 
 /* Used to find the request on SQE commit */
@@ -998,6 +1076,8 @@ static void fuse_uring_add_req_to_ring_ent(struct fuse_ring_ent *ent,
 					   struct fuse_req *req)
 {
 	struct fuse_ring_queue *queue = ent->queue;
+	struct fuse_ring *ring = queue->ring;
+	int node = queue->numa_node;
 
 	lockdep_assert_held(&queue->lock);
 
@@ -1012,6 +1092,16 @@ static void fuse_uring_add_req_to_ring_ent(struct fuse_ring_ent *ent,
 	ent->state = FRRS_FUSE_REQ;
 	list_move_tail(&ent->list, &queue->ent_w_req_queue);
 	fuse_uring_add_to_pq(ent, req);
+
+	/*
+	 * If there are no more available entries, mark the queue as unavailable
+	 * in both global and per-NUMA node masks
+	 */
+	if (list_empty(&queue->ent_avail_queue)) {
+		cpumask_clear_cpu(queue->qid, ring->avail_q_mask);
+		cpumask_clear_cpu(queue->qid,
+				  ring->per_numa_avail_q_mask[node]);
+	}
 }
 
 /* Fetch the next fuse request if available */
@@ -1400,6 +1490,10 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
 
 	/* Marks the ring entry as ready */
 	fuse_uring_next_fuse_req(ent, queue, issue_flags);
+
+	cpumask_set_cpu(queue->qid, ring->registered_q_mask);
+	cpumask_set_cpu(queue->qid,
+			ring->numa_registered_q_mask[queue->numa_node]);
 
 	return 0;
 }

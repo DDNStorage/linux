@@ -70,6 +70,9 @@ struct fuse_ring_queue {
 	/* queue id, corresponds to the cpu core */
 	unsigned int qid;
 
+	/* NUMA node this queue belongs to */
+	int numa_node;
+
 	/*
 	 * queue lock, taken when any value in the queue changes _and_ also
 	 * a ring entry state changes.
@@ -148,6 +151,18 @@ struct fuse_ring {
 
 	/* all queue tracking */
 	struct fuse_queue_map q_map;
+
+	/* Tracks which queues are available (empty) globally */
+	cpumask_var_t avail_q_mask;
+
+	/* Tracks which queues are available per NUMA node */
+	cpumask_var_t *per_numa_avail_q_mask;
+
+	/* Tracks which queues are registered */
+	cpumask_var_t registered_q_mask;
+
+	/* Tracks which queues are registered per NUMA node */
+	cpumask_var_t *numa_registered_q_mask;
 
 	wait_queue_head_t stop_waitq;
 
