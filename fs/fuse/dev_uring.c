@@ -43,8 +43,15 @@ static inline void io_uring_cmd_private_sz_check(size_t cmd_sz)
 )
 #endif
 
-/* Number of queued fuse requests until a queue is considered full */
-#define FUSE_URING_QUEUE_THRESHOLD 5
+/* Number of queued fuse requests until a queue is considered full
+ * Basically no entries, as synchronization is with bitmaps and lockless. I.e.
+ * no accuracy - queues always get a bit more requests that way. Lightly
+ * loaded queues is wanted to reduced kernel/userspace switches.
+ */
+#define FUSE_URING_QUEUE_THRESHOLD 0
+
+static unsigned int fuse_uring_get_random_qid(struct fuse_ring *ring,
+					      const struct cpumask *mask);
 
 bool fuse_uring_enabled(void)
 {
@@ -1049,8 +1056,7 @@ static void fuse_uring_ent_avail(struct fuse_ring_ent *ent,
 	list_move(&ent->list, &queue->ent_avail_queue);
 	ent->state = FRRS_AVAILABLE;
 
-	if (list_is_singular(&queue->ent_avail_queue) &&
-	    queue->nr_reqs <= FUSE_URING_QUEUE_THRESHOLD) {
+	if (queue->nr_reqs <= FUSE_URING_QUEUE_THRESHOLD) {
 		cpumask_set_cpu(queue->qid, ring->avail_q_mask);
 		cpumask_set_cpu(queue->qid, ring->per_numa_avail_q_mask[node]);
 	}
@@ -1594,80 +1600,109 @@ static void fuse_uring_send_in_task(struct io_uring_cmd *cmd,
 	fuse_uring_send(ent, cmd, err, issue_flags);
 }
 
-static struct fuse_ring_queue *fuse_uring_select_queue(struct fuse_ring *ring,
-						       bool background)
+static struct fuse_ring_queue *
+fuse_uring_get_first_queue(struct fuse_ring *ring, const struct cpumask *mask)
 {
-	unsigned int qid;
-	int node, tries = 0;
-	unsigned int nr_queues;
-	unsigned int cpu = task_cpu(current);
-	struct fuse_ring_queue *queue, *primary_queue = NULL;
+	int qid;
+
+	/* Find the first available CPU in this mask */
+	qid = cpumask_first(mask);
+
+	/* Check if we found a valid CPU */
+	if (qid >= ring->max_nr_queues)
+		return NULL; /* No available queues */
+
+	/* This is the global mask, cpu is already the global qid */
+	return ring->queues[qid];
+}
+
+/*
+ * Return a random queue from the registered queues mask
+ *
+ * Uses a deterministic but well-distributed algorithm to select
+ * a random queue from the provided CPU mask.
+ */
+static unsigned int fuse_uring_get_random_qid(struct fuse_ring *ring,
+					      const struct cpumask *mask)
+{
+	unsigned int nr_bits = cpumask_weight(mask);
+	unsigned int nth, cpu;
+
+	if (nr_bits == 0)
+		return UINT_MAX;
+
+	/* Fast path for single CPU */
+	if (nr_bits == 1)
+		return cpumask_first(mask);
 
 	/*
-	 *  Background requests result in better performance on a different
-	 *  CPU, unless CPUs are already busy.
+	 * Use current jiffies and task PID to create a pseudo-random
+	 * but well-distributed selection that varies across calls
 	 */
-	if (background)
-		cpu++;
+	nth = (get_random_u32() ^ (jiffies & 0xFFFF) ^
+	       (current->pid & 0xFFFF)) %
+	      nr_bits;
 
-retry:
-	cpu = cpu % ring->max_nr_queues;
-
-	/* numa local registered queue bitmap */
-	node = cpu_to_node(cpu);
-	if (WARN_ONCE(node >= ring->nr_numa_nodes,
-		      "Node number (%d) exceeds nr nodes (%d)\n",
-		      node, ring->nr_numa_nodes)) {
-		node = 0;
+	/* Find the CPU at that position */
+	for_each_cpu(cpu, mask) {
+		if (nth-- == 0)
+			return cpu;
 	}
 
-	nr_queues = READ_ONCE(ring->numa_q_map[node].nr_queues);
-	if (nr_queues) {
-		/* prefer the queue that corresponds to the current cpu */
-		queue = READ_ONCE(ring->queues[cpu]);
-		if (queue) {
-			if (queue->nr_reqs <= FUSE_URING_Q_THRESHOLD)
-				return queue;
-			primary_queue = queue;
-		}
+	return UINT_MAX;
+}
 
-		qid = ring->numa_q_map[node].cpu_to_qid[cpu];
-		if (WARN_ON_ONCE(qid >= ring->max_nr_queues))
-			return NULL;
-		if (qid != cpu) {
-			queue = READ_ONCE(ring->queues[qid]);
+/*
+ * Get the best queue for the current CPU
+ */
+static struct fuse_ring_queue *fuse_uring_get_queue(struct fuse_ring *ring)
+{
+	unsigned int qid;
+	struct fuse_ring_queue *queue, *local_queue = NULL;
+	int local_node;
+	struct cpumask *mask;
+	struct fuse_conn *fc = ring->fc;
 
-			/* Might happen on teardown */
-			if (unlikely(!queue))
-				return NULL;
+	qid = task_cpu(current);
+	local_node = cpu_to_node(qid);
+	if (WARN_ON_ONCE(local_node >= ring->nr_numa_nodes || local_node < 0))
+		local_node = 0;
 
-			if (queue->nr_reqs <= FUSE_URING_Q_THRESHOLD)
-				return queue;
-		}
-
-		/* Retries help for load balancing */
-		if (tries < FUSE_URING_Q_TRIES && tries + 1 < nr_queues) {
-			if (!primary_queue)
-				primary_queue = queue;
-
-			/* Increase cpu, assuming it will map to a different qid*/
-			cpu++;
-			tries++;
-			goto retry;
-		}
+	/* First check if current CPU's queue is available */
+	if (qid < ring->max_nr_queues) {
+		local_queue = queue = ring->queues[qid];
+		if (queue && queue->nr_reqs <= FUSE_URING_QUEUE_THRESHOLD)
+			return queue;
 	}
 
-	/* Retries exceeded, take the primary target queue */
-	if (primary_queue)
-		return primary_queue;
+	/* Second check if there are any available queues on the local node */
+	mask = ring->per_numa_avail_q_mask[local_node];
+	queue = fuse_uring_get_first_queue(ring, mask);
+	if (queue)
+		return queue;
 
-	/* global registered queue bitmap */
-	qid = ring->q_map.cpu_to_qid[cpu];
-	if (WARN_ON_ONCE(qid >= ring->max_nr_queues)) {
-		/* Might happen on teardown */
-		return NULL;
-	}
-	return READ_ONCE(ring->queues[qid]);
+	/* Third check if there are any available queues on any node */
+	queue = fuse_uring_get_first_queue(ring, ring->avail_q_mask);
+	if (queue)
+		return queue;
+
+	/* No free queue, use the local queue if it exists */
+	if (local_queue)
+		return local_queue;
+
+	/* Try to use a random queue from the local NUMA node, if there is one */
+	mask = ring->numa_registered_q_mask[local_node];
+	qid = fuse_uring_get_random_qid(ring, mask);
+	if (qid < ring->max_nr_queues)
+		return ring->queues[qid];
+
+	/* Finally, use a random queue among all queues that are registered */
+	qid = fuse_uring_get_random_qid(ring, ring->registered_q_mask);
+	if (qid < ring->max_nr_queues)
+		return ring->queues[qid];
+
+	WARN_ON_ONCE(fc->connected);
+	return NULL;
 }
 
 static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg)
@@ -1707,7 +1742,7 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	int err;
 
 	err = -EINVAL;
-	queue = fuse_uring_select_queue(ring, false);
+	queue = fuse_uring_get_queue(ring);
 	if (!queue)
 		goto err;
 
@@ -1721,6 +1756,19 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	ent = list_first_entry_or_null(&queue->ent_avail_queue,
 				       struct fuse_ring_ent, list);
 	queue->nr_reqs++;
+
+	/*
+	 * Update queue availability based on number of requests
+	 * A queue is considered busy if it has more than
+	 * FUSE_URING_QUEUE_THRESHOLD requests
+	 */
+	if (queue->nr_reqs == FUSE_URING_QUEUE_THRESHOLD + 1) {
+		/* Queue just became busy */
+		cpumask_clear_cpu(queue->qid, ring->avail_q_mask);
+		cpumask_clear_cpu(
+			queue->qid,
+			ring->per_numa_avail_q_mask[queue->numa_node]);
+	}
 
 	if (ent)
 		fuse_uring_add_req_to_ring_ent(ent, req);
@@ -1749,7 +1797,7 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 	struct fuse_ring_queue *queue;
 	struct fuse_ring_ent *ent = NULL;
 
-	queue = fuse_uring_select_queue(ring, true);
+	queue = fuse_uring_get_queue(ring);
 	if (!queue)
 		return false;
 
@@ -1795,12 +1843,25 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 bool fuse_uring_remove_pending_req(struct fuse_req *req)
 {
 	struct fuse_ring_queue *queue = req->ring_queue;
+	struct fuse_ring *ring = queue->ring;
+	int node = queue->numa_node;
 	bool removed = fuse_remove_pending_req(req, &queue->lock);
 
 	if (removed) {
 		/* Update counters after successful removal */
 		spin_lock(&queue->lock);
 		queue->nr_reqs--;
+
+		/*
+		 * Update queue availability based on number of requests
+		 * A queue is considered available if it has FUSE_URING_QUEUE_THRESHOLD or fewer requests
+		 */
+		if (queue->nr_reqs == FUSE_URING_QUEUE_THRESHOLD) {
+			/* Queue just became available */
+			cpumask_set_cpu(queue->qid, ring->avail_q_mask);
+			cpumask_set_cpu(queue->qid,
+					ring->per_numa_avail_q_mask[node]);
+		}
 		spin_unlock(&queue->lock);
 	}
 
