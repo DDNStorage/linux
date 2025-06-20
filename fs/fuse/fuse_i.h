@@ -31,6 +31,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
+#include "fuse_dlm_cache.h"
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
@@ -94,6 +95,17 @@ struct fuse_backing {
 	struct rcu_head rcu;
 };
 
+/**
+ * data structure to save the information that we have
+ * requested dlm locks for the given area from the fuse server
+*/
+struct dlm_locked_area
+{
+	struct list_head list;
+	loff_t offset;
+	size_t size;
+};
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -152,6 +164,9 @@ struct fuse_inode {
 
 			/* List of writepage requestst (pending or sent) */
 			struct rb_root writepages;
+
+			/* dlm locked areas we have sent lock requests for */
+			struct fuse_dlm_cache dlm_locked_areas;
 		};
 
 		/* readdir cache (directory only) */
@@ -880,6 +895,9 @@ struct fuse_conn {
 
 	/* Is link not implemented by fs? */
 	unsigned int no_link:1;
+
+	/* do we have support for dlm in the fs? */
+	unsigned int dlm:1;
 
 	/* Use io_uring for communication */
 	unsigned int io_uring;
