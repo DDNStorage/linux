@@ -152,9 +152,6 @@ struct fuse_inode {
 			/* waitq for direct-io completion */
 			wait_queue_head_t direct_io_waitq;
 
-			/* List of writepage requestst (pending or sent) */
-			struct rb_root writepages;
-
 			/* dlm locked areas we have sent lock requests for */
 			struct fuse_dlm_cache dlm_locked_areas;
 		};
@@ -1480,6 +1477,12 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 								bool isdir);
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir);
+#ifdef CONFIG_MIGRATION
+int fuse_migrate_folio(struct address_space *mapping, struct folio *dst,
+		struct folio *src, enum migrate_mode mode);
+#else
+#define fuse_migrate_folio NULL
+#endif
 
 #ifdef CONFIG_MIGRATION
 int fuse_migrate_folio(struct address_space *mapping, struct folio *dst,
