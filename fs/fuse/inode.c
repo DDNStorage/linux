@@ -1833,8 +1833,12 @@ static int fuse_bdi_init(struct fuse_conn *fc, struct super_block *sb)
 	if (err)
 		return err;
 
-	/* fuse does it's own writeback accounting */
-	sb->s_bdi->capabilities &= ~BDI_CAP_WRITEBACK_ACCT;
+	/*
+	 * fuse uses the default (core) writeback accounting now that the manual
+	 * WB_WRITEBACK updates are gone, so leave BDI_CAP_WRITEBACK_ACCT set:
+	 * clearing it would zero the per-bdi writeback stats and writeout
+	 * fraction that balance_dirty_pages() throttles on.
+	 */
 	sb->s_bdi->capabilities &= ~BDI_CAP_STRICTLIMIT;
 
 	/*
