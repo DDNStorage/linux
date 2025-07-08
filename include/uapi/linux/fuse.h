@@ -441,6 +441,8 @@ struct fuse_file_lock {
  *		    of the request ID indicates resend requests
  * FUSE_ALLOW_IDMAP: allow creation of idmapped mounts
  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
+ * FUSE_INVAL_INODE_ENTRY: invalidate inode aliases when doing inode invalidation
+ * FUSE_EXPIRE_INODE_ENTRY: expire inode aliases when doing inode invalidation
  * FUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
  *			 init_out.request_timeout contains the timeout (in secs)
  */
@@ -489,6 +491,8 @@ struct fuse_file_lock {
 #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
 #define FUSE_ALLOW_IDMAP	(1ULL << 40)
 #define FUSE_OVER_IO_URING	(1ULL << 41)
+#define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
+#define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
 
 /**
