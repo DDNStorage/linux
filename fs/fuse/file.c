@@ -2269,10 +2269,96 @@ static int fuse_launder_folio(struct folio *folio)
  */
 static void fuse_vma_close(struct vm_area_struct *vma)
 {
-	int err;
+	pgoff_t index = pos >> PAGE_SHIFT;
+	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
+	struct page *page;
+	loff_t fsize;
+	int err = -ENOMEM;
 
-	err = write_inode_now(vma->vm_file->f_mapping->host, 1);
-	mapping_set_error(vma->vm_file->f_mapping, err);
+	WARN_ON(!fc->writeback_cache);
+
+	page = grab_cache_page_write_begin(mapping, index);
+	if (!page)
+		goto error;
+
+	fuse_wait_on_page_writeback(mapping->host, page->index);
+
+	if (PageUptodate(page) || len == PAGE_SIZE)
+		goto success;
+	/*
+	 * Check if the start this page comes after the end of file, in which
+	 * case the readpage can be optimized away.
+	 */
+	fsize = i_size_read(mapping->host);
+	if (fsize <= (pos & PAGE_MASK)) {
+		size_t off = pos & ~PAGE_MASK;
+		if (off)
+			zero_user_segment(page, 0, off);
+		goto success;
+	}
+	err = fuse_do_readpage(file, page);
+	if (err)
+		goto cleanup;
+success:
+	*pagep = page;
+	return 0;
+
+cleanup:
+	unlock_page(page);
+	put_page(page);
+error:
+	return err;
+}
+
+static int fuse_write_end(struct file *file, struct address_space *mapping,
+		loff_t pos, unsigned len, unsigned copied,
+		struct page *page, void *fsdata)
+{
+	struct inode *inode = page->mapping->host;
+
+	/* Haven't copied anything?  Skip zeroing, size extending, dirtying. */
+	if (!copied)
+		goto unlock;
+
+	pos += copied;
+	if (!PageUptodate(page)) {
+		/* Zero any unwritten bytes at the end of the page */
+		size_t endoff = pos & ~PAGE_MASK;
+		if (endoff)
+			zero_user_segment(page, endoff, PAGE_SIZE);
+		SetPageUptodate(page);
+	}
+
+	if (pos > inode->i_size)
+		i_size_write(inode, pos);
+
+	set_page_dirty(page);
+
+unlock:
+	unlock_page(page);
+	put_page(page);
+
+	return copied;
+}
+
+static int fuse_launder_folio(struct folio *folio)
+{
+	int err = 0;
+	struct fuse_fill_wb_data data = {};
+	struct iomap_writepage_ctx wpc = {
+		.inode = folio->mapping->host,
+		.iomap.type = IOMAP_MAPPED,
+		.ops = &fuse_writeback_ops,
+		.wb_ctx	= &data,
+	};
+
+	if (folio_clear_dirty_for_io(folio)) {
+		err = iomap_writeback_folio(&wpc, folio);
+		err = fuse_iomap_writeback_submit(&wpc, err);
+		if (!err)
+			folio_wait_writeback(folio);
+	}
+	return err;
 }
 
 /*
@@ -2293,7 +2379,18 @@ static void fuse_vma_close(struct vm_area_struct *vma)
 static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 {
 	struct folio *folio = page_folio(vmf->page);
-	struct inode *inode = file_inode(vmf->vma->vm_file);
+	struct file *file = vmf->vma->vm_file;
+	struct inode *inode = file_inode(file);
+	struct fuse_mount *fm = get_fuse_mount(inode);
+
+	if (fm->fc->dlm) {
+		loff_t pos = vmf->pgoff << PAGE_SHIFT;
+		size_t length = PAGE_SIZE;
+		int err = fuse_get_page_mkwrite_lock(file, pos, length);
+		if (err < 0) {
+			return vmf_error(err);
+		}
+	}
 
 	file_update_time(vmf->vma->vm_file);
 	folio_lock(folio);
