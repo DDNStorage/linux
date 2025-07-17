@@ -1320,6 +1320,12 @@ void fuse_dentry_tree_cleanup(void);
 void fuse_epoch_work(struct work_struct *work);
 
 /**
+ * Flush all pending requests and wait for them.  Takes an optional timeout
+ * in jiffies.
+ */
+void fuse_flush_requests(struct fuse_conn *fc, unsigned long timeout);
+
+/**
  * Invalidate inode attributes
  */
 
