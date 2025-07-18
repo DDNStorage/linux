@@ -204,6 +204,14 @@ static inline bool fuse_uring_remove_pending_req(struct fuse_req *req)
 	return false;
 }
 
+static inline bool fuse_uring_request_expired(struct fuse_conn *fc)
+{
+}
+
+static inline void fuse_uring_flush_bg(struct fuse_conn *fc)
+{
+}
+
 #endif /* CONFIG_FUSE_IO_URING */
 
 #endif /* _FS_FUSE_DEV_URING_I_H */
