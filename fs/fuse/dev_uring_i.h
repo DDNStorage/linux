@@ -157,33 +157,6 @@ static inline void fuse_uring_abort(struct fuse_conn *fc)
 		return;
 
 	if (atomic_read(&ring->queue_refs) > 0) {
-		fuse_uring_abort_end_requests(ring);
-		fuse_uring_stop_queues(ring);
-	}
-}
-
-static inline void fuse_uring_wait_stopped_queues(struct fuse_conn *fc)
-{
-	struct fuse_ring *ring = fc->ring;
-
-	if (ring)
-		wait_event(ring->stop_waitq,
-			   atomic_read(&ring->queue_refs) == 0);
-}
-
-static inline bool fuse_uring_ready(struct fuse_conn *fc)
-{
-	return fc->ring && fc->ring->ready;
-}
-
-static inline void fuse_uring_abort(struct fuse_conn *fc)
-{
-	struct fuse_ring *ring = fc->ring;
-
-	if (ring == NULL)
-		return;
-
-	if (atomic_read(&ring->queue_refs) > 0) {
 		fuse_uring_flush_bg(fc);
 		fuse_uring_stop_queues(ring);
 	}
@@ -235,6 +208,19 @@ static inline bool fuse_uring_remove_pending_req(struct fuse_req *req)
 static inline bool fuse_uring_request_expired(struct fuse_conn *fc)
 {
 	return false;
+}
+
+static inline bool fuse_uring_request_expired(struct fuse_conn *fc)
+{
+	return false;
+}
+
+static inline bool fuse_uring_request_expired(struct fuse_conn *fc)
+{
+}
+
+static inline void fuse_uring_flush_bg(struct fuse_conn *fc)
+{
 }
 
 #endif /* CONFIG_FUSE_IO_URING */
