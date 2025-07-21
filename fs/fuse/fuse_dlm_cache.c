@@ -533,19 +533,19 @@ void fuse_get_dlm_write_lock(struct file *file, loff_t offset,
 		return;
 	}
 
-	if (outarg.locksize < end - offset + 1) {
-		/* fuse server is seriously broken */
-		pr_warn("fuse: dlm lock request for %llu bytes returned %u bytes\n",
-			end - offset + 1, outarg.locksize);
-		fuse_abort_conn(fc);
-		return;
-	}
-
 	if (err)
 		return;
 	else
-		/* ignore any errors here, there is no way we can react appropriately */
-		fuse_dlm_lock_range(fi, offset,
+		if (outarg.locksize < end - offset + 1) {
+			/* fuse server is seriously broken */
+			pr_warn("fuse: dlm lock request for %llu bytes returned %u bytes\n",
+				end - offset + 1, outarg.locksize);
+			fuse_abort_conn(fc);
+			return;
+		} else {
+			/* ignore any errors here, there is no way we can react appropriately */
+			fuse_dlm_lock_range(fi, offset,
 				    		offset + outarg.locksize - 1,
 				    		FUSE_PAGE_LOCK_WRITE);
+		}
 }
