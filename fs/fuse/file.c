@@ -2384,7 +2384,7 @@ static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t l
 		err = 0;
 	}
 
-	if (!err && outarg.locksize < length) {
+	if (!err && fc->dlm && outarg.locksize < length) {
 		/* fuse server is seriously broken */
 		pr_warn("fuse: dlm lock request for %lu bytes returned %u bytes\n",
 			length, outarg.locksize);
