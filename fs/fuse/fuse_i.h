@@ -1578,6 +1578,14 @@ ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
 				      size_t len, unsigned int flags);
 ssize_t fuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma);
 
+#ifdef CONFIG_MIGRATION
+int fuse_migrate_folio(struct address_space *mapping, struct folio *dst,
+               struct folio *src, enum migrate_mode mode);
+#else
+#define fuse_migrate_folio NULL
+#endif
+
+
 #ifdef CONFIG_SYSCTL
 extern int fuse_sysctl_register(void);
 extern void fuse_sysctl_unregister(void);

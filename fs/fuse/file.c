@@ -3171,6 +3171,17 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
 	return ret;
 }
 
+#ifdef CONFIG_MIGRATION
+int fuse_migrate_folio(struct address_space *mapping, struct folio *dst,
+               struct folio *src, enum migrate_mode mode) {
+
+       if (folio_test_writeback(src))
+               return -EBUSY;
+       return filemap_migrate_folio(mapping, dst, src, mode);
+}
+#endif
+
+
 static const struct file_operations fuse_file_operations = {
 	.llseek		= fuse_file_llseek,
 	.read_iter	= fuse_file_read_iter,
@@ -3198,7 +3209,7 @@ static const struct address_space_operations fuse_file_aops  = {
 	.writepages	= fuse_writepages,
 	.launder_folio	= fuse_launder_folio,
 	.dirty_folio	= filemap_dirty_folio,
-	.migrate_folio	= filemap_migrate_folio,
+	.migrate_folio	= fuse_migrate_folio,
 	.bmap		= fuse_bmap,
 	.direct_IO	= fuse_direct_IO,
 	.write_begin	= fuse_write_begin,
