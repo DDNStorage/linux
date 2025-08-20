@@ -1428,30 +1428,15 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool writeback = false;
 
-	if (fc->writeback_cache) {
-		/* Update size (EOF optimization) and mode (SUID clearing) */
-		err = fuse_update_attributes(mapping->host, file,
-					     STATX_SIZE | STATX_MODE);
-		if (err)
-			return err;
+	/* Update size (EOF optimization) and mode (SUID clearing) */
+	err = fuse_update_attributes(mapping->host, file,
+				     STATX_SIZE | STATX_MODE);
+	if (err)
+		return err;
 
-		if (!fc->handle_killpriv_v2 ||
-		    !setattr_should_drop_suidgid(idmap, file_inode(file)))
-			writeback = true;
-
-		/* if we have dlm support acquire the lock for the area
-		 * we are writing into */
-		if (fc->dlm) {
-			/* note that a file opened with O_APPEND will have relative values
-			 * in ki_pos. This code is here for convenience and for libfuse overlay test.
-			 * Filesystems should handle O_APPEND with 'direct io' to additionally
-			 * get the performance benefits of 'parallel direct writes'. */
-			loff_t pos = file->f_flags & O_APPEND ? i_size_read(inode) + iocb->ki_pos : iocb->ki_pos;
-			size_t length = iov_iter_count(from);
-			fuse_get_dlm_write_lock(file, pos, length);
-		}
-		return generic_file_write_iter(iocb, from);
-	}
+	if (fc->writeback_cache && (!fc->handle_killpriv_v2 ||
+	    !setattr_should_drop_suidgid(idmap, file_inode(file))))
+		writeback = true;
 
 	inode_lock(inode);
 
@@ -1460,6 +1445,16 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		goto out;
 
 	task_io_account_write(count);
+
+	if (fc->dlm) {
+		/* note that a file opened with O_APPEND will have relative values
+		 * in ki_pos. This code is here for convenience and for libfuse overlay test.
+		 * Filesystems should handle O_APPEND with 'direct io' to additionally
+		 * get the performance benefits of 'parallel direct writes'. */
+		loff_t pos = file->f_flags & O_APPEND ? i_size_read(inode) + iocb->ki_pos : iocb->ki_pos;
+		size_t length = iov_iter_count(from);
+		fuse_get_dlm_write_lock(file, pos, length);
+	}
 
 	err = kiocb_modified(iocb);
 	if (err)
@@ -2328,8 +2323,8 @@ static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t l
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
 
-	inarg.offset = offset;
-	inarg.size = length;
+	inarg.start = offset;
+	inarg.end = offset + length - 1;
 	inarg.type = FUSE_DLM_PAGE_MKWRITE;
 
 	args.opcode = FUSE_DLM_WB_LOCK;
@@ -2346,10 +2341,13 @@ static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t l
 		err = 0;
 	}
 
-	if (!err && fc->dlm && outarg.locksize < length) {
+	if (!err &&
+		fc->dlm &&
+		(outarg.start > inarg.start ||
+	    outarg.end < inarg.end)) {
 		/* fuse server is seriously broken */
-		pr_warn("fuse: dlm lock request for %lu bytes returned %u bytes\n",
-			length, outarg.locksize);
+		pr_warn("fuse: dlm lock request for %llu:%llu bytes returned %llu:%llu bytes\n",
+			inarg.start, inarg.end, outarg.start, outarg.end);
 		fuse_abort_conn(fc);
 		err = -EINVAL;
 	}
