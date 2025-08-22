@@ -862,6 +862,9 @@ struct fuse_conn {
 	/* do we have support for dlm in the fs? */
 	unsigned int dlm:1;
 
+	/* Is synchronous FUSE_INIT allowed? */
+	unsigned int sync_init:1;
+
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
@@ -1271,7 +1274,7 @@ struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc);
 struct fuse_dev *fuse_dev_alloc(void);
 void fuse_dev_install(struct fuse_dev *fud, struct fuse_conn *fc);
 void fuse_dev_free(struct fuse_dev *fud);
-void fuse_send_init(struct fuse_mount *fm);
+int fuse_send_init(struct fuse_mount *fm);
 
 /**
  * Fill in superblock and initialize fuse connection
