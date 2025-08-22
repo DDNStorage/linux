@@ -8,6 +8,8 @@
 
 #include <linux/types.h>
 
+extern struct wait_queue_head fuse_dev_waitq;
+
 /* Ordinary requests have even IDs, while interrupts IDs are odd */
 #define FUSE_INT_REQ_BIT (1ULL << 0)
 #define FUSE_REQ_ID_STEP (1ULL << 1)
@@ -39,14 +41,21 @@ struct fuse_copy_state {
 	} ring;
 };
 
-static inline struct fuse_dev *fuse_get_dev(struct file *file)
+#define FUSE_DEV_SYNC_INIT ((struct fuse_dev *) 1)
+#define FUSE_DEV_PTR_MASK (~1UL)
+
+static inline struct fuse_dev *__fuse_get_dev(struct file *file)
 {
 	/*
 	 * Lockless access is OK, because file->private data is set
 	 * once during mount and is valid until the file is released.
 	 */
-	return READ_ONCE(file->private_data);
+	struct fuse_dev *fud = READ_ONCE(file->private_data);
+
+	return (typeof(fud)) ((unsigned long) fud & FUSE_DEV_PTR_MASK);
 }
+
+struct fuse_dev *fuse_get_dev(struct file *file);
 
 unsigned int fuse_req_hash(u64 unique);
 struct fuse_req *fuse_request_find(struct fuse_pqueue *fpq, u64 unique);
