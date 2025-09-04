@@ -152,6 +152,9 @@ struct fuse_inode {
 			/* waitq for direct-io completion */
 			wait_queue_head_t direct_io_waitq;
 
+			/* List of writepage requestst (pending or sent) */
+			struct rb_root writepages;
+
 			/* dlm locked areas we have sent lock requests for */
 			struct fuse_dlm_cache dlm_locked_areas;
 		};
