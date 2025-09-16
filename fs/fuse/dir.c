@@ -9,6 +9,7 @@
 #include "fuse_dlm_cache.h"
 #include "fuse_i.h"
 
+#include <linux/fuse.h>
 #include <linux/pagemap.h>
 #include <linux/file.h>
 #include <linux/fs_context.h>

@@ -905,6 +905,9 @@ struct fuse_conn {
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
+	/* Does the filesystem support compound operations? */
+	unsigned int compound_open_getattr:1;
+
 	/** Maximum stack depth for passthrough backing files */
 	int max_stack_depth;
 
@@ -1258,6 +1261,25 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			   gfp_t gfp_flags);
 
 /**
+ * Compound request API
+ */
+struct fuse_compound_req;
+ssize_t fuse_compound_request(struct fuse_mount *fm, struct fuse_args *args);
+ssize_t fuse_compound_send(struct fuse_compound_req *compound);
+
+struct fuse_compound_req *fuse_compound_alloc(struct fuse_mount *fm, uint32_t flags);
+int fuse_compound_add(struct fuse_compound_req *compound,
+		    struct fuse_args *args);
+int fuse_compound_get_error(struct fuse_compound_req * compound,
+			int op_idx);
+void fuse_compound_free(struct fuse_compound_req *compound);
+
+/**
+ * Assign a unique id to a fuse request
+ */
+void fuse_request_assign_unique(struct fuse_iqueue *fiq, struct fuse_req *req);
+
+/**
  * End a finished request
  */
 void fuse_request_end(struct fuse_req *req);
@@ -1510,7 +1532,8 @@ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
 
 /* file.c */
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
-				 unsigned int open_flags, bool isdir);
+								struct inode *inode,
+								unsigned int open_flags, bool isdir);
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir);
 
