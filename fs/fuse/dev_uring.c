@@ -731,11 +731,14 @@ static int fuse_uring_args_to_ring_pages(struct fuse_ring *ring,
 			     (struct fuse_arg *)in_args, 0);
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
-		return err;
+		goto copy_finish;
 	}
 
 	ent_in_out.payload_sz = cs.ring.copied_sz;
 	memcpy(&headers->ring_ent_in_out, &ent_in_out, sizeof(ent_in_out));
+
+copy_finish:
+	fuse_copy_finish(&cs);
 	return err;
 }
 
