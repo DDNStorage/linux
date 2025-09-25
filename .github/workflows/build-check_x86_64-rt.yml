@@ -14,7 +14,7 @@ jobs:
         ROCKY_ENV: rocky9
       ports:
         - 80
-      options: --cpus 8
+      options: --cpus 4
     steps:
       - name: Install tools and Libraries
         run: |
@@ -30,4 +30,4 @@ jobs:
           git config --global --add safe.directory /__w/kernel-src-tree/kernel-src-tree
           cp configs/kernel-x86_64-rt-rhel.config .config
           make olddefconfig
-          make -j8
+          make -j4
