@@ -7,7 +7,7 @@ on:
 
 jobs:
   kernel-build-job:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     container:
       image: rockylinux:9
       env:
