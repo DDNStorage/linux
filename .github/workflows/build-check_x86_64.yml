@@ -7,8 +7,7 @@ on:
 
 jobs:
   kernel-build-job:
-    runs-on:
-      labels: kernel-build
+    runs-on: ubuntu-latest
     container:
       image: rockylinux:9
       env:
