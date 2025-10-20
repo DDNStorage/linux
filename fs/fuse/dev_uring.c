@@ -452,7 +452,7 @@ static void fuse_uring_stop_fuse_req_end(struct fuse_req *req)
 /*
  * Release a request/entry on connection tear down
  */
-static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent)
+static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent, int issue_flags)
 {
 	struct fuse_req *req;
 	struct io_uring_cmd *cmd;
@@ -480,7 +480,7 @@ static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent)
 	spin_unlock(&queue->lock);
 
 	if (cmd)
-		io_uring_cmd_done(cmd, -ENOTCONN, 0, IO_URING_F_UNLOCKED);
+		io_uring_cmd_done(cmd, -ENOTCONN, 0, issue_flags);
 
 	if (req)
 		fuse_uring_stop_fuse_req_end(req);
@@ -515,7 +515,7 @@ static void fuse_uring_stop_list_entries(struct list_head *head,
 
 	/* no queue lock to avoid lock order issues */
 	list_for_each_entry_safe(ent, next, &to_teardown, list)
-		fuse_uring_entry_teardown(ent);
+		fuse_uring_entry_teardown(ent, IO_URING_F_UNLOCKED);
 }
 
 static void fuse_uring_teardown_entries(struct fuse_ring_queue *queue)
@@ -641,7 +641,7 @@ static void fuse_uring_cancel(struct io_uring_cmd *cmd,
 {
 	struct fuse_ring_ent *ent = uring_cmd_to_ring_ent(cmd);
 	struct fuse_ring_queue *queue;
-	bool need_cmd_done = false;
+	bool teardown = false;
 
 	/*
 	 * direct access on ent - it must not be destructed as long as
@@ -651,15 +651,13 @@ static void fuse_uring_cancel(struct io_uring_cmd *cmd,
 	spin_lock(&queue->lock);
 	if (ent->state == FRRS_AVAILABLE) {
 		ent->state = FRRS_TEARDOWN;
-		list_del_init_tail(&ent->list);
+		list_del_init(&ent->list);
 		teardown = true;
 	}
 	spin_unlock(&queue->lock);
 
-	if (need_cmd_done) {
-		/* no queue lock to avoid lock order issues */
-		io_uring_cmd_done(cmd, -ENOTCONN, 0, issue_flags);
-	}
+	if (teardown)
+		fuse_uring_entry_teardown(ent, issue_flags);
 }
 
 static void fuse_uring_prepare_cancel(struct io_uring_cmd *cmd, int issue_flags,
