@@ -22,6 +22,8 @@ MODULE_PARM_DESC(enable_uring,
 #define FUSE_RING_HEADER_PG 0
 #define FUSE_RING_PAYLOAD_PG 1
 
+#define FUSE_URING_Q_THRESHOLD 2
+
 /* redfs only to allow patch backports */
 #define IO_URING_F_TASK_DEAD (1 << 13)
 
@@ -1480,9 +1482,10 @@ static struct fuse_ring_queue *fuse_uring_select_queue(struct fuse_ring *ring,
 						       bool background)
 {
 	unsigned int qid;
-	int node;
+	int node, retries = 0;
 	unsigned int nr_queues;
 	unsigned int cpu = task_cpu(current);
+	struct fuse_ring_queue *queue, *primary_queue = NULL;
 
 	/*
 	 *  Background requests result in better performance on a different
@@ -1491,6 +1494,7 @@ static struct fuse_ring_queue *fuse_uring_select_queue(struct fuse_ring *ring,
 	if (background)
 		cpu++;
 
+retry:
 	cpu = cpu % ring->max_nr_queues;
 
 	/* numa local registered queue bitmap */
@@ -1506,12 +1510,35 @@ static struct fuse_ring_queue *fuse_uring_select_queue(struct fuse_ring *ring,
 		qid = ring->numa_q_map[node].cpu_to_qid[cpu];
 		if (WARN_ON_ONCE(qid >= ring->max_nr_queues))
 			return NULL;
-		return READ_ONCE(ring->queues[qid]);
+		queue = READ_ONCE(ring->queues[qid]);
+
+		/* Might happen on teardown */
+		if (unlikely(!queue))
+			return NULL;
+
+		if (queue->nr_reqs < FUSE_URING_Q_THRESHOLD)
+			return queue;
+
+		/* Retries help for load balancing */
+		if (retries < FUSE_URING_Q_THRESHOLD) {
+			if (!retries)
+				primary_queue = queue;
+
+			/* Increase cpu, assuming it will map to a differet qid*/
+			cpu++;
+			retries++;
+			goto retry;
+		}
 	}
+
+	/* Retries exceeded, take the primary target queue */
+	if (primary_queue)
+		return primary_queue;
 
 	/* global registered queue bitmap */
 	qid = ring->q_map.cpu_to_qid[cpu];
 	if (WARN_ON_ONCE(qid >= ring->max_nr_queues))
+	/* Might happen on teardown */
 		return NULL;
 	return READ_ONCE(ring->queues[qid]);
 }
