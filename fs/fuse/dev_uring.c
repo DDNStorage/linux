@@ -178,9 +178,11 @@ static void fuse_uring_destruct_q_masks(struct fuse_ring *ring)
 
 	fuse_ring_destruct_q_map(&ring->q_map);
 
-	if (ring->numa_q_map)
+	if (ring->numa_q_map) {
 		for (node = 0; node < ring->nr_numa_nodes; node++)
 			fuse_ring_destruct_q_map(&ring->numa_q_map[node]);
+		kfree(ring->numa_q_map);
+	}
 }
 
 static bool ent_list_request_expired(struct fuse_conn *fc, struct list_head *list)
