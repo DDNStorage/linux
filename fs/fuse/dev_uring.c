@@ -92,6 +92,7 @@ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
 	spin_lock(&queue->lock);
 	ent->fuse_req = NULL;
 	queue->nr_reqs--;
+	list_del_init(&req->list);
 	if (test_bit(FR_BACKGROUND, &req->flags)) {
 		queue->active_background--;
 		spin_lock(&fc->bg_lock);
@@ -524,6 +525,10 @@ static void fuse_uring_teardown_entries(struct fuse_ring_queue *queue)
 				     FRRS_USERSPACE);
 	fuse_uring_stop_list_entries(&queue->ent_avail_queue, queue,
 				     FRRS_AVAILABLE);
+	fuse_uring_stop_list_entries(&queue->ent_w_req_queue, queue,
+				     FRRS_FUSE_REQ);
+	fuse_uring_stop_list_entries(&queue->ent_commit_queue, queue,
+				     FRRS_COMMIT);
 }
 
 /*
