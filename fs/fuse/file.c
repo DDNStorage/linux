@@ -130,13 +130,14 @@ static int fuse_compound_open_getattr(struct fuse_mount *fm, u64 nodeid,
 				struct fuse_attr_out *outattrp,
 				struct fuse_open_out *outargp)
 {
+	struct fuse_conn *fc = fm->fc;
 	struct fuse_compound_req *compound;
 	struct fuse_args open_args = {}, getattr_args = {};
 	struct fuse_open_in open_in = {};
 	struct fuse_getattr_in getattr_in = {};
 	int err;
 
-	/* Build compound request with flag to execute in the given order */
+	/* Build compound request */
 	compound = fuse_compound_alloc(fm, 0);
 	if (IS_ERR(compound))
 		return PTR_ERR(compound);
@@ -150,6 +151,7 @@ static int fuse_compound_open_getattr(struct fuse_mount *fm, u64 nodeid,
 	    (open_in.flags & O_TRUNC) && !capable(CAP_FSETID)) {
 		open_in.open_flags |= FUSE_OPEN_KILL_SUIDGID;
 	}
+
 	open_args.opcode = opcode;
 	open_args.nodeid = nodeid;
 	open_args.in_numargs = 1;
@@ -178,8 +180,31 @@ static int fuse_compound_open_getattr(struct fuse_mount *fm, u64 nodeid,
 		goto out;
 
 	err = fuse_compound_send(compound);
+	if (err == -ENOSYS) {
+		fc->compound_open_getattr = 0;
+		goto out;
+	}
+
 	if (err)
 		goto out;
+
+	/* Check individual operation errors */
+	err = fuse_compound_get_error(compound, 0);
+	if (err)
+		goto out;
+
+	err = fuse_compound_get_error(compound, 1);
+	if (err) {
+		/* OPEN succeeded but GETATTR failed - need to release the handle */
+		struct fuse_release_args *ra = ff->release_args;
+
+		if (ra) {
+			ra->inarg.fh = open_out.fh;
+			ra->inarg.flags = open_in.flags;
+			fuse_file_put(ff, true);
+		}
+		goto out;
+	}
 
 	ff->fh = outargp->fh;
 	ff->open_flags = outargp->open_flags;
