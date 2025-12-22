@@ -13,8 +13,7 @@
 /*
  * Compound request
  */
-struct fuse_compound_req
-{
+struct fuse_compound_req {
 	struct fuse_mount *fm;
 	struct fuse_compound_in compound_header;
 	struct fuse_compound_out result_header;
@@ -59,10 +58,11 @@ struct fuse_compound_req *fuse_compound_alloc(struct fuse_mount *fm,
  */
 void fuse_compound_free(struct fuse_compound_req *compound)
 {
-	if (compound) {
-		kvfree(compound->buffer);
-		kfree(compound);
-	}
+	if (!compound)
+		return;
+
+	kvfree(compound->buffer);
+	kfree(compound);
 }
 
 /*
@@ -149,23 +149,18 @@ int fuse_compound_add(struct fuse_compound_req *compound,
 	size_t args_size = 0;
 	size_t needed_size;
 	size_t expected_out_size = 0;
-	size_t page_payload_size = 0;
 	int i;
 
 	if (!compound || compound->compound_header.count >= FUSE_MAX_COMPOUND_OPS)
 		return -EINVAL;
 
-	/* Calculate input size - handle page-based arguments separately */
-	for (i = 0; i < args->in_numargs; i++) {
-		/* Last argument with in_pages flag gets data from pages */
-		if (unlikely(i == args->in_numargs - 1 && args->in_pages)) {
-			/* the data handling is not supported at the moment */
-			page_payload_size = args->in_args[i].size;
-			args_size += page_payload_size;
-		} else {
-			args_size += args->in_args[i].size;
-		}
-	}
+	/* Page-based payloads are not supported */
+	if (args->in_pages)
+		return -EINVAL;
+
+	/* Calculate input size */
+	for (i = 0; i < args->in_numargs; i++)
+		args_size += args->in_args[i].size;
 
 	/* Calculate expected output size */
 	for (i = 0; i < args->out_numargs; i++)
@@ -177,10 +172,12 @@ int fuse_compound_add(struct fuse_compound_req *compound,
 	if (compound->buffer_pos + needed_size > compound->buffer_size) {
 		size_t new_size = max(compound->buffer_size * 2,
 				      compound->buffer_pos + needed_size);
+		char *new_buffer;
+
 		new_size = round_up(new_size, PAGE_SIZE);
-		char *new_buffer = kvrealloc(compound->buffer,
-						compound->buffer_size,
-						new_size, GFP_KERNEL);
+		new_buffer = kvrealloc(compound->buffer,
+				       compound->buffer_size,
+				       new_size, GFP_KERNEL);
 		if (!new_buffer)
 			return -ENOMEM;
 		compound->buffer = new_buffer;
@@ -198,12 +195,6 @@ int fuse_compound_add(struct fuse_compound_req *compound,
 	hdr->pid = pid_nr_ns(task_pid(current), compound->fm->fc->pid_ns);
 	hdr->unique = fuse_get_unique(&compound->fm->fc->iq);
 	compound->buffer_pos += sizeof(*hdr);
-
-	if (args->in_pages) {
-		/* we have external payload,
-		 * this is not supported at the moment */
-		return -EINVAL;
-	}
 
 	/* Copy operation arguments */
 	for (i = 0; i < args->in_numargs; i++) {
@@ -238,28 +229,61 @@ static void *fuse_copy_response_data(struct fuse_args *args, char *response_data
 
 		/* Last argument with out_pages: copy to pages */
 		if (arg_idx == args->out_numargs - 1 && args->out_pages) {
-			/* external payload (in the last out arg)
+			/*
+			 * External payload (in the last out arg)
 			 * is not supported at the moment
 			 */
 			return response_data;
-		} else {
-			size_t arg_size = current_arg.size;
-			if (current_arg.value && arg_size > 0) {
-				memcpy(current_arg.value,
-				       (char *)response_data + copied,
-				       arg_size);
-				copied += arg_size;
-			}
+		}
+
+		size_t arg_size = current_arg.size;
+
+		if (current_arg.value && arg_size > 0) {
+			memcpy(current_arg.value,
+			       (char *)response_data + copied,
+			       arg_size);
+			copied += arg_size;
 		}
 	}
 
-	return (char*)response_data + copied;
+	return (char *)response_data + copied;
 }
 
-int fuse_compound_get_error(struct fuse_compound_req * compound,
-			    int op_idx)
+int fuse_compound_get_error(struct fuse_compound_req *compound, int op_idx)
 {
 	return compound->op_errors[op_idx];
+}
+
+/*
+ * Parse a single operation response from the compound response buffer
+ *
+ * Returns pointer to the next operation response on success, or NULL on error.
+ */
+static void *fuse_compound_parse_one_op(struct fuse_compound_req *compound,
+					int op_index, void *op_out_data,
+					void *response_end)
+{
+	struct fuse_out_header *op_hdr = op_out_data;
+	struct fuse_args *args = compound->op_args[op_index];
+
+	/* Validate header length */
+	if (op_hdr->len < sizeof(struct fuse_out_header))
+		return NULL;
+
+	/* Check if the entire operation response fits in the buffer */
+	if ((char *)op_out_data + op_hdr->len > (char *)response_end)
+		return NULL;
+
+	if (op_hdr->error != 0)
+		compound->op_errors[op_index] = op_hdr->error;
+
+	/* Copy response data */
+	if (args && op_hdr->len > sizeof(struct fuse_out_header))
+		return fuse_copy_response_data(args,
+				op_out_data + sizeof(struct fuse_out_header));
+
+	/* No response data, just advance past the header */
+	return (char *)op_out_data + op_hdr->len;
 }
 
 /*
@@ -275,58 +299,35 @@ int fuse_compound_get_error(struct fuse_compound_req * compound,
  * Returns 0 on success, negative error code on failure.
  */
 static int fuse_compound_parse_resp(struct fuse_compound_req *compound,
-				uint32_t count, void *response, size_t response_size)
+				    uint32_t count, void *response,
+				    size_t response_size)
 {
-	int i;
-	int res = 0;
-
-	/* double parsing prevention will be important
-	 * for large responses most likely out pages.
-	 */
-	if (compound->parsed) {
-		return 0;
-	}
-
 	void *op_out_data = response;
 	void *response_end = (char *)response + response_size;
+	int i;
+
+	/*
+	 * Double parsing prevention will be important
+	 * for large responses most likely out pages.
+	 */
+	if (compound->parsed)
+		return 0;
 
 	/* Basic validation */
-	if (!response || response_size < sizeof(struct fuse_out_header)) {
+	if (!response || response_size < sizeof(struct fuse_out_header))
 		return -EIO;
-	}
 
 	/* Parse each operation response */
-	for (i = 0;
-			i < count && i < compound->result_header.count; i++) {
-		struct fuse_out_header *op_hdr = op_out_data;
-		struct fuse_args *args = compound->op_args[i];
-
-		/* Validate header length */
-		if (op_hdr->len < sizeof(struct fuse_out_header)) {
+	for (i = 0; i < count && i < compound->result_header.count; i++) {
+		op_out_data = fuse_compound_parse_one_op(compound, i,
+							 op_out_data,
+							 response_end);
+		if (!op_out_data)
 			return -EIO;
-		}
-
-		/* Check if the entire operation response fits in the buffer */
-		if ((char *)op_out_data + op_hdr->len > (char *)response_end) {
-			return -EIO;
-		}
-
-		if (op_hdr->error != 0) {
-			compound->op_errors[i] = op_hdr->error;
-		}
-
-		/* Copy response data */
-		if (args && op_hdr->len > sizeof(struct fuse_out_header)) {
-			op_out_data = fuse_copy_response_data(args,
-								op_out_data + sizeof(struct fuse_out_header));
-		} else {
-			/* No response data, just advance past the header */
-			op_out_data = (char *)op_out_data + op_hdr->len;
-		}
 	}
 
 	compound->parsed = true;
-	return res;
+	return 0;
 }
 
 /*
@@ -341,13 +342,11 @@ static int fuse_compound_parse_resp(struct fuse_compound_req *compound,
  * On success, the response data is copied to the original fuse_args
  * structures for each operation.
  *
- * Returns 0 on success, or the first error code from any operation.
+ * Returns 0 on success.
  * Returns negative error code if the request itself fails.
  */
 ssize_t fuse_compound_send(struct fuse_compound_req *compound)
 {
-	size_t expected_response_size;
-	ssize_t ret;
 	struct fuse_args args = {
 		.opcode = FUSE_COMPOUND,
 		.nodeid = 0,
@@ -355,6 +354,11 @@ ssize_t fuse_compound_send(struct fuse_compound_req *compound)
 		.out_numargs = 2,
 		.out_argvar = true,
 	};
+	size_t expected_response_size;
+	size_t total_buffer_size;
+	size_t actual_response_size;
+	void *resp_payload;
+	ssize_t ret;
 
 	if (!compound) {
 		pr_info_ratelimited("FUSE: compound request is NULL in fuse_compound_send\n");
@@ -367,16 +371,15 @@ ssize_t fuse_compound_send(struct fuse_compound_req *compound)
 	}
 
 	/* Calculate response buffer size */
-	expected_response_size =
-		compound->total_expected_out_size;
-	size_t total_buffer_size = expected_response_size +
+	expected_response_size = compound->total_expected_out_size;
+	total_buffer_size = expected_response_size +
 		(compound->compound_header.count * sizeof(struct fuse_out_header));
 
-	void *resp_payload = kvmalloc(total_buffer_size, GFP_KERNEL | __GFP_ZERO);
-
+	resp_payload = kvmalloc(total_buffer_size, GFP_KERNEL | __GFP_ZERO);
 	if (!resp_payload)
 		return -ENOMEM;
-	/* tell the fuse server how much memory we have allocated */
+
+	/* Tell the fuse server how much memory we have allocated */
 	compound->compound_header.result_size = expected_response_size;
 
 	args.in_args[0].size = sizeof(compound->compound_header);
@@ -395,25 +398,24 @@ ssize_t fuse_compound_send(struct fuse_compound_req *compound)
 		goto out;
 
 	ret = fuse_compound_request(compound->fm, &args);
-	if (ret == -ENOSYS) {
+	if (ret == -ENOSYS)
 		goto out;
-	}
 
-	size_t actual_response_size = args.out_args[1].size;
+	actual_response_size = args.out_args[1].size;
 
 	/* Validate response size */
 	if (actual_response_size < sizeof(struct fuse_compound_out)) {
 		pr_info_ratelimited("FUSE: compound response too small (%zu bytes, minimum %zu bytes)\n",
-				    actual_response_size, sizeof(struct fuse_compound_out));
+				    actual_response_size,
+				    sizeof(struct fuse_compound_out));
 		ret = -EINVAL;
 		goto out;
 	}
 
 	/* Parse response using actual size */
-	ret = fuse_compound_parse_resp(compound,
-			compound->result_header.count,
-			((char *)resp_payload),
-			actual_response_size);
+	ret = fuse_compound_parse_resp(compound, compound->result_header.count,
+				       (char *)resp_payload,
+				       actual_response_size);
 out:
 	kvfree(resp_payload);
 	return ret;
