@@ -20,6 +20,13 @@
 #include <linux/uio.h>
 #include <linux/fs.h>
 
+/* RHEL/Rocky 9.7 */
+#if defined(__has_include)
+# if __has_include(<linux/filelock.h>)
+#  include <linux/filelock.h>
+# endif
+#endif
+
 static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
 			  unsigned int open_flags, int opcode,
 			  struct fuse_open_out *outargp)
