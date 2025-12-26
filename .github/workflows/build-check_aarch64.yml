@@ -22,12 +22,8 @@ jobs:
           dnf install --enablerepo=crb bc dwarves kernel-devel openssl-devel elfutils-libelf-devel -y
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: "${{ github.event.pull_request.head.sha }}"
-          fetch-depth: 0
       - name: Build the Kernel
         run: |
-          git config --global --add safe.directory /__w/kernel-src-tree/kernel-src-tree
-          cp configs/kernel-aarch64-rhel.config .config
+          cp configs/kernel-aarch64-redfs-ci.config .config
           make olddefconfig
           make -j4
