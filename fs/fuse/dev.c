@@ -2598,17 +2598,6 @@ static long fuse_dev_ioctl(struct file *file, unsigned int cmd,
 	}
 }
 
-#ifdef CONFIG_PROC_FS
-static void fuse_dev_show_fdinfo(struct seq_file *seq, struct file *file)
-{
-	struct fuse_dev *fud = __fuse_get_dev(file);
-	if (!fud)
-		return;
-
-	seq_printf(seq, "fuse_connection:\t%u\n", fud->fc->dev);
-}
-#endif
-
 const struct file_operations fuse_dev_operations = {
 	.owner		= THIS_MODULE,
 	.open		= fuse_dev_open,
