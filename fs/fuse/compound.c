@@ -398,7 +398,7 @@ ssize_t fuse_compound_send(struct fuse_compound_req *compound)
 		goto out;
 
 	ret = fuse_compound_request(compound->fm, &args);
-	if (ret == -ENOSYS)
+	if (ret < 0)
 		goto out;
 
 	actual_response_size = args.out_args[1].size;
