@@ -1169,6 +1169,14 @@ struct fuse_io_args {
 void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 			 size_t count, int opcode);
 
+/*
+ * Helper functions to initialize fuse_args for common operations
+ */
+void fuse_open_args_fill(struct fuse_args *args, u64 nodeid, int opcode,
+			 struct fuse_open_in *inarg, struct fuse_open_out *outarg);
+void fuse_getattr_args_fill(struct fuse_args *args, u64 nodeid,
+			    struct fuse_getattr_in *inarg,
+			    struct fuse_attr_out *outarg);
 
 struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release);
 void fuse_file_free(struct fuse_file *ff);
@@ -1275,7 +1283,6 @@ int fuse_compound_add(struct fuse_compound_req *compound,
 		    struct fuse_args *args);
 int fuse_compound_get_error(struct fuse_compound_req * compound,
 			int op_idx);
-void fuse_compound_free(struct fuse_compound_req *compound);
 
 /**
  * Assign a unique id to a fuse request
@@ -1536,7 +1543,8 @@ void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
 /* file.c */
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 								struct inode *inode,
-								unsigned int open_flags, bool isdir);
+								unsigned int open_flags,
+								bool isdir);
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir);
 
