@@ -689,6 +689,9 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
 static bool fuse_request_queue_background_uring(struct fuse_conn *fc,
 					       struct fuse_req *req)
 {
+	struct fuse_iqueue *fiq = &fc->iq;
+
+	req->in.h.unique = fuse_get_unique(fiq);
 	req->in.h.len = sizeof(struct fuse_in_header) +
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
@@ -893,6 +896,15 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 			cs->pipebufs++;
 			cs->nr_segs++;
 		}
+	} else if (cs->ring.pages) {
+		cs->pg = cs->ring.pages[cs->ring.page_idx++];
+		/*
+		 * non stricly needed, just to avoid a uring exception in
+		 * fuse_copy_finish
+		 */
+		get_page(cs->pg);
+		cs->len = PAGE_SIZE;
+		cs->offset = 0;
 	} else {
 		size_t off;
 		err = iov_iter_get_pages2(cs->iter, &page, PAGE_SIZE, 1, &off);
