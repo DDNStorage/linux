@@ -37,6 +37,10 @@ static bool __read_mostly enable_compound;
 module_param(enable_compound, bool, 0644);
 MODULE_PARM_DESC(enable_uring, "Enable fuse compounds");
 
+static bool __read_mostly enable_large_folios = true;
+module_param(enable_large_folios, bool, 0644);
+MODULE_PARM_DESC(enable_large_folios, "Enable large folios support");
+
 static struct kmem_cache *fuse_inode_cachep;
 struct list_head fuse_conn_list;
 DEFINE_MUTEX(fuse_mutex);

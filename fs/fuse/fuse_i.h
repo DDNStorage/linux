@@ -84,6 +84,7 @@ extern struct mutex fuse_mutex;
 /** Module parameters */
 extern unsigned int max_user_bgreq;
 extern unsigned int max_user_congthresh;
+extern bool enable_large_folios;
 
 /* One forget request */
 struct fuse_forget_link {
@@ -947,6 +948,7 @@ struct fuse_conn {
 
 	/* Use io_uring for communication */
 	unsigned int io_uring;
+
 
 	/* Does the filesystem support compound operations? */
 	unsigned int compound_open_getattr:1;

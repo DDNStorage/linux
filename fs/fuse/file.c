@@ -3400,4 +3400,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
+
+	if (enable_large_folios)
+		mapping_set_large_folios(inode->i_mapping);
 }
