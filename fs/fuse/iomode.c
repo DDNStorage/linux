@@ -70,10 +70,12 @@ static void fuse_file_cached_io_end(struct inode *inode, struct fuse_file *ff)
 	spin_unlock(&fi->lock);
 }
 
-/* Start strictly uncached io mode where cache access is not allowed */
-int fuse_file_uncached_io_start(struct inode *inode, struct fuse_file *ff)
+/*
+ * Start strictly uncached io mode where cache access is not allowed.
+ * This is for parallel DIO - does NOT change ff->iomode state.
+ */
+int fuse_inode_uncached_io_start(struct fuse_inode *fi)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
 	int err = 0;
 
 	spin_lock(&fi->lock);
@@ -81,26 +83,55 @@ int fuse_file_uncached_io_start(struct inode *inode, struct fuse_file *ff)
 		err = -ETXTBSY;
 		goto unlock;
 	}
-	WARN_ON(ff->iomode != IOM_NONE);
 	fi->iocachectr--;
-	ff->iomode = IOM_UNCACHED;
 unlock:
 	spin_unlock(&fi->lock);
 	return err;
 }
 
-void fuse_file_uncached_io_end(struct inode *inode, struct fuse_file *ff)
+/*
+ * End uncached io mode for parallel DIO.
+ * Does NOT change ff->iomode state.
+ */
+void fuse_inode_uncached_io_end(struct fuse_inode *fi)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
-
 	spin_lock(&fi->lock);
 	WARN_ON(fi->iocachectr >= 0);
-	WARN_ON(ff->iomode != IOM_UNCACHED);
-	ff->iomode = IOM_NONE;
 	fi->iocachectr++;
 	if (!fi->iocachectr)
 		wake_up(&fi->direct_io_waitq);
 	spin_unlock(&fi->lock);
+}
+
+/*
+ * Start uncached io mode for file open.
+ * Takes uncached_io inode mode reference AND sets ff->iomode.
+ */
+int fuse_file_uncached_io_start(struct inode *inode, struct fuse_file *ff)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	int err;
+
+	err = fuse_inode_uncached_io_start(fi);
+	if (err)
+		return err;
+
+	WARN_ON(ff->iomode != IOM_NONE);
+	ff->iomode = IOM_UNCACHED;
+	return 0;
+}
+
+/*
+ * End uncached io mode for file release.
+ * Drops uncached_io inode mode reference AND clears ff->iomode.
+ */
+void fuse_file_uncached_io_end(struct inode *inode, struct fuse_file *ff)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	WARN_ON(ff->iomode != IOM_UNCACHED);
+	ff->iomode = IOM_NONE;
+	fuse_inode_uncached_io_end(fi);
 }
 
 /* Request access to submit new io to inode via open file */
