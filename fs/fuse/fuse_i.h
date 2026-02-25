@@ -1464,6 +1464,8 @@ int fuse_fileattr_set(struct user_namespace *mnt_userns,
 
 /* iomode.c */
 int fuse_file_cached_io_start(struct inode *inode, struct fuse_file *ff);
+int fuse_inode_uncached_io_start(struct fuse_inode *fi);
+void fuse_inode_uncached_io_end(struct fuse_inode *fi);
 int fuse_file_uncached_io_start(struct inode *inode, struct fuse_file *ff);
 void fuse_file_uncached_io_end(struct inode *inode, struct fuse_file *ff);
 

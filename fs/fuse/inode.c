@@ -175,6 +175,9 @@ static void fuse_evict_inode(struct inode *inode)
 			fuse_cleanup_submount_lookup(fc, fi->submount_lookup);
 			fi->submount_lookup = NULL;
 		}
+		if (S_ISREG(inode->i_mode) && !fuse_is_bad(inode)) {
+			WARN_ON(fi->iocachectr != 0);
+		}
 		/*
 		 * Evict of non-deleted inode may race with outstanding
 		 * LOOKUP/READDIRPLUS requests and result in inconsistency when
