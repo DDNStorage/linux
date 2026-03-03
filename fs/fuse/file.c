@@ -22,6 +22,8 @@
 #include <linux/filelock.h>
 #include <linux/splice.h>
 
+extern int sb_init_dio_done_wq(struct super_block *sb);
+
 /*
  * Helper function to initialize fuse_args for OPEN/OPENDIR operations
  */
@@ -716,6 +718,19 @@ static ssize_t fuse_get_res_by_io(struct fuse_io_priv *io)
 	return io->bytes < 0 ? io->size : io->bytes;
 }
 
+static void fuse_aio_invalidate_worker(struct work_struct *work)
+{
+	struct fuse_io_priv *io = container_of(work, struct fuse_io_priv, work);
+	struct address_space *mapping = io->iocb->ki_filp->f_mapping;
+	ssize_t res = fuse_get_res_by_io(io);
+	pgoff_t start = io->offset >> PAGE_SHIFT;
+	pgoff_t end = (io->offset + res - 1) >> PAGE_SHIFT;
+
+	invalidate_inode_pages2_range(mapping, start, end);
+	io->iocb->ki_complete(io->iocb, res);
+	kref_put(&io->refcnt, fuse_io_release);
+}
+
 /*
  * In case of short read, the caller sets 'pos' to the position of
  * actual end of fuse request in IO request. Otherwise, if bytes_requested
@@ -748,28 +763,32 @@ static void fuse_aio_complete(struct fuse_io_priv *io, int err, ssize_t pos)
 	spin_unlock(&io->lock);
 
 	if (!left && !io->blocking) {
+		struct inode *inode = file_inode(io->iocb->ki_filp);
+		struct address_space *mapping = io->iocb->ki_filp->f_mapping;
 		ssize_t res = fuse_get_res_by_io(io);
 
 		if (res >= 0) {
-			struct inode *inode = file_inode(io->iocb->ki_filp);
 			struct fuse_conn *fc = get_fuse_conn(inode);
 			struct fuse_inode *fi = get_fuse_inode(inode);
-			struct address_space *mapping = io->iocb->ki_filp->f_mapping;
 
+			spin_lock(&fi->lock);
+			fi->attr_version = atomic64_inc_return(&fc->attr_version);
+			spin_unlock(&fi->lock);
+		}
+
+		if (io->write && res > 0 && mapping->nrpages) {
 			/*
 			 * As in generic_file_direct_write(), invalidate after the
 			 * write, to invalidate read-ahead cache that may have competed
 			 * with the write.
 			 */
-			if (io->write && res && mapping->nrpages) {
-				invalidate_inode_pages2_range(mapping,
-						io->offset >> PAGE_SHIFT,
-						(io->offset + res - 1) >> PAGE_SHIFT);
+			if (!inode->i_sb->s_dio_done_wq)
+				res = sb_init_dio_done_wq(inode->i_sb);
+			if (res >= 0) {
+				INIT_WORK(&io->work, fuse_aio_invalidate_worker);
+				queue_work(inode->i_sb->s_dio_done_wq, &io->work);
+				return;
 			}
-
-			spin_lock(&fi->lock);
-			fi->attr_version = atomic64_inc_return(&fc->attr_version);
-			spin_unlock(&fi->lock);
 		}
 
 		io->iocb->ki_complete(io->iocb, res);
