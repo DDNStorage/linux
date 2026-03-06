@@ -1832,6 +1832,56 @@ copy_finish:
 	return err;
 }
 
+static int fuse_notify_register_gds_netdev(struct fuse_conn *fc, unsigned int size,
+					struct fuse_copy_state *cs)
+{
+	char netdev_name[256];
+	int err;
+
+	err = -EINVAL;
+	if (size >= sizeof(netdev_name))
+		goto copy_finish;
+
+	err = fuse_copy_one(cs, netdev_name, size);
+	if (err)
+		goto copy_finish;
+
+	netdev_name[size] = '\0';
+	fuse_copy_finish(cs);
+
+	err = fuse_dmabuf_register_netdev(fc, netdev_name);
+	return err;
+
+copy_finish:
+	fuse_copy_finish(cs);
+	return err;
+}
+
+static int fuse_notify_unregister_gds_netdev(struct fuse_conn *fc, unsigned int size,
+					struct fuse_copy_state *cs)
+{
+	char netdev_name[256];
+	int err;
+
+	err = -EINVAL;
+	if (size >= sizeof(netdev_name))
+		goto copy_finish;
+
+	err = fuse_copy_one(cs, netdev_name, size);
+	if (err)
+		goto copy_finish;
+
+	netdev_name[size] = '\0';
+	fuse_copy_finish(cs);
+
+	err = fuse_dmabuf_unregister_netdev(fc, netdev_name);
+	return err;
+
+copy_finish:
+	fuse_copy_finish(cs);
+	return err;
+}
+
 static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 		       unsigned int size, struct fuse_copy_state *cs)
 {
@@ -1856,6 +1906,12 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
 
 	case FUSE_NOTIFY_DELETE:
 		return fuse_notify_delete(fc, size, cs);
+
+	case FUSE_NOTIFY_REGISTER_GDS_NETDEV:
+		return fuse_notify_register_gds_netdev(fc, size, cs);
+
+	case FUSE_NOTIFY_UNREGISTER_GDS_NETDEV:
+		return fuse_notify_unregister_gds_netdev(fc, size, cs);
 
 	default:
 		fuse_copy_finish(cs);

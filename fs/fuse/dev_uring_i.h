@@ -7,6 +7,7 @@
 #ifndef _FS_FUSE_DEV_URING_I_H
 #define _FS_FUSE_DEV_URING_I_H
 
+#include "gds.h"
 #include "fuse_i.h"
 
 #ifdef CONFIG_FUSE_IO_URING
@@ -45,6 +46,10 @@ struct fuse_ring_ent {
 	void __user *payload;
 	struct page **payload_pages;
 	int nr_payload_pages;
+	void __user *payload_mr;
+
+	/* DMA-buf object info for GPU Direct Storage */
+	struct fuse_dmabuf_entry dmabuf_ent;
 
 	/* the ring queue that owns the request */
 	struct fuse_ring_queue *queue;

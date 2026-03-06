@@ -10,6 +10,7 @@
 #include "fuse_dlm_cache.h"
 #include "fuse_dev_i.h"
 #include "dev_uring_i.h"
+#include "gds.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -1045,6 +1046,9 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 
 	INIT_LIST_HEAD(&fc->mounts);
 	list_add(&fm->fc_entry, &fc->mounts);
+
+	spin_lock_init(&fc->gds_netdev_lock);
+	INIT_LIST_HEAD(&fc->gds_netdev_list);
 	fm->fc = fc;
 }
 EXPORT_SYMBOL_GPL(fuse_conn_init);
@@ -1440,6 +1444,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->inval_inode_entries = 1;
 			if (flags & FUSE_EXPIRE_INODE_ENTRY)
 				fc->expire_inode_entries = 1;
+			if (flags & FUSE_GDS_SUPPORT)
+				fc->gds = 1;
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1553,6 +1559,7 @@ EXPORT_SYMBOL_GPL(fuse_send_init);
 void fuse_free_conn(struct fuse_conn *fc)
 {
 	WARN_ON(!list_empty(&fc->devices));
+	fuse_dmabuf_cleanup_netdev(fc);
 	kfree(fc);
 }
 EXPORT_SYMBOL_GPL(fuse_free_conn);

@@ -18,9 +18,11 @@ module_param(enable_uring, bool, 0644);
 MODULE_PARM_DESC(enable_uring,
 		 "Enable userspace communication through io-uring");
 
-#define FUSE_URING_IOV_SEGS 2 /* header and payload */
+#define FUSE_URING_IOV_SEGS 3 /* header, payload and mr */
 #define FUSE_RING_HEADER_PG 0
 #define FUSE_RING_PAYLOAD_PG 1
+#define FUSE_RING_PAYLOAD_MR_PG 2
+#define FUSE_URING_IOV_SEGS_COMPAT 2 /* header and payload */
 
 /* Threshold that determines if a better queue should be searched for */
 #define FUSE_URING_Q_THRESHOLD 2
@@ -231,6 +233,7 @@ void fuse_uring_destruct(struct fuse_conn *fc)
 			io_pages_free(&ent->header_pages, ent->nr_header_pages);
 			io_pages_free(&ent->payload_pages,
 				      ent->nr_payload_pages);
+			fuse_dmabuf_clear_sgt(&ent->dmabuf_ent);
 			kfree(ent);
 		}
 
@@ -837,6 +840,24 @@ copy_finish:
 	return err ? -EFAULT : 0;
 }
 
+static void fuse_uring_prepare_mr(struct fuse_ring_ent *ent,
+			           struct fuse_req *req)
+{
+	struct fuse_mr_in *mr = &req->args->mr.mr_in;
+
+	if (req->args->is_gds) {
+		BUG_ON(mr->type != FUSE_MR_DMABUF);
+
+		/* Associate GPU scatter-gather table with DMA-buf file descriptor */
+		fuse_dmabuf_set_sgt(&ent->dmabuf_ent, (struct fuse_refcnt_sgt *)mr->rdma_dmabuf.sgt);
+
+		/* Get DMA-buf file descriptor for userspace */
+		mr->rdma_dmabuf.dmabuf_fd = ent->dmabuf_ent.fd;
+	} else {
+		mr->type = FUSE_MR_NONE;
+	}
+}
+
 static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
 				   struct fuse_req *req)
 {
@@ -844,6 +865,7 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
 	struct fuse_ring *ring = queue->ring;
 	int err;
 	struct fuse_uring_req_header *headers = NULL;
+	struct fuse_mr *mr;
 
 	err = -EIO;
 	if (WARN_ON(ent->state != FRRS_FUSE_REQ)) {
@@ -856,12 +878,18 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
 	if (WARN_ON(req->in.h.unique == 0))
 		return err;
 
+	fuse_uring_prepare_mr(ent, req);
+
 	/* copy fuse_in_header */
 	if (ent->header_pages) {
 		headers = kmap_local_page(
 			ent->header_pages[FUSE_RING_HEADER_PG]);
 
 		memcpy(&headers->in_out, &req->in.h, sizeof(req->in.h));
+
+		/* copy MR info located after header in same page */
+		mr = (struct fuse_mr *)(headers + 1);
+		memcpy(&mr->mr_in, &req->args->mr.mr_in, sizeof(struct fuse_mr_in));
 
 		err = fuse_uring_args_to_ring_pages(ring, req, ent, headers);
 		kunmap_local(headers);
@@ -874,6 +902,10 @@ static int fuse_uring_copy_to_ring(struct fuse_ring_ent *ent,
 		}
 		err = copy_to_user(&ent->headers->in_out, &req->in.h,
 				   sizeof(req->in.h));
+		if (!err) {
+			err = copy_to_user(ent->headers + 1, &req->args->mr.mr_in,
+					sizeof(struct fuse_mr_in));
+		}
 		if (err)
 			err = -EFAULT;
 	}
@@ -1187,15 +1219,15 @@ static int fuse_uring_get_iovec_from_sqe(const struct io_uring_sqe *sqe,
 	struct iov_iter iter;
 	ssize_t ret;
 
-	if (sqe->len != FUSE_URING_IOV_SEGS)
+	if (sqe->len < FUSE_URING_IOV_SEGS_COMPAT || sqe->len > FUSE_URING_IOV_SEGS)
 		return -EINVAL;
 
 	/*
 	 * Direction for buffer access will actually be READ and WRITE,
 	 * using write for the import should include READ access as well.
 	 */
-	ret = import_iovec(WRITE, uiov, FUSE_URING_IOV_SEGS,
-			   FUSE_URING_IOV_SEGS, &iov, &iter);
+	ret = import_iovec(WRITE, uiov, sqe->len,
+			   sqe->len, &iov, &iter);
 	if (ret < 0)
 		return ret;
 
@@ -1296,14 +1328,32 @@ fuse_uring_create_ring_ent(struct io_uring_cmd *cmd,
 	ent->headers = iov[0].iov_base;
 	ent->payload = iov[1].iov_base;
 
+	/* Payload MR is optional - iov[2] indicates existence, actual location follows header */
+	if (cmd->sqe->len > FUSE_RING_PAYLOAD_MR_PG)
+		ent->payload_mr = iov[FUSE_RING_PAYLOAD_MR_PG].iov_base;
+	else
+		ent->payload_mr = NULL;
+
 	err = fuse_uring_pin_pages(ent);
 	if (err) {
-		kfree(ent);
-		return ERR_PTR(err);
+		goto out;
+	}
+
+	err = fuse_create_dmabuf(&ent->dmabuf_ent, payload_size);
+	if (err) {
+		goto dmabuf_out;
 	}
 
 	atomic_inc(&ring->queue_refs);
 	return ent;
+
+dmabuf_out:
+	io_pages_free(&ent->header_pages, ent->nr_header_pages);
+	io_pages_free(&ent->payload_pages, ent->nr_payload_pages);
+
+out:
+	kfree(ent);
+	return ERR_PTR(err);
 }
 
 /*

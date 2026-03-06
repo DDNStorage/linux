@@ -32,6 +32,7 @@
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
 #include "fuse_dlm_cache.h"
+// #include "gds.h"
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
@@ -315,8 +316,10 @@ struct fuse_args {
 	bool may_block:1;
 	bool is_ext:1;
 	bool is_pinned:1;
+	bool is_gds:1;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
+	struct fuse_mr mr;
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
 };
 
@@ -866,6 +869,7 @@ struct fuse_conn {
 	/* Is synchronous FUSE_INIT allowed? */
 	unsigned int sync_init:1;
 
+	unsigned int gds:1;
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
@@ -936,6 +940,9 @@ struct fuse_conn {
 	/* The foffset alignment in PAGE */
 	unsigned int alignment_pages;
 
+	/* List of registered netdevs of GDS */
+	spinlock_t gds_netdev_lock;
+	struct list_head gds_netdev_list;
 };
 
 /*
@@ -1106,6 +1113,7 @@ struct fuse_io_args {
 	union {
 		struct {
 			struct fuse_read_in in;
+			struct fuse_gds_read_out out;
 			u64 attr_ver;
 		} read;
 		struct {
@@ -1200,7 +1208,7 @@ int fuse_dev_init(void);
 void fuse_dev_cleanup(void);
 
 int fuse_ctl_init(void);
-void __exit fuse_ctl_cleanup(void);
+void fuse_ctl_cleanup(void);
 
 /**
  * Simple request sending that does request allocation and freeing

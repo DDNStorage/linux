@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
+#include "gds.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -682,9 +683,19 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 	args->in_numargs = 1;
 	args->in_args[0].size = sizeof(ia->read.in);
 	args->in_args[0].value = &ia->read.in;
+
+	if (args->is_gds) {
+		/* file data is passed through RDMA, the read size is returned in out.args[0] */
+		args->user_pages = false;
+		args->out_pages = false;
+		args->out_args[0].size = sizeof(ia->read.out);
+		args->out_args[0].value = &ia->read.out;
+	}
+	else {
+		args->out_args[0].size = count;
+	}
 	args->out_argvar = true;
 	args->out_numargs = 1;
-	args->out_args[0].size = count;
 }
 
 static void fuse_release_user_pages(struct fuse_args_pages *ap,
@@ -846,6 +857,8 @@ static ssize_t fuse_send_read(struct fuse_io_args *ia, loff_t pos, size_t count,
 	struct file *file = ia->io->iocb->ki_filp;
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
+	struct fuse_args *args = &ia->ap.args;
+	int err;
 
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	if (owner != NULL) {
@@ -856,7 +869,14 @@ static ssize_t fuse_send_read(struct fuse_io_args *ia, loff_t pos, size_t count,
 	if (ia->io->async)
 		return fuse_async_req_send(fm, ia, count);
 
-	return fuse_simple_request(fm, &ia->ap.args);
+	err = fuse_simple_request(fm, &ia->ap.args);
+
+	/* Handle different return values of fuse_simple_request: regular read returns
+	 * bytes read, GDS read returns sizeof(ia->read.out) - normalize to bytes read */
+	if (args->is_gds && err == sizeof(ia->read.out)) {
+		err = ia->read.out.size;
+	}
+	return err;
 }
 
 static void fuse_read_update_size(struct inode *inode, loff_t size,
@@ -1099,13 +1119,23 @@ static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
 	ia->write.in.size = count;
 	args->opcode = FUSE_WRITE;
 	args->nodeid = ff->nodeid;
-	args->in_numargs = 2;
+	args->in_numargs = 1;
 	if (ff->fm->fc->minor < 9)
 		args->in_args[0].size = FUSE_COMPAT_WRITE_IN_SIZE;
 	else
 		args->in_args[0].size = sizeof(ia->write.in);
 	args->in_args[0].value = &ia->write.in;
-	args->in_args[1].size = count;
+
+	if (args->is_gds) {
+		/* skip data copy */
+		args->user_pages = false;
+		args->in_pages = false;
+	}
+	else {
+		args->in_numargs++;
+		args->in_args[1].size = count;
+	}
+
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(ia->write.out);
 	args->out_args[0].value = &ia->write.out;
@@ -1596,8 +1626,10 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 	struct fuse_io_args *ia;
 	unsigned int max_pages;
 	bool fopen_direct_io = ff->open_flags & FOPEN_DIRECT_IO;
+	bool is_gds = false;
 
 	max_pages = iov_iter_npages(iter, fc->max_pages);
+
 	ia = fuse_io_alloc(io, max_pages);
 	if (!ia)
 		return -ENOMEM;
@@ -1636,6 +1668,15 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		if (err && !nbytes)
 			break;
 
+		if (fuse_is_gds_buffer(&ia->ap)) {
+			is_gds = true;
+			err = fuse_gds_map_sg(fc, write, ia);
+			if (err) {
+				fuse_release_user_pages(&ia->ap, io->should_dirty);
+				break;
+			}
+		}
+
 		if (write) {
 			if (!capable(CAP_FSETID))
 				ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
@@ -1643,6 +1684,10 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 			nres = fuse_send_write(ia, pos, nbytes, owner);
 		} else {
 			nres = fuse_send_read(ia, pos, nbytes, owner);
+		}
+
+		if (is_gds) {
+			fuse_gds_unmap_sg(fc, write, ia);
 		}
 
 		if (!io->async || nres < 0) {

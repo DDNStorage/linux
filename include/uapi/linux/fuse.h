@@ -261,7 +261,8 @@
 #define FUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define FUSE_KERNEL_MINOR_VERSION 39
+// todo
+#define FUSE_KERNEL_MINOR_VERSION 40
 
 /** The node ID of the root inode */
 #define FUSE_ROOT_ID 1
@@ -482,6 +483,7 @@ struct fuse_file_lock {
 #define FUSE_URING_REDUCED_Q	(1ULL << 59)
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
 #define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)
+#define FUSE_GDS_SUPPORT	(1ULL << 62)
 
 /**
  * CUSE INIT request/reply flags
@@ -512,18 +514,23 @@ struct fuse_file_lock {
  * FUSE_WRITE_CACHE: delayed write from page cache, file handle is guessed
  * FUSE_WRITE_LOCKOWNER: lock_owner field is valid
  * FUSE_WRITE_KILL_SUIDGID: kill suid and sgid bits
+ * FUSE_WRITE_GDS: write operation using GPU Direct Storage
  */
 #define FUSE_WRITE_CACHE	(1 << 0)
 #define FUSE_WRITE_LOCKOWNER	(1 << 1)
 #define FUSE_WRITE_KILL_SUIDGID (1 << 2)
+#define FUSE_WRITE_GDS		(1 << 20)
 
 /* Obsolete alias; this flag implies killing suid/sgid only. */
 #define FUSE_WRITE_KILL_PRIV	FUSE_WRITE_KILL_SUIDGID
 
 /**
  * Read flags
+ *
+ * FUSE_READ_GDS: read operation using GPU Direct Storage
  */
 #define FUSE_READ_LOCKOWNER	(1 << 1)
+#define FUSE_READ_GDS		(1 << 20)
 
 /**
  * Ioctl flags
@@ -675,6 +682,8 @@ enum fuse_notify_code {
 	FUSE_NOTIFY_STORE = 4,
 	FUSE_NOTIFY_RETRIEVE = 5,
 	FUSE_NOTIFY_DELETE = 6,
+	FUSE_NOTIFY_REGISTER_GDS_NETDEV = 100,
+	FUSE_NOTIFY_UNREGISTER_GDS_NETDEV = 101,
 	FUSE_NOTIFY_CODE_MAX,
 };
 
@@ -828,6 +837,10 @@ struct fuse_read_in {
 	uint32_t	padding;
 };
 
+struct fuse_gds_read_out {
+	uint64_t	size;
+};
+
 #define FUSE_COMPAT_WRITE_IN_SIZE 24
 
 struct fuse_write_in {
@@ -843,6 +856,43 @@ struct fuse_write_in {
 struct fuse_write_out {
 	uint32_t	size;
 	uint32_t	padding;
+};
+
+enum fuse_mr_type {
+	FUSE_MR_NONE = 0,
+	FUSE_MR_DMABUF = 1,
+	FUSE_MR_RDMAINFO = 2,
+};
+
+struct fuse_mr_dmabuf
+{
+	uint32_t	dmabuf_fd;
+	uint32_t	iova_offset;
+	uint64_t	sgt;
+};
+
+struct fuse_mr_rdma_info
+{
+	uint8_t    version;	/* to support future changes to structure */
+	uint8_t    flags;	/* if bit 0 != 0, then gid field is valid */
+	uint16_t   lid;		/* subnet local identifier of the client node port */
+	uint32_t   qp_num;	/* QP number of DCT on the client node */
+	uint64_t   rem_vaddr;	/* remote address */
+	uint32_t   size;
+	uint32_t   rkey;
+	uint64_t   gid[2];	/* 16-byte global identifier of the client node port */
+	uint32_t   dc_key;
+};
+
+struct fuse_mr {
+	struct fuse_mr_in {
+		enum fuse_mr_type type;
+		union {
+			struct fuse_mr_dmabuf rdma_dmabuf;
+			struct fuse_mr_rdma_info rdma_info;
+		};
+	} mr_in;
+	void *user_mr;
 };
 
 #define FUSE_COMPAT_STATFS_SIZE 48
