@@ -829,38 +829,14 @@ static int fuse_simple_notify_reply(struct fuse_mount *fm,
 	return 0;
 }
 
-/*
- * Lock the request.  Up to the next unlock_request() there mustn't be
- * anything that could cause a page-fault.  If the request was already
- * aborted bail out.
- */
-static int lock_request(struct fuse_req *req)
-{
-	int err = 0;
-	if (req) {
-		spin_lock(&req->waitq.lock);
-		if (test_bit(FR_ABORTED, &req->flags))
-			err = -ENOENT;
-		else
-			set_bit(FR_LOCKED, &req->flags);
-		spin_unlock(&req->waitq.lock);
-	}
-	return err;
-}
 
-/*
- * Unlock request.  If it was aborted while locked, caller is responsible
- * for unlocking and ending the request.
- */
-static int unlock_request(struct fuse_req *req)
+static int check_req_aborted(struct fuse_req *req)
 {
 	int err = 0;
-	if (req) {
+	if (req && test_bit(FR_ABORTED, &req->flags)) {
 		spin_lock(&req->waitq.lock);
 		if (test_bit(FR_ABORTED, &req->flags))
 			err = -ENOENT;
-		else
-			clear_bit(FR_LOCKED, &req->flags);
 		spin_unlock(&req->waitq.lock);
 	}
 	return err;
@@ -902,7 +878,7 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 	struct page *page;
 	int err;
 
-	err = unlock_request(cs->req);
+	err = check_req_aborted(cs->req);
 	if (err)
 		return err;
 
@@ -961,7 +937,7 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
 		cs->pg = page;
 	}
 
-	return lock_request(cs->req);
+	return 0;
 }
 
 /* Do as much copy to/from userspace buffer as we can */
@@ -1022,9 +998,6 @@ static int fuse_try_move_folio(struct fuse_copy_state *cs, struct folio **foliop
 	struct pipe_buffer *buf = cs->pipebufs;
 
 	folio_get(oldfolio);
-	err = unlock_request(cs->req);
-	if (err)
-		goto out_put_old;
 
 	fuse_copy_finish(cs);
 
@@ -1110,9 +1083,7 @@ out_fallback:
 	cs->pg = buf->page;
 	cs->offset = buf->offset;
 
-	err = lock_request(cs->req);
-	if (!err)
-		err = 1;
+	err = 1;
 
 	goto out_put_old;
 }
@@ -1121,17 +1092,11 @@ static int fuse_ref_folio(struct fuse_copy_state *cs, struct folio *folio,
 			  unsigned offset, unsigned count)
 {
 	struct pipe_buffer *buf;
-	int err;
 
 	if (cs->nr_segs >= cs->pipe->max_usage)
 		return -EIO;
 
 	folio_get(folio);
-	err = unlock_request(cs->req);
-	if (err) {
-		folio_put(folio);
-		return err;
-	}
 
 	fuse_copy_finish(cs);
 
