@@ -564,7 +564,8 @@ static void request_wait_answer(struct fuse_req *req)
 	 * Either request is already in userspace, or it was forced.
 	 * Wait it out.
 	 */
-	wait_event(req->waitq, test_bit(FR_FINISHED, &req->flags));
+	wait_event(req->waitq,
+		   test_bit(FR_FINISHED, &req->flags));
 }
 
 static void __fuse_request_send(struct fuse_req *req)
@@ -2514,11 +2515,119 @@ void fuse_abort_conn(struct fuse_conn *fc)
 }
 EXPORT_SYMBOL_GPL(fuse_abort_conn);
 
+static void fuse_debug_print_outstanding_reqs(struct fuse_conn *fc)
+{
+	struct fuse_dev *fud;
+
+	pr_warn("FUSE: fuse_wait_aborted: num_waiting=%d (should be 0)\n",
+		atomic_read(&fc->num_waiting));
+
+#ifdef CONFIG_FUSE_IO_URING
+	/* Print io_uring state if enabled */
+	if (fc->ring) {
+		struct fuse_ring *ring = fc->ring;
+
+		pr_warn("FUSE: io_uring enabled - queue_refs=%d ready=%d\n",
+			atomic_read(&ring->queue_refs), ring->ready);
+	}
+#endif
+
+	/* Print all outstanding requests - lockless for debug */
+	list_for_each_entry(fud, &fc->devices, entry) {
+		struct fuse_pqueue *fpq = &fud->pq;
+		struct fuse_req *req;
+		int i;
+
+		/* Print all requests on fpq->io */
+		if (!list_empty(&fpq->io)) {
+			pr_warn("FUSE: Outstanding requests on fpq->io:\n");
+			list_for_each_entry(req, &fpq->io, list) {
+#ifdef CONFIG_FUSE_IO_URING
+				if (test_bit(FR_URING, &req->flags) &&
+				    req->ring_entry) {
+					struct fuse_ring_ent *ent = req->ring_entry;
+
+					pr_warn("  req %p: opcode=%u unique=%llu flags=0x%lx FR_WAITING=%d FR_LOCKED=%d FR_FORCE=%d FR_ABORTED=%d FR_URING=%d ring_ent=%p state=%d\n",
+						req, req->in.h.opcode,
+						req->in.h.unique, req->flags,
+						test_bit(FR_WAITING, &req->flags),
+						test_bit(FR_LOCKED, &req->flags),
+						test_bit(FR_FORCE, &req->flags),
+						test_bit(FR_ABORTED, &req->flags),
+						test_bit(FR_URING, &req->flags),
+						ent, ent->state);
+				} else {
+#endif
+					pr_warn("  req %p: opcode=%u unique=%llu flags=0x%lx FR_WAITING=%d FR_LOCKED=%d FR_FORCE=%d FR_ABORTED=%d FR_URING=%d\n",
+						req, req->in.h.opcode,
+						req->in.h.unique, req->flags,
+						test_bit(FR_WAITING, &req->flags),
+						test_bit(FR_LOCKED, &req->flags),
+						test_bit(FR_FORCE, &req->flags),
+						test_bit(FR_ABORTED, &req->flags),
+						test_bit(FR_URING, &req->flags));
+#ifdef CONFIG_FUSE_IO_URING
+				}
+#endif
+			}
+		}
+
+		/* Print all requests on fpq->processing */
+		for (i = 0; i < FUSE_PQ_HASH_SIZE; i++) {
+			if (list_empty(&fpq->processing[i]))
+				continue;
+
+			pr_warn("FUSE: Outstanding requests on fpq->processing[%d]:\n",
+				i);
+			list_for_each_entry(req, &fpq->processing[i], list) {
+#ifdef CONFIG_FUSE_IO_URING
+				if (test_bit(FR_URING, &req->flags) &&
+				    req->ring_entry) {
+					struct fuse_ring_ent *ent = req->ring_entry;
+
+					pr_warn("  req %p: opcode=%u unique=%llu flags=0x%lx FR_WAITING=%d FR_LOCKED=%d FR_FORCE=%d FR_ABORTED=%d FR_URING=%d ring_ent=%p state=%d\n",
+						req, req->in.h.opcode,
+						req->in.h.unique, req->flags,
+						test_bit(FR_WAITING, &req->flags),
+						test_bit(FR_LOCKED, &req->flags),
+						test_bit(FR_FORCE, &req->flags),
+						test_bit(FR_ABORTED, &req->flags),
+						test_bit(FR_URING, &req->flags),
+						ent, ent->state);
+				} else {
+#endif
+					pr_warn("  req %p: opcode=%u unique=%llu flags=0x%lx FR_WAITING=%d FR_LOCKED=%d FR_FORCE=%d FR_ABORTED=%d FR_URING=%d\n",
+						req, req->in.h.opcode,
+						req->in.h.unique, req->flags,
+						test_bit(FR_WAITING, &req->flags),
+						test_bit(FR_LOCKED, &req->flags),
+						test_bit(FR_FORCE, &req->flags),
+						test_bit(FR_ABORTED, &req->flags),
+						test_bit(FR_URING, &req->flags));
+#ifdef CONFIG_FUSE_IO_URING
+				}
+#endif
+			}
+		}
+	}
+}
+
 void fuse_wait_aborted(struct fuse_conn *fc)
 {
+	unsigned int timeout = 20;
+
 	/* matches implicit memory barrier in fuse_drop_waiting() */
 	smp_mb();
-	wait_event(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0);
+
+wait:
+	wait_event_timeout(fc->blocked_waitq, atomic_read(&fc->num_waiting) == 0, HZ * timeout);
+
+	/* Debug: print info if we're waiting */
+	if (atomic_read(&fc->num_waiting) > 0) {
+		fuse_debug_print_outstanding_reqs(fc);
+		timeout *= 3;
+		goto wait;
+	}
 
 	fuse_uring_wait_stopped_queues(fc);
 }
