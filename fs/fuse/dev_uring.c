@@ -158,11 +158,10 @@ void fuse_uring_flush_bg(struct fuse_conn *fc)
 		if (!queue)
 			continue;
 
-		queue->stopped = true;
-
 		WARN_ON_ONCE(ring->fc->max_background != UINT_MAX);
 		spin_lock(&queue->lock);
 		spin_lock(&fc->bg_lock);
+		queue->stopped = true;
 		fuse_uring_flush_queue_bg(queue);
 		spin_unlock(&fc->bg_lock);
 		spin_unlock(&queue->lock);
