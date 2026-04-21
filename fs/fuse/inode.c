@@ -619,6 +619,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 	fuse_invalidate_attr(inode);
 	forget_all_cached_acls(inode);
+	security_inode_invalidate_secctx(inode);
 	if (offset >= 0) {
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)
