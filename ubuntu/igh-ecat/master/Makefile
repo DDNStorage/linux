@@ -1,5 +1,5 @@
 ccflags-y := -I$(src)/../ \
-	-Wmaybe-uninitialized
+	-Wuninitialized
 
 obj-$(CONFIG_IGH_ECAT) += ec_master.o
 
