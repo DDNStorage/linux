@@ -1214,6 +1214,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	/* module option for now */
 	fc->compound_open_getattr = enable_compound;
 
+	xa_init(&fc->dlm_retry_tasks);
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
@@ -1263,6 +1264,7 @@ void fuse_conn_put(struct fuse_conn *fc)
 		}
 		if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			fuse_backing_files_free(fc);
+		xa_destroy(&fc->dlm_retry_tasks);
 		call_rcu(&fc->rcu, delayed_release);
 	}
 }

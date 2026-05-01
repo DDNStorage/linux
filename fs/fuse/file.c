@@ -960,8 +960,8 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	if (res < 0) {
 		/*
 		 * please refer to Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt
-		 * why this is necessarry.
-		 * READ can return -EAGAIN from DLM subsystem
+		 * why READ can return -EAGAIN from DLM subsystem.
+		 * XXX find a better DLM specific error code
 		 */
 		if (res == -EAGAIN && fm->fc->dlm)
 			res = AOP_TRUNCATED_PAGE;
@@ -1001,8 +1001,45 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 				       size_t len)
 {
 	struct file *file = iter->private;
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	size_t off = offset_in_folio(folio, pos);
-	return fuse_do_readfolio(file, folio, off, len);
+	int ret;
+	ret = fuse_do_readfolio(file, folio, off, len);
+
+	/*
+	 * TEMPORARY WORKAROUND for iomap write deadlock:
+	 *
+	 * When FUSE server returns -EAGAIN due to DLM,
+	 * fuse_do_readfolio() converts it to AOP_TRUNCATED_PAGE and
+	 * unlocks the folio (per AOP_TRUNCATED_PAGE contract).
+	 *
+	 * However, iomap doesn't understand AOP_TRUNCATED_PAGE.
+	 * We need to:
+	 * 1. Mark the retry flag (caller stored it in xarray)
+	 * 2. Convert to -EAGAIN so iomap sees an error
+	 * 3. Let fuse_cache_write_iter() detect and retry
+	 *
+	 * This breaks the ABBA deadlock:
+	 * - Folio is unlocked (page invalidation can proceed)
+	 * - Write will be retried at higher level
+	 *
+	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE support.
+	 */
+	if (ret == AOP_TRUNCATED_PAGE) {
+		struct fuse_dlm_retry *retry;
+		unsigned long task_key = (unsigned long)current;
+
+		retry = xa_load(&fc->dlm_retry_tasks, task_key);
+		if (retry) {
+			retry->retry_needed = true;
+		}
+
+		/* Convert to -EAGAIN for iomap */
+		ret = -EAGAIN;
+	}
+
+	return ret;
 }
 
 static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
@@ -1555,6 +1592,69 @@ static const struct iomap_ops fuse_iomap_ops = {
 	.iomap_begin	= fuse_iomap_begin,
 };
 
+static ssize_t fuse_writeback_write_iter(struct kiocb *iocb,
+					 struct iov_iter *from,
+					 struct file *file)
+{
+	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
+	ssize_t written, total_written = 0;
+
+	/*
+	 * TEMPORARY WORKAROUND for iomap write deadlock:
+	 *
+	 * Stack-allocate retry state and register it before calling
+	 * iomap. If fuse_iomap_read_folio_range() encounters
+	 * AOP_TRUNCATED_PAGE, it will mark retry_needed.
+	 *
+	 * Stack allocation ensures no memory leaks - the state is
+	 * valid for the duration of this function call and is
+	 * automatically cleaned up.
+	 */
+	struct fuse_dlm_retry retry_state = {
+		.retry_needed = false,
+	};
+	unsigned long task_key = (unsigned long)current;
+	int xa_ret;
+
+	xa_ret = xa_err(xa_store(&fc->dlm_retry_tasks, task_key,
+				 &retry_state, GFP_KERNEL));
+	if (xa_ret)
+		return xa_ret;
+
+retry:
+	/*
+	 * Use iomap so that we can do granular uptodate reads
+	 * and granular dirty tracking for large folios.
+	 */
+	written = iomap_file_buffered_write(iocb, from, &fuse_iomap_ops,
+					    &fuse_iomap_write_ops, file);
+
+	if (written > 0)
+		total_written += written;
+
+	/*
+	 * If DLM lock contention occurred (AOP_TRUNCATED_PAGE),
+	 * retry the entire write operation.
+	 *
+	 * The folio has been unlocked by fuse_do_readfolio(),
+	 * breaking the ABBA deadlock with page invalidation.
+	 *
+	 * Keep the entry in xarray and reuse it for the retry.
+	 *
+	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE
+	 * retry support.
+	 */
+	if (retry_state.retry_needed) {
+		retry_state.retry_needed = false;
+		goto retry;
+	}
+
+	/* Remove from xarray now that we're done */
+	xa_erase(&fc->dlm_retry_tasks, task_key);
+
+	return written < 0 ? written : total_written;
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1621,14 +1721,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = direct_write_fallback(iocb, from, written,
 						fuse_perform_write(iocb, from));
 	} else if (writeback) {
-		/*
-		 * Use iomap so that we can do granular uptodate reads
-		 * and granular dirty tracking for large folios.
-		 */
-		written = iomap_file_buffered_write(iocb, from,
-						    &fuse_iomap_ops,
-						    &fuse_iomap_write_ops,
-						    file);
+		written = fuse_writeback_write_iter(iocb, from, file);
+		if (written < 0) {
+			err = written;
+			goto out;
+		}
 	} else {
 		written = fuse_perform_write(iocb, from);
 	}
