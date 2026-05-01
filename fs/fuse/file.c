@@ -1002,7 +1002,55 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 {
 	struct file *file = iter->private;
 	size_t off = offset_in_folio(folio, pos);
-	return fuse_do_readfolio(file, folio, off, len);
+
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	int ret;
+
+	ret = fuse_do_readfolio(file, folio, off, len);
+
+	/*
+	 * TEMPORARY WORKAROUND for iomap write deadlock:
+	 *
+	 * When FUSE server returns -EAGAIN (DLM lock contention),
+	 * fuse_do_readfolio() converts it to AOP_TRUNCATED_PAGE and
+	 * unlocks the folio (per AOP_TRUNCATED_PAGE contract).
+	 *
+	 * However, iomap doesn't understand AOP_TRUNCATED_PAGE.
+	 * We need to:
+	 * 1. Track this task needs a retry (using xarray)
+	 * 2. Convert to -EAGAIN so iomap sees an error
+	 * 3. Let fuse_cache_write_iter() detect and retry
+	 *
+	 * This breaks the ABBA deadlock:
+	 * - Folio is unlocked (page invalidation can proceed)
+	 * - Write will be retried at higher level
+	 *
+	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE support.
+	 */
+	if (ret == AOP_TRUNCATED_PAGE) {
+		struct fuse_dlm_retry *retry;
+		unsigned long task_key = (unsigned long)current;
+
+		retry = kzalloc(sizeof(*retry), GFP_NOFS);
+		if (!retry)
+			return -ENOMEM;
+ 
+		retry->task = current;
+		retry->retry_needed = true;
+
+		ret = xa_err(xa_store(&fc->dlm_retry_tasks, task_key, retry,
+				      GFP_NOFS));
+		if (ret) {
+			kfree(retry);
+			return ret;
+		}
+
+		/* Convert to -EAGAIN for iomap */
+		ret = -EAGAIN;
+	}
+
+	return ret;
 }
 
 static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
@@ -1604,6 +1652,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	inode_lock(inode);
 
+retry:
 	err = count = generic_write_checks(iocb, from);
 	if (err <= 0)
 		goto out;
@@ -1629,6 +1678,30 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 						    &fuse_iomap_ops,
 						    &fuse_iomap_write_ops,
 						    file);
+
+		/*
+		 * TEMPORARY WORKAROUND for iomap write deadlock:
+		 *
+		 * Check if fuse_iomap_read_folio_range() encountered
+		 * DLM lock contention (AOP_TRUNCATED_PAGE from FUSE server).
+		 * If so, retry the entire write operation.
+		 *
+		 * The folio has been unlocked by fuse_do_readfolio(),
+		 * breaking the ABBA deadlock with page invalidation.
+		 *
+		 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE
+		 * retry support.
+		 */
+		if (written < 0) {
+			unsigned long task_key = (unsigned long)current;
+			struct fuse_dlm_retry *retry;
+
+			retry = xa_erase(&fc->dlm_retry_tasks, task_key);
+			if (retry) {
+				kfree(retry);
+				goto retry;
+			}
+		}
 	} else {
 		written = fuse_perform_write(iocb, from);
 	}

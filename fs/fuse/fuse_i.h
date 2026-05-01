@@ -640,6 +640,18 @@ struct fuse_sync_bucket {
 };
 
 /**
+ * DLM retry tracking for iomap write deadlock workaround.
+ *
+ * Temporary workaround until mainline iomap gains AOP_TRUNCATED_PAGE
+ * retry support. Tracks tasks that need to retry write operations due
+ * to DLM lock contention (-EAGAIN from FUSE server).
+ */
+struct fuse_dlm_retry {
+	struct task_struct *task;
+	bool retry_needed;
+};
+
+/**
  * A Fuse connection.
  *
  * This structure is created, when the root filesystem is mounted, and
@@ -1022,6 +1034,12 @@ struct fuse_conn {
 	/* The foffset alignment in PAGE */
 	unsigned int alignment_pages;
 
+	/**
+	 * XArray tracking tasks that need DLM retry.
+	 * Maps task pointer -> struct fuse_dlm_retry.
+	 * Temporary workaround for iomap write deadlock.
+	 */
+	struct xarray dlm_retry_tasks;
 };
 
 /*

@@ -1056,6 +1056,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->initialized = 0;
 	fc->connected = 1;
 	fc->dlm = 1;
+	xa_init(&fc->dlm_retry_tasks);
 
 	/* module option for now */
 	fc->compound_open_getattr = enable_compound;
@@ -1109,6 +1110,7 @@ void fuse_conn_put(struct fuse_conn *fc)
 		}
 		if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			fuse_backing_files_free(fc);
+		xa_destroy(&fc->dlm_retry_tasks);
 		call_rcu(&fc->rcu, delayed_release);
 	}
 }
