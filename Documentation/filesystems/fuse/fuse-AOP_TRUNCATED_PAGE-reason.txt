@@ -1,0 +1,577 @@
+=================================================================================
+WHY FUSE CONVERTS -EAGAIN TO AOP_TRUNCATED_PAGE IN fuse_read_folio()
+=================================================================================
+
+TLDR: To prevent ABBA deadlock between page locks and DLM (cluster) locks.
+
+=================================================================================
+THE FUNDAMENTAL DEADLOCK SCENARIO - DETAILED CODE FLOW
+=================================================================================
+
+This deadlock occurs when two CPUs hold locks in opposite order, creating
+a circular dependency. Below is the exact code flow showing how this happens.
+
+─────────────────────────────────────────────────────────────────────────────
+TIMELINE: CORE-0 (Application Read Path - Waiting for DLM Lock)
+─────────────────────────────────────────────────────────────────────────────
+
+T0: Application calls read()
+    ├─ sys_read()                                    [fs/read_write.c]
+    └─ vfs_read()                                    [fs/read_write.c:440]
+       └─ generic_file_read_iter()                   [mm/filemap.c:2850]
+
+T1: Enter page cache read path
+    └─ filemap_read()                                [mm/filemap.c:2675]
+       │  ACQUIRES: filemap invalidate_lock (shared) [line 2678]
+       │  STATUS: Holding invalidate_lock
+       │
+       └─ filemap_get_pages()                        [mm/filemap.c:2712]
+          └─ filemap_update_page()                   [mm/filemap.c:2625]
+
+T2: Attempt to lock page
+    └─ folio_trylock()                               [mm/filemap.c:2466]
+       │  ACQUIRES: page lock
+       │  STATUS: Holding invalidate_lock + page lock
+       │
+       └─ filemap_read_folio()                       [mm/filemap.c:2497]
+          └─ filler(file, folio)                     [mm/filemap.c:2413]
+             │  Calls address_space_operations->read_folio
+             │
+             └─ ocfs2_read_folio()                   [fs/ocfs2/aops.c:262]
+
+T3: Attempt to acquire DLM lock (CRITICAL POINT)
+    └─ ocfs2_inode_lock_with_folio()                 [fs/ocfs2/aops.c:271]
+       │  STATUS: Holding invalidate_lock + page lock
+       │  WANTS: DLM inode lock
+       │
+       └─ ocfs2_inode_lock_full()                    [fs/ocfs2/dlmglue.c:2552]
+          └─ __ocfs2_cluster_lock()                  [fs/ocfs2/dlmglue.c:2465]
+             └─ dlm_lock()                           [fs/dlm/lock.c:3372]
+                │
+                ❌ BLOCKS HERE - DLM lock held by Core-1
+                │  Waiting for DLM lock while holding page lock
+                │
+                DEADLOCK CONDITION: Cannot proceed
+
+─────────────────────────────────────────────────────────────────────────────
+TIMELINE: CORE-1 (Memory Reclaim Path - Waiting for Page Lock)
+─────────────────────────────────────────────────────────────────────────────
+
+T0: Memory pressure triggers reclaim
+    └─ kswapd() or direct memory reclaim             [mm/vmscan.c]
+       └─ shrink_node_memcgs()                       [mm/vmscan.c]
+
+T1: Start reclaiming pages
+    └─ shrink_inactive_list()                        [mm/vmscan.c:2004]
+       └─ shrink_folio_list()                        [mm/vmscan.c:1098]
+          │  Iterating through pages to evict
+          │
+          └─ Check if folio needs writeback            [mm/vmscan.c:1227]
+
+T2: DLM lock already held during downconvert/writeback
+    │  CONTEXT: This thread is handling:
+    │    - DLM lock downconvert request from another node
+    │    - Metadata update requiring DLM lock
+    │    - Page writeback with cluster coordination
+    │
+    │  STATUS: Holding DLM INODE LOCK (exclusive or shared)
+    │
+    └─ pageout(folio, mapping, ...)                  [mm/vmscan.c:1452]
+       │  May trigger writepage callback
+       │
+       └─ Filesystem writepage operations
+          │  These operations may update metadata
+          │  Already holding DLM lock for coordination
+
+T3: Attempt to acquire page lock (CRITICAL POINT)
+    └─ folio_trylock()                               [mm/vmscan.c:1129]
+       │  STATUS: Holding DLM lock
+       │  WANTS: page lock
+       │
+       ❌ BLOCKS HERE - Page lock held by Core-0
+       │  Waiting for page lock while holding DLM lock
+       │
+       DEADLOCK CONDITION: Cannot proceed
+
+─────────────────────────────────────────────────────────────────────────────
+RESULT: ABBA DEADLOCK (Circular Wait)
+─────────────────────────────────────────────────────────────────────────────
+
+Lock Acquisition Order Violation:
+
+  Core-0: invalidate_lock → page lock → [WANTS] DLM lock
+  Core-1: DLM lock → [WANTS] page lock
+
+Circular Dependency:
+  Core-0 waits for DLM lock (held by Core-1)
+  Core-1 waits for page lock (held by Core-0)
+
+  ┌──────────────┐                ┌──────────────┐
+  │   CORE-0     │                │   CORE-1     │
+  │              │                │              │
+  │ Holds: page  │◄───────────────┤ Wants: page  │
+  │ Wants: DLM   │                │ Holds: DLM   │
+  │              │────────────────►│              │
+  └──────────────┘                └──────────────┘
+       ▲                                  │
+       │                                  │
+       └──────────── DEADLOCK ────────────┘
+
+Neither Core-0 nor Core-1 can proceed → System deadlock
+
+=================================================================================
+WHY PAGE LOCKS ARE HELD WHEN CALLING read_folio()
+=================================================================================
+
+From mm/filemap.c:do_read_cache_folio():
+  1. Page is allocated/looked up in page cache
+  2. folio_trylock() acquires the page lock
+  3. filler (read_folio) is called WITH page locked
+  4. Lock prevents concurrent modifications during I/O
+  5. Lock ensures atomic read operation
+
+The page lock must be held to prevent:
+  - Concurrent writes while reading
+  - Page truncation during read
+  - Multiple simultaneous reads to the same page
+
+=================================================================================
+THE LOCK ORDERING RULE (From GFS2 Documentation)
+=================================================================================
+
+From Documentation/filesystems/gfs2-glocks.rst:
+
+  Lock ordering within GFS2:
+    1. i_rwsem (if required)
+    2. Rename glock
+    3. Inode glock(s)
+    4. Rgrp glock(s)
+    5. Transaction glock
+    6. i_rw_mutex (if required)
+    7. Page lock (ALWAYS LAST!)
+
+**Critical Rule: PAGE LOCK IS ALWAYS ACQUIRED LAST**
+
+This means:
+  - All filesystem/cluster locks must be acquired BEFORE page lock
+  - NO filesystem lock can be acquired while holding a page lock
+  - Prevents lock inversion with memory reclaim
+
+=================================================================================
+OCFS2'S SOLUTION: Breaking the Deadlock with AOP_TRUNCATED_PAGE
+=================================================================================
+
+Location: fs/ocfs2/dlmglue.c:2547-2568
+Function: ocfs2_inode_lock_with_folio()
+
+─────────────────────────────────────────────────────────────────────────────
+CODE: Deadlock Prevention Pattern
+─────────────────────────────────────────────────────────────────────────────
+
+  int ocfs2_inode_lock_with_folio(struct inode *inode,
+          struct buffer_head **ret_bh, int ex, struct folio *folio)
+  {
+      int ret;
+
+      // LINE 2552: Try non-blocking DLM lock first
+      ret = ocfs2_inode_lock_full(inode, ret_bh, ex, OCFS2_LOCK_NONBLOCK);
+
+      if (ret == -EAGAIN) {
+          // DLM lock not immediately available
+          // Would block, risking deadlock with Core-1
+
+          // LINE 2554: ✓ CRITICAL - Unlock page BEFORE waiting for DLM lock
+          folio_unlock(folio);
+
+          /*
+           * Wait for DLM lock WITHOUT holding page lock
+           * This breaks the Core-0 → Core-1 dependency
+           *
+           * From comment (lines 2555-2560):
+           * "If we can't get inode lock immediately, we should not return
+           *  directly here, since this will lead to a softlockup problem.
+           *  The method is to get a blocking lock and immediately unlock
+           *  before returning, this can avoid CPU resource waste due to
+           *  lots of retries, and benefits fairness in getting lock."
+           */
+
+          // LINE 2562: Acquire lock in blocking mode (without page lock)
+          if (ocfs2_inode_lock(inode, ret_bh, ex) == 0)
+              ocfs2_inode_unlock(inode, ex);  // Immediately release
+
+          // LINE 2564: Signal VFS to retry entire operation
+          ret = AOP_TRUNCATED_PAGE;
+      }
+
+      return ret;
+  }
+
+─────────────────────────────────────────────────────────────────────────────
+HOW THIS BREAKS THE DEADLOCK
+─────────────────────────────────────────────────────────────────────────────
+
+BEFORE (would deadlock):
+  Core-0: page lock → [WAITS for DLM lock] → BLOCKED by Core-1
+  Core-1: DLM lock → [WAITS for page lock] → BLOCKED by Core-0
+  Result: Circular wait, system hangs
+
+AFTER (with fix):
+  Core-0 at T3:
+    1. Detects DLM lock unavailable (-EAGAIN)
+    2. ✓ Releases page lock (line 2554)
+    3. Waits for DLM lock (now safe, no page lock held)
+    4. Gets DLM lock, immediately releases it (fair cycling)
+    5. Returns AOP_TRUNCATED_PAGE
+
+  Core-0 caller (mm/filemap.c):
+    6. Sees AOP_TRUNCATED_PAGE
+    7. Drops folio reference
+    8. Jumps to retry label (e.g., do_read_cache_folio line 3971)
+    9. Re-acquires page from cache
+    10. Tries read again
+
+  Core-1:
+    - While Core-0 released page lock (step 2)
+    - Core-1 can now acquire page lock
+    - Core-1 completes its work
+    - Core-1 releases DLM lock
+
+  Core-0 retry:
+    - Now DLM lock is available
+    - Successfully acquires DLM lock
+    - Completes read operation
+
+  Result: Both cores make progress, no deadlock
+
+─────────────────────────────────────────────────────────────────────────────
+KEY INSIGHT FROM OCFS2 COMMENTS
+─────────────────────────────────────────────────────────────────────────────
+
+From fs/ocfs2/dlmglue.c:1627-1632:
+
+  "This is helping work around a lock inversion between the page lock
+   and dlm locks. One path holds the page lock while calling aops
+   which block acquiring dlm locks. The voting thread holds dlm
+   locks while acquiring page locks while down converting data locks.
+   This block is helping an aop path notice the inversion and back
+   off to unlock its page lock before trying the dlm lock again."
+
+Translation:
+  - "One path" = Core-0 (application read)
+  - "voting thread" = Core-1 (DLM downconvert/memory reclaim)
+  - "lock inversion" = ABBA deadlock scenario
+  - "back off" = Release page lock, return AOP_TRUNCATED_PAGE
+
+=================================================================================
+FUSE'S SPECIFIC CONTEXT: Same Pattern, Different DLM
+=================================================================================
+
+FUSE implements a custom "DLM cache" (fs/fuse/fuse_dlm_cache.c):
+  - NOT the kernel's DLM subsystem (used by GFS2/OCFS2)
+  - Tracks page-level locks for distributed coordination
+  - Sends FUSE_DLM_WB_LOCK operations to userspace daemon
+  - Userspace daemon handles cluster lock negotiation
+
+─────────────────────────────────────────────────────────────────────────────
+FUSE READ PATH - CODE FLOW WITH DEADLOCK RISK
+─────────────────────────────────────────────────────────────────────────────
+
+Core-0: Application reading from FUSE filesystem
+
+  filemap_read()                               [mm/filemap.c:2675]
+    └─ filemap_get_pages()                     [line 2712]
+       └─ filemap_update_page()                [line 2625]
+          └─ folio_trylock()                   [line 2466]
+             │  ACQUIRES: page lock
+             │
+             └─ filemap_read_folio()           [line 2497]
+                └─ fuse_read_folio()           [fs/fuse/file.c:947]
+                   └─ fuse_do_readfolio()      [fs/fuse/file.c:956]
+                      └─ fuse_simple_request() [fs/fuse/file.c:932]
+                         │
+                         │  Sends FUSE_READ to userspace daemon
+                         │  Daemon may need to acquire cluster lock
+                         │
+                         └─ Might return -EAGAIN if DLM detects possible
+                            deadlock due to concurrant page invalidation
+
+
+─────────────────────────────────────────────────────────────────────────────
+WHY FUSE NEEDS THIS CONVERSION
+─────────────────────────────────────────────────────────────────────────────
+
+When fuse_simple_request() returns -EAGAIN:
+  - Userspace FUSE daemon encountered transient failure
+  - Could be: cluster lock contention, timeout, daemon busy
+  - The page might be stale/modified during the wait
+  - Page lock is STILL HELD at this point
+
+If -EAGAIN were returned directly:
+  ❌ VFS would see error and fail the read
+  ❌ Page would remain locked
+  ❌ No retry mechanism triggered
+
+By converting to AOP_TRUNCATED_PAGE:
+  ✓ Signals to VFS: "retry the entire page acquisition"
+  ✓ fuse_read_folio() unlocks page before returning (line 962)
+  ✓ Follows the OCFS2 pattern: unlock page, retry operation
+  ✓ Prevents potential deadlock with cluster lock operations
+  ✓ Uses VFS's built-in retry mechanism in mm/filemap.c
+
+─────────────────────────────────────────────────────────────────────────────
+CODE: fuse_read_folio() - Ensures Page Unlock
+─────────────────────────────────────────────────────────────────────────────
+
+Location: fs/fuse/file.c:947-964
+
+  static int fuse_read_folio(struct file *file, struct folio *folio)
+  {
+      struct inode *inode = folio->mapping->host;
+      int err;
+
+      err = -EIO;
+      if (fuse_is_bad(inode))
+          goto out;
+
+      // LINE 956: Calls fuse_do_readfolio, may return AOP_TRUNCATED_PAGE
+      err = fuse_do_readfolio(file, folio, 0, folio_size(folio));
+      if (!err)
+          folio_mark_uptodate(folio);
+
+      fuse_invalidate_atime(inode);
+   out:
+      // LINE 962: ✓ CRITICAL - Always unlocks page before returning
+      folio_unlock(folio);
+      return err;  // Returns AOP_TRUNCATED_PAGE if -EAGAIN occurred
+  }
+
+This matches OCFS2's pattern:
+  1. Detect lock contention (-EAGAIN from daemon)
+  2. Unlock the page (line 962)
+  3. Return AOP_TRUNCATED_PAGE
+  4. VFS retries the operation
+
+=================================================================================
+THE CONTRACT: AOP_TRUNCATED_PAGE Semantics
+=================================================================================
+
+From include/linux/fs.h:
+  "AOP_TRUNCATED_PAGE: The AOP method that was handed a locked page has
+   unlocked it and the page might have been truncated. The caller should
+   back up to acquiring a new page and trying again."
+
+Key requirements:
+  - The folio MUST be unlocked before returning AOP_TRUNCATED_PAGE
+  - Signals "retry from scratch" to the caller
+  - Caller will drop page reference and re-acquire
+  - Prevents livelock through filesystem's "reasonable precautions"
+
+Callers in mm/filemap.c handle it consistently:
+  - do_read_cache_folio(): "if (err == AOP_TRUNCATED_PAGE) goto repeat;"
+  - filemap_get_pages(): "if (err == AOP_TRUNCATED_PAGE) goto retry;"
+  - do_filemap_fault(): "if (error == AOP_TRUNCATED_PAGE) goto retry_find;"
+
+=================================================================================
+WHY NOT JUST RETURN -EAGAIN?
+=================================================================================
+
+From OCFS2 comments (fs/ocfs2/dlmglue.c:2555-2560):
+  "If we can't get inode lock immediately, we should not return
+   directly here, since this will lead to a softlockup problem.
+   The method is to get a blocking lock and immediately unlock
+   before returning, this can avoid CPU resource waste due to
+   lots of retries, and benefits fairness in getting lock."
+
+Returning -EAGAIN directly would cause:
+  - VFS to immediately retry without unlocking the page
+  - Busy-waiting loop (soft lockup)
+  - CPU resource waste
+  - Potential starvation of lock waiters
+
+AOP_TRUNCATED_PAGE forces:
+  - Full retry cycle (unlock, re-acquire, re-read)
+  - Allows other threads to make progress
+  - Yields CPU properly
+  - Fair lock acquisition
+
+=================================================================================
+COMPLETE EXECUTION TIMELINE - DEADLOCK AND RESOLUTION
+=================================================================================
+
+Without AOP_TRUNCATED_PAGE (DEADLOCK SCENARIO):
+────────────────────────────────────────────────────────────────────────────
+
+Time   Core-0 (Read Path)              Core-1 (Reclaim/DLM)
+────   ─────────────────────────────   ──────────────────────────────────
+T0     Enter filemap_read()            [Idle]
+
+T1     Lock: invalidate_lock           [Idle]
+       Lock: page lock
+
+T2     Call: ocfs2_read_folio()        DLM downconvert starts
+                                        Lock: DLM inode lock
+
+T3     Want: DLM inode lock            Want: page lock
+       ❌ BLOCKED (held by Core-1)     ❌ BLOCKED (held by Core-0)
+
+T4     [DEADLOCK]                      [DEADLOCK]
+       Holding: page lock              Holding: DLM lock
+       Waiting: DLM lock               Waiting: page lock
+
+∞      System hangs                    System hangs
+
+With AOP_TRUNCATED_PAGE (DEADLOCK PREVENTION):
+────────────────────────────────────────────────────────────────────────────
+
+Time   Core-0 (Read Path)              Core-1 (Reclaim/DLM)
+────   ─────────────────────────────   ──────────────────────────────────
+T0     Enter filemap_read()            [Idle]
+
+T1     Lock: invalidate_lock           [Idle]
+       Lock: page lock
+
+T2     Call: ocfs2_read_folio()        DLM downconvert starts
+                                        Lock: DLM inode lock
+
+T3     Try: DLM lock (NONBLOCK)        Want: page lock
+       Returns: -EAGAIN                ❌ BLOCKED (held by Core-0)
+
+T4     ✓ Unlock: page lock             ✓ Acquires: page lock
+       Return: AOP_TRUNCATED_PAGE      Continues: reclaim work
+
+T5     Caller sees AOP_TRUNCATED_PAGE  Completes: page eviction
+       goto retry (line 3971)          Unlock: page lock
+                                        Unlock: DLM lock
+
+T6     Re-acquire: page from cache     [Completes]
+       Re-try: read operation
+
+T7     Try: DLM lock (NONBLOCK)
+       ✓ SUCCESS (Core-1 released it)
+       Lock: DLM inode lock
+
+T8     Complete: read operation
+       Unlock: DLM lock
+       Unlock: page lock
+
+T9     Return: success to application
+
+Result: Both cores complete successfully, no deadlock
+
+=================================================================================
+VFS RETRY MECHANISM - HOW AOP_TRUNCATED_PAGE TRIGGERS RETRY
+=================================================================================
+
+Location: mm/filemap.c
+
+─────────────────────────────────────────────────────────────────────────────
+Caller 1: do_read_cache_folio() - lines 3967-3973
+─────────────────────────────────────────────────────────────────────────────
+
+  repeat:
+      folio = __filemap_get_folio(...);
+
+      filler:
+          err = filemap_read_folio(file, filler, folio);  // Calls read_folio
+          if (err) {
+              folio_put(folio);
+              if (err == AOP_TRUNCATED_PAGE)
+                  goto repeat;  // ← RETRY from beginning
+              return ERR_PTR(err);
+          }
+
+Effect: Full retry of page acquisition and read
+
+─────────────────────────────────────────────────────────────────────────────
+Caller 2: filemap_get_pages() - lines 2638-2639
+─────────────────────────────────────────────────────────────────────────────
+
+  retry:
+      ...
+      err = filemap_update_page(...);
+      if (err < 0)
+          goto err;
+      ...
+  err:
+      if (err < 0)
+          folio_put(folio);
+      if (likely(--fbatch->nr))
+          return 0;
+      if (err == AOP_TRUNCATED_PAGE)
+          goto retry;  // ← RETRY from beginning
+      return err;
+
+Effect: Re-attempts page update after releasing folio
+
+─────────────────────────────────────────────────────────────────────────────
+Caller 3: do_filemap_fault() - lines 3542-3543
+─────────────────────────────────────────────────────────────────────────────
+
+  retry_find:
+      ...
+      error = filemap_read_folio(file, mapping->a_ops->read_folio, folio);
+      ...
+      if (!error || error == AOP_TRUNCATED_PAGE)
+          goto retry_find;  // ← RETRY page fault handling
+
+Effect: Re-handles the page fault from scratch
+
+=================================================================================
+SUMMARY: Why -EAGAIN → AOP_TRUNCATED_PAGE is Essential
+=================================================================================
+
+The conversion -EAGAIN → AOP_TRUNCATED_PAGE in fuse_read_folio() is necessary:
+
+1. **Prevent Deadlock**: Avoids page lock vs cluster lock ABBA deadlock
+   - Core-0 holds page lock, wants DLM lock
+   - Core-1 holds DLM lock, wants page lock
+   - Conversion forces Core-0 to release page lock first
+
+2. **Follow Lock Ordering**: Page lock must be released before cluster locks
+   - Kernel rule: Page lock is ALWAYS acquired last
+   - Documented in Documentation/filesystems/gfs2-glocks.rst
+   - Prevents lock inversion with memory reclaim
+
+3. **Enable Retry**: Uses VFS's built-in retry mechanism properly
+   - AOP_TRUNCATED_PAGE is understood by mm/filemap.c
+   - Triggers automatic retry loops at multiple call sites
+   - -EAGAIN alone would just fail the operation
+
+4. **Ensure Fairness**: Allows fair lock acquisition through retry cycle
+   - Other threads get chance to acquire locks
+   - Prevents starvation of waiters
+   - Better system responsiveness
+
+This pattern is the established solution in distributed filesystems (OCFS2, GFS2)
+for handling deadlock between page cache and cluster coordination locks.
+
+=================================================================================
+REFERENCES - Exact Code Locations
+=================================================================================
+
+Core-0 (Read Path):
+  - Entry: filemap_read()                        [mm/filemap.c:2675]
+  - Page lock: folio_trylock()                   [mm/filemap.c:2466]
+  - FUSE read: fuse_do_readfolio()               [fs/fuse/file.c:905]
+  - -EAGAIN conversion                           [fs/fuse/file.c:934-935]
+  - Page unlock: folio_unlock()                  [fs/fuse/file.c:962]
+
+Core-1 (Reclaim Path):
+  - Entry: shrink_folio_list()                   [mm/vmscan.c:1098]
+  - Page lock attempt: folio_trylock()           [mm/vmscan.c:1129]
+
+OCFS2 Solution:
+  - Detection: ocfs2_inode_lock_with_folio()     [fs/ocfs2/dlmglue.c:2547]
+  - Page unlock: folio_unlock()                  [fs/ocfs2/dlmglue.c:2554]
+  - Return: AOP_TRUNCATED_PAGE                   [fs/ocfs2/dlmglue.c:2564]
+
+VFS Retry:
+  - do_read_cache_folio() retry                  [mm/filemap.c:3971]
+  - filemap_get_pages() retry                    [mm/filemap.c:2639]
+  - do_filemap_fault() retry                     [mm/filemap.c:3543]
+
+Lock Ordering Documentation:
+  - GFS2 lock ordering rules                     [Documentation/filesystems/gfs2-glocks.rst:110-120]
+  - OCFS2 deadlock comments                      [fs/ocfs2/dlmglue.c:1627-1632]
+
+=================================================================================

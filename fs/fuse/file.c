@@ -958,10 +958,16 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
 	res = fuse_simple_request(fm, &ia.ap.args);
 	if (res < 0) {
-		if (res == -EAGAIN)
+		/*
+		 * please refer to Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt
+		 * why this is necessarry.
+		 * READ can return -EAGAIN from DLM subsystem
+		 */
+		if (res == -EAGAIN && fm->fc->dlm)
 			res = AOP_TRUNCATED_PAGE;
 		return res;
 	}
+
 	/*
 	 * Short read means EOF.  If file size is larger, truncate it
 	 */
@@ -996,7 +1002,6 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 {
 	struct file *file = iter->private;
 	size_t off = offset_in_folio(folio, pos);
-
 	return fuse_do_readfolio(file, folio, off, len);
 }
 
@@ -1575,8 +1580,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			/*
 			* If we have dlm support acquire the lock for the area
 			* we are writing into.
-			* dlm lock is only needed as the write is cached and the 
-			* fuse server is not notified otherwise 
+			* dlm lock is only needed as the write is cached and the
+			* fuse server is not notified otherwise
 			*/
 			if (fc->dlm) {
 				/*
