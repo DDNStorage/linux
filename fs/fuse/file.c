@@ -1569,28 +1569,31 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			return err;
 
 		if (!fc->handle_killpriv_v2 ||
-		    !setattr_should_drop_suidgid(idmap, file_inode(file)))
+		    !setattr_should_drop_suidgid(idmap, file_inode(file))) {
 			writeback = true;
 
-		/*
-		 * If we have dlm support acquire the lock for the area
-		 * we are writing into.
-		 */
-		if (fc->dlm) {
 			/*
-			 * Note that a file opened with O_APPEND will have
-			 * relative values in ki_pos. This code is here for
-			 * convenience and for libfuse overlay test.
-			 * Filesystems should handle O_APPEND with 'direct io'
-			 * to additionally get the performance benefits of
-			 * 'parallel direct writes'.
-			 */
-			loff_t pos = file->f_flags & O_APPEND ?
-				     i_size_read(inode) + iocb->ki_pos :
-				     iocb->ki_pos;
-			size_t length = iov_iter_count(from);
+			* If we have dlm support acquire the lock for the area
+			* we are writing into.
+			* dlm lock is only needed as the write is cached and the 
+			* fuse server is not notified otherwise 
+			*/
+			if (fc->dlm) {
+				/*
+				* Note that a file opened with O_APPEND will have
+				* relative values in ki_pos. This code is here for
+				* convenience and for libfuse overlay test.
+				* Filesystems should handle O_APPEND with 'direct io'
+				* to additionally get the performance benefits of
+				* 'parallel direct writes'.
+				*/
+				loff_t pos = file->f_flags & O_APPEND ?
+						i_size_read(inode) + iocb->ki_pos :
+						iocb->ki_pos;
+				size_t length = iov_iter_count(from);
 
-			fuse_get_dlm_write_lock(file, pos, length);
+				fuse_get_dlm_write_lock(file, pos, length);
+			}
 		}
 	}
 
