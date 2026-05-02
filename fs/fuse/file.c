@@ -959,11 +959,14 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	res = fuse_simple_request(fm, &ia.ap.args);
 	if (res < 0) {
 		/*
-		 * please refer to Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt
-		 * why READ can return -EAGAIN from DLM subsystem.
-		 * XXX find a better DLM specific error code
+		 * Please refer to Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt
+		 * why READ can return -EDEADLK from DLM subsystem.
+		 *
+		 * -EDEADLK: Preferred error code indicating DLM lock ordering violation
+		 *           (would cause deadlock with page lock)
+		 * -EAGAIN:  Legacy error code, maintained for backward compatibility
 		 */
-		if (res == -EAGAIN && fm->fc->dlm)
+		if ((res == -EDEADLK || res == -EAGAIN) && fm->fc->dlm)
 			res = AOP_TRUNCATED_PAGE;
 		return res;
 	}
@@ -1010,9 +1013,9 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 	/*
 	 * TEMPORARY WORKAROUND for iomap write deadlock:
 	 *
-	 * When FUSE server returns -EAGAIN due to DLM,
-	 * fuse_do_readfolio() converts it to AOP_TRUNCATED_PAGE and
-	 * unlocks the folio (per AOP_TRUNCATED_PAGE contract).
+	 * When FUSE server returns -EDEADLK (or legacy -EAGAIN) due to DLM
+	 * lock contention, fuse_do_readfolio() converts it to AOP_TRUNCATED_PAGE
+	 * and unlocks the folio (per AOP_TRUNCATED_PAGE contract).
 	 *
 	 * However, iomap doesn't understand AOP_TRUNCATED_PAGE.
 	 * We need to:

@@ -1,5 +1,5 @@
 =================================================================================
-WHY FUSE CONVERTS -EAGAIN TO AOP_TRUNCATED_PAGE IN fuse_read_folio()
+WHY FUSE CONVERTS -EDEADLK TO AOP_TRUNCATED_PAGE IN fuse_read_folio()
 =================================================================================
 
 TLDR: To prevent ABBA deadlock between page locks and DLM (cluster) locks.
@@ -292,21 +292,22 @@ Core-0: Application reading from FUSE filesystem
                          │  Sends FUSE_READ to userspace daemon
                          │  Daemon may need to acquire cluster lock
                          │
-                         └─ Might return -EAGAIN if DLM detects possible
+                         └─ Might return -EDEADLK if DLM detects possible
                             deadlock due to concurrant page invalidation
+                            - For now -EAGAIN handled the same
 
 
 ─────────────────────────────────────────────────────────────────────────────
 WHY FUSE NEEDS THIS CONVERSION
 ─────────────────────────────────────────────────────────────────────────────
 
-When fuse_simple_request() returns -EAGAIN:
+When fuse_simple_request() returns -EDEADLK:
   - Userspace FUSE daemon encountered transient failure
   - Could be: cluster lock contention, timeout, daemon busy
   - The page might be stale/modified during the wait
   - Page lock is STILL HELD at this point
 
-If -EAGAIN were returned directly:
+If -EDEADLK were returned directly:
   ❌ VFS would see error and fail the read
   ❌ Page would remain locked
   ❌ No retry mechanism triggered
@@ -342,11 +343,12 @@ Location: fs/fuse/file.c:947-964
    out:
       // LINE 962: ✓ CRITICAL - Always unlocks page before returning
       folio_unlock(folio);
-      return err;  // Returns AOP_TRUNCATED_PAGE if -EAGAIN occurred
+      return err;  // Returns AOP_TRUNCATED_PAGE if -EDEADLK occurred
   }
 
 This matches OCFS2's pattern:
   1. Detect lock contention (-EAGAIN from daemon)
+    - Note: confusing that OCFS2 uses -EAGAIN instead of -EDEADLK
   2. Unlock the page (line 962)
   3. Return AOP_TRUNCATED_PAGE
   4. VFS retries the operation
@@ -372,7 +374,7 @@ Callers in mm/filemap.c handle it consistently:
   - do_filemap_fault(): "if (error == AOP_TRUNCATED_PAGE) goto retry_find;"
 
 =================================================================================
-WHY NOT JUST RETURN -EAGAIN?
+WHY NOT JUST RETURN -EDEADLK (-EAGAIN)?
 =================================================================================
 
 From OCFS2 comments (fs/ocfs2/dlmglue.c:2555-2560):
@@ -434,7 +436,7 @@ T2     Call: ocfs2_read_folio()        DLM downconvert starts
                                         Lock: DLM inode lock
 
 T3     Try: DLM lock (NONBLOCK)        Want: page lock
-       Returns: -EAGAIN                ❌ BLOCKED (held by Core-0)
+       Returns: -EDEADLK               ❌ BLOCKED (held by Core-0)
 
 T4     ✓ Unlock: page lock             ✓ Acquires: page lock
        Return: AOP_TRUNCATED_PAGE      Continues: reclaim work
@@ -517,10 +519,10 @@ Caller 3: do_filemap_fault() - lines 3542-3543
 Effect: Re-handles the page fault from scratch
 
 =================================================================================
-SUMMARY: Why -EAGAIN → AOP_TRUNCATED_PAGE is Essential
+SUMMARY: Why -EDEADLK → AOP_TRUNCATED_PAGE is Essential
 =================================================================================
 
-The conversion -EAGAIN → AOP_TRUNCATED_PAGE in fuse_read_folio() is necessary:
+The conversion -EDEADLK → AOP_TRUNCATED_PAGE in fuse_read_folio() is necessary:
 
 1. **Prevent Deadlock**: Avoids page lock vs cluster lock ABBA deadlock
    - Core-0 holds page lock, wants DLM lock
@@ -535,7 +537,7 @@ The conversion -EAGAIN → AOP_TRUNCATED_PAGE in fuse_read_folio() is necessary:
 3. **Enable Retry**: Uses VFS's built-in retry mechanism properly
    - AOP_TRUNCATED_PAGE is understood by mm/filemap.c
    - Triggers automatic retry loops at multiple call sites
-   - -EAGAIN alone would just fail the operation
+   - -EDEADLK alone would just fail the operation
 
 4. **Ensure Fairness**: Allows fair lock acquisition through retry cycle
    - Other threads get chance to acquire locks
@@ -553,7 +555,7 @@ Core-0 (Read Path):
   - Entry: filemap_read()                        [mm/filemap.c:2675]
   - Page lock: folio_trylock()                   [mm/filemap.c:2466]
   - FUSE read: fuse_do_readfolio()               [fs/fuse/file.c:905]
-  - -EAGAIN conversion                           [fs/fuse/file.c:934-935]
+  - -EDEADLK conversion                           [fs/fuse/file.c:934-935]
   - Page unlock: folio_unlock()                  [fs/fuse/file.c:962]
 
 Core-1 (Reclaim Path):
