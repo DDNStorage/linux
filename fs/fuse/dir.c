@@ -1244,6 +1244,62 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 	return 0;
 }
 
+/*
+ * This is used by permission checking to get attributes without requiring
+ * accurate time information. This allows the FUSE server to acquire a weaker
+ * lock mode and reduce lock contention.
+ */
+static int fuse_perm_do_statx(struct inode *inode, struct file *file)
+{
+	int err;
+	struct fuse_attr attr;
+	struct fuse_statx *sx;
+	struct fuse_statx_in inarg;
+	struct fuse_statx_out outarg;
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	u64 attr_version = fuse_get_attr_version(fm->fc);
+	FUSE_ARGS(args);
+
+	memset(&inarg, 0, sizeof(inarg));
+	memset(&outarg, 0, sizeof(outarg));
+	/* Directories have separate file-handle space */
+	if (file && S_ISREG(inode->i_mode)) {
+		struct fuse_file *ff = file->private_data;
+
+		inarg.getattr_flags |= FUSE_GETATTR_FH;
+		inarg.fh = ff->fh;
+	}
+
+	inarg.sx_flags = 0;
+	inarg.sx_mask = STATX_BASIC_STATS & ~(STATX_ATIME | STATX_MTIME | STATX_CTIME);
+	args.opcode = FUSE_STATX;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(outarg);
+	args.out_args[0].value = &outarg;
+	err = fuse_simple_request(fm, &args);
+	if (err)
+		return err;
+
+	sx = &outarg.stat;
+	if (((sx->mask & STATX_SIZE) && !fuse_valid_size(sx->size)) ||
+	    ((sx->mask & STATX_TYPE) && (!fuse_valid_type(sx->mode) ||
+					 inode_wrong_type(inode, sx->mode)))) {
+		fuse_make_bad(inode);
+		return -EIO;
+	}
+
+	fuse_statx_to_attr(&outarg.stat, &attr);
+	fuse_change_attributes(inode, &attr, &outarg.stat,
+				ATTR_TIMEOUT(&outarg), attr_version);
+	fuse_invalidate_attr_mask(inode, STATX_ATIME|STATX_MTIME|STATX_CTIME);
+
+	return 0;
+}
+
 static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 			   struct file *file)
 {
@@ -1484,7 +1540,7 @@ static int fuse_perm_getattr(struct inode *inode, int mask)
 		return -ECHILD;
 
 	forget_all_cached_acls(inode);
-	return fuse_do_getattr(inode, NULL, NULL);
+	return fuse_perm_do_statx(inode, NULL);
 }
 
 /*
