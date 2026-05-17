@@ -217,6 +217,135 @@ static ino_t fuse_squash_ino(u64 ino64)
 	return ino;
 }
 
+/*
+ * Handle statx-specific attribute updates with partial attribute support.
+ */
+static void fuse_change_attributes_common_sx(struct inode *inode,
+					     struct fuse_attr *attr,
+					     struct fuse_statx *sx,
+					     u64 attr_valid, u32 cache_mask,
+					     u64 evict_ctr)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	u32 returned_attrs = sx->mask & STATX_BASIC_STATS;
+
+	lockdep_assert_held(&fi->lock);
+
+	/*
+	 * Clear returned basic stats from invalid mask.
+	 *
+	 * Don't do this if this is coming from a fuse_iget() call and there
+	 * might have been a racing evict which would've invalidated the result
+	 * if the attr_version would've been preserved.
+	 *
+	 * !evict_ctr -> this is create
+	 * fi->attr_version != 0 -> this is not a new inode
+	 * evict_ctr == fuse_get_evict_ctr() -> no evicts while during request
+	 */
+	if (!evict_ctr || fi->attr_version || evict_ctr == fuse_get_evict_ctr(fc))
+		set_mask_bits(&fi->inval_mask, returned_attrs, 0);
+
+	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+
+	/*
+	 * Only update i_time if we got all the attributes we care about.
+	 *
+	 * With writeback_cache (cache_mask set): cache_mask attributes are
+	 * managed locally and their values from the server are ignored.
+	 * So we only need all the OTHER attributes (non-cache_mask).
+	 */
+	if (cache_mask) {
+		/* writeback_cache: ignore cache_mask attrs, check everything else */
+		if ((returned_attrs | cache_mask) == STATX_BASIC_STATS)
+			fi->i_time = attr_valid;
+	} else {
+		/* no writeback_cache: need all basic stats */
+		if (returned_attrs == STATX_BASIC_STATS)
+			fi->i_time = attr_valid;
+	}
+
+	/*
+	 * Only update inode fields for attributes that were actually returned.
+	 * TYPE is part of i_mode but already set during inode creation.
+	 */
+	if (returned_attrs & STATX_INO)
+		inode->i_ino = fuse_squash_ino(attr->ino);
+	if (returned_attrs & STATX_MODE)
+		inode->i_mode = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
+	if (returned_attrs & STATX_NLINK)
+		set_nlink(inode, attr->nlink);
+	if (returned_attrs & STATX_UID)
+		inode->i_uid = make_kuid(fc->user_ns, attr->uid);
+	if (returned_attrs & STATX_GID)
+		inode->i_gid = make_kgid(fc->user_ns, attr->gid);
+	if (returned_attrs & STATX_BLOCKS)
+		inode->i_blocks = attr->blocks;
+
+	if (returned_attrs & STATX_ATIME) {
+		attr->atimensec = min_t(u32, attr->atimensec, NSEC_PER_SEC - 1);
+		inode->i_atime.tv_sec   = attr->atime;
+		inode->i_atime.tv_nsec  = attr->atimensec;
+	}
+	/* mtime from server may be stale due to local buffered write */
+	if ((returned_attrs & STATX_MTIME) && !(cache_mask & STATX_MTIME)) {
+		attr->mtimensec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
+		inode->i_mtime.tv_sec   = attr->mtime;
+		inode->i_mtime.tv_nsec  = attr->mtimensec;
+	}
+	if ((returned_attrs & STATX_CTIME) && !(cache_mask & STATX_CTIME)) {
+		attr->ctimensec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
+		inode->i_ctime.tv_sec   = attr->ctime;
+		inode->i_ctime.tv_nsec  = attr->ctimensec;
+	}
+	if (sx) {
+		/* Sanitize nsecs */
+		sx->btime.tv_nsec =
+			min_t(u32, sx->btime.tv_nsec, NSEC_PER_SEC - 1);
+
+		/*
+		 * Btime has been queried, cache is valid (whether or not btime
+		 * is available or not) so clear STATX_BTIME from inval_mask.
+		 *
+		 * Availability of the btime attribute is indicated in
+		 * FUSE_I_BTIME
+		 */
+		set_mask_bits(&fi->inval_mask, STATX_BTIME, 0);
+		if (sx->mask & STATX_BTIME) {
+			set_bit(FUSE_I_BTIME, &fi->state);
+			fi->i_btime.tv_sec = sx->btime.tv_sec;
+			fi->i_btime.tv_nsec = sx->btime.tv_nsec;
+		}
+	}
+
+	/* Common fields for both statx and getattr */
+	if (attr->blksize != 0)
+		inode->i_blkbits = ilog2(attr->blksize);
+	else
+		inode->i_blkbits = inode->i_sb->s_blocksize_bits;
+
+	/*
+	 * Don't set the sticky bit in i_mode, unless we want the VFS
+	 * to check permissions.  This prevents failures due to the
+	 * check in may_delete().
+	 */
+	fi->orig_i_mode = inode->i_mode;
+	if (!fc->default_permissions)
+		inode->i_mode &= ~S_ISVTX;
+
+	fi->orig_ino = attr->ino;
+
+	/*
+	 * We are refreshing inode data and it is possible that another
+	 * client set suid/sgid or security.capability xattr. So clear
+	 * S_NOSEC. Ideally, we could have cleared it only if suid/sgid
+	 * was set or if security.capability xattr was set. But we don't
+	 * know if security.capability has been set or not. So clear it
+	 * anyway. Its less efficient but should be safe.
+	 */
+	inode->i_flags &= ~S_NOSEC;
+}
+
 void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 				   struct fuse_statx *sx,
 				   u64 attr_valid, u32 cache_mask,
@@ -226,6 +355,12 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
 	lockdep_assert_held(&fi->lock);
+
+	if (sx) {
+		return fuse_change_attributes_common_sx(inode, attr, sx,
+							attr_valid, cache_mask,
+							evict_ctr);
+	}
 
 	/*
 	 * Clear basic stats from invalid mask.
@@ -334,8 +469,10 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	u32 cache_mask;
 	loff_t oldsize;
 	struct timespec64 old_mtime;
+	bool have_size = !sx || (sx->mask & STATX_SIZE);
 
 	spin_lock(&fi->lock);
+
 	/*
 	 * In case of writeback_cache enabled, writes update mtime, ctime and
 	 * may update i_size.  In these cases trust the cached value in the
@@ -369,19 +506,26 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	 * In case of writeback_cache enabled, the cached writes beyond EOF
 	 * extend local i_size without keeping userspace server in sync. So,
 	 * attr->size coming from server can be stale. We cannot trust it.
+	 * Only update i_size if SIZE was actually returned by the server.
 	 */
-	if (!(cache_mask & STATX_SIZE))
+	if (have_size && !(cache_mask & STATX_SIZE))
 		i_size_write(inode, attr->size);
 	spin_unlock(&fi->lock);
 
+	/*
+	 * Only do page cache invalidation when cache_mask is not set
+	 * (writeback_cache disabled) AND the relevant attributes (SIZE/MTIME)
+	 * were actually returned by the server.
+	 */
 	if (!cache_mask && S_ISREG(inode->i_mode)) {
 		bool inval = false;
+		bool have_mtime = !sx || (sx->mask & STATX_MTIME);
 
-		if (oldsize != attr->size) {
+		if (have_size && oldsize != attr->size) {
 			truncate_pagecache(inode, attr->size);
 			if (!fc->explicit_inval_data)
 				inval = true;
-		} else if (fc->auto_inval_data) {
+		} else if (have_mtime && fc->auto_inval_data) {
 			struct timespec64 new_mtime = {
 				.tv_sec = attr->mtime,
 				.tv_nsec = attr->mtimensec,
