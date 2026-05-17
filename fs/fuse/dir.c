@@ -1182,8 +1182,13 @@ static void fuse_statx_to_attr(struct fuse_statx *sx, struct fuse_attr *attr)
 	attr->blksize = sx->blksize;
 }
 
+/*
+ * @param sx_mask request mask send to to fuse-server
+ * @param mandatory_sx_mask subset of (or complete) sx_mask that the server
+ * has to fulfill
+*/
 static int fuse_do_statx(struct inode *inode, struct file *file,
-			 struct kstat *stat)
+			 struct kstat *stat, u32 sx_mask, u32 mandatory_sx_mask)
 {
 	int err;
 	struct fuse_attr attr;
@@ -1194,6 +1199,12 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 	u64 attr_version = fuse_get_attr_version(fm->fc);
 	FUSE_ARGS(args);
 
+	/*
+	 * mandatory_sx_mask should be a subset of sx_mask.
+	 * If it's not, we have a logic error somewhere in the call chain.
+	 */
+	WARN_ON_ONCE((mandatory_sx_mask & sx_mask) != mandatory_sx_mask);
+
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outarg, 0, sizeof(outarg));
 	/* Directories have separate file-handle space */
@@ -1203,9 +1214,12 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 		inarg.getattr_flags |= FUSE_GETATTR_FH;
 		inarg.fh = ff->fh;
 	}
-	/* For now leave sync hints as the default, request all stats. */
+	/*
+	 * For permission checks, we only need mode, uid, gid.
+	 * This is an optimization to avoid fetching all stats when not needed.
+	 */
 	inarg.sx_flags = 0;
-	inarg.sx_mask = STATX_BASIC_STATS | STATX_BTIME;
+	inarg.sx_mask = sx_mask;
 	args.opcode = FUSE_STATX;
 	args.nodeid = get_node_id(inode);
 	args.in_numargs = 1;
@@ -1219,6 +1233,17 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 		return err;
 
 	sx = &outarg.stat;
+
+	/*
+	 * Verify the server returned at least what we requested.
+	 * The server may return more attributes than requested (which is fine),
+	 * but must not return fewer.
+	 */
+	if ((sx->mask & mandatory_sx_mask) != mandatory_sx_mask) {
+		fuse_make_bad(inode);
+		return -EIO;
+	}
+
 	if (((sx->mask & STATX_SIZE) && !fuse_valid_size(sx->size)) ||
 	    ((sx->mask & STATX_TYPE) && (!fuse_valid_type(sx->mode) ||
 					 inode_wrong_type(inode, sx->mode)))) {
@@ -1227,7 +1252,7 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 	}
 
 	fuse_statx_to_attr(&outarg.stat, &attr);
-	if ((sx->mask & STATX_BASIC_STATS) == STATX_BASIC_STATS) {
+	if (sx->mask & STATX_BASIC_STATS) {
 		fuse_change_attributes(inode, &attr, &outarg.stat,
 				       ATTR_TIMEOUT(&outarg), attr_version);
 	}
@@ -1292,30 +1317,31 @@ static int fuse_update_get_attr(struct inode *inode, struct file *file,
 	bool sync;
 	u32 inval_mask = READ_ONCE(fi->inval_mask);
 	u32 cache_mask = fuse_get_cache_mask(inode);
-
+	u32 mandatory_sx_mask = request_mask & STATX_BASIC_STATS;
+	u32 sx_mask = request_mask;
 
 	/* FUSE only supports basic stats and possibly btime */
-	request_mask &= STATX_BASIC_STATS | STATX_BTIME;
+	sx_mask &= STATX_BASIC_STATS | STATX_BTIME;
 retry:
 	if (fc->no_statx)
-		request_mask &= STATX_BASIC_STATS;
+		sx_mask &= STATX_BASIC_STATS;
 
-	if (!request_mask)
+	if (!sx_mask)
 		sync = false;
 	else if (flags & AT_STATX_FORCE_SYNC)
 		sync = true;
 	else if (flags & AT_STATX_DONT_SYNC)
 		sync = false;
-	else if (request_mask & inval_mask & ~cache_mask)
+	else if (sx_mask & inval_mask & ~cache_mask)
 		sync = true;
 	else
 		sync = time_before64(fi->i_time, get_jiffies_64());
 
 	if (sync) {
 		forget_all_cached_acls(inode);
-		/* Try statx if BTIME is requested */
-		if (!fc->no_statx && (request_mask & ~STATX_BASIC_STATS)) {
-			err = fuse_do_statx(inode, file, stat);
+		if (!fc->no_statx) {
+			err = fuse_do_statx(inode, file, stat, sx_mask,
+					    mandatory_sx_mask);
 			if (err == -ENOSYS) {
 				fc->no_statx = 1;
 				err = 0;
@@ -1477,13 +1503,14 @@ static int fuse_access(struct inode *inode, int mask)
 	return err;
 }
 
-static int fuse_perm_getattr(struct inode *inode, int mask)
+static int fuse_perm_getattr(struct inode *inode, int mask, int perm_mask)
 {
 	if (mask & MAY_NOT_BLOCK)
 		return -ECHILD;
 
 	forget_all_cached_acls(inode);
-	return fuse_do_getattr(inode, NULL, NULL);
+	return fuse_update_get_attr(inode, NULL, NULL, perm_mask,
+				    AT_STATX_FORCE_SYNC);
 }
 
 /*
@@ -1505,6 +1532,7 @@ static int fuse_permission(struct user_namespace *mnt_userns,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool refreshed = false;
 	int err = 0;
+	int perm_mask = STATX_MODE | STATX_UID | STATX_GID;
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -1518,13 +1546,12 @@ static int fuse_permission(struct user_namespace *mnt_userns,
 	if (fc->default_permissions ||
 	    ((mask & MAY_EXEC) && S_ISREG(inode->i_mode))) {
 		struct fuse_inode *fi = get_fuse_inode(inode);
-		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
 
 		if (perm_mask & READ_ONCE(fi->inval_mask) ||
 		    time_before64(fi->i_time, get_jiffies_64())) {
 			refreshed = true;
 
-			err = fuse_perm_getattr(inode, mask);
+			err = fuse_perm_getattr(inode, mask, perm_mask);
 			if (err)
 				return err;
 		}
@@ -1537,7 +1564,7 @@ static int fuse_permission(struct user_namespace *mnt_userns,
 		   attributes.  This is also needed, because the root
 		   node will at first have no permissions */
 		if (err == -EACCES && !refreshed) {
-			err = fuse_perm_getattr(inode, mask);
+			err = fuse_perm_getattr(inode, mask, perm_mask);
 			if (!err)
 				err = generic_permission(&init_user_ns,
 							 inode, mask);
@@ -1554,7 +1581,7 @@ static int fuse_permission(struct user_namespace *mnt_userns,
 			if (refreshed)
 				return -EACCES;
 
-			err = fuse_perm_getattr(inode, mask);
+			err = fuse_perm_getattr(inode, mask, perm_mask);
 			if (!err && !(inode->i_mode & S_IXUGO))
 				return -EACCES;
 		}
