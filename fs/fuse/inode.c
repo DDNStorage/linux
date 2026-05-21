@@ -1180,6 +1180,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->initialized = 0;
 	fc->connected = 1;
 	fc->dlm = 1;
+	fc->lookupx = 1;
 
 	/* module option for now */
 	fc->compound_open_getattr = enable_compound;

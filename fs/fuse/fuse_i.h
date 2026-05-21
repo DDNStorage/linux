@@ -865,6 +865,9 @@ struct fuse_conn {
 	/* do we have support for dlm in the fs? */
 	unsigned int dlm:1;
 
+	/* Is extended lookup implemented by fs? */
+	unsigned int lookupx:1;
+
 	/* Is synchronous FUSE_INIT allowed? */
 	unsigned int sync_init:1;
 
