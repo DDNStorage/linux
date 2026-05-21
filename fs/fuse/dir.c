@@ -28,6 +28,8 @@ module_param(allow_sys_admin_access, bool, 0644);
 MODULE_PARM_DESC(allow_sys_admin_access,
 		 "Allow users with CAP_SYS_ADMIN in initial userns to bypass allow_other access check");
 
+static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, uint32_t mask);
+
 static void fuse_advise_use_readdirplus(struct inode *dir)
 {
 	struct fuse_inode *fi = get_fuse_inode(dir);
@@ -185,6 +187,69 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
 	args->out_args[0].value = outarg;
 }
 
+/**
+ * fuse_do_lookupx - Perform a FUSE_LOOKUPX operation
+ *
+ * @ext_out: extended output argument structure
+ * @lookup_flags: lookup flags (e.g., FUSE_LOOKUPX_FOR_REVALIDATE)
+ */
+static int fuse_do_lookupx(struct fuse_mount *fm, u64 nodeid,
+			    const struct qstr *name,
+			    struct fuse_lookupx_out *ext_out,
+			    uint32_t lookup_flags)
+{
+	struct fuse_conn *fc = fm->fc;
+	FUSE_ARGS(args);
+	struct fuse_lookupx_in inarg = { .lookup_flags = lookup_flags };
+	int err;
+
+	memset(ext_out, 0, sizeof(*ext_out));
+	args.nodeid = nodeid;
+
+	if (!fc->lookupx)
+		goto fallback;
+
+	args.opcode = FUSE_LOOKUPX;
+	args.in_numargs = 3;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.in_args[1].size = 0;
+	args.in_args[1].value = NULL;
+	args.in_args[2].size = name->len + 1;
+	args.in_args[2].value = name->name;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(struct fuse_lookupx_out);
+	args.out_args[0].value = ext_out;
+
+	err = fuse_simple_request(fm, &args);
+	if (err) {
+		if (err == -ENOSYS) {
+			fc->lookupx = 0;
+			goto fallback;
+		}
+		return err;
+	}
+
+	return 0;
+
+fallback:
+	args.opcode = FUSE_LOOKUP;
+	args.in_numargs = 2;
+	fuse_set_zero_arg0(&args);
+	args.in_args[1].size = name->len + 1;
+	args.in_args[1].value = name->name;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(struct fuse_entry_out);
+	args.out_args[0].value = &ext_out->entry;
+
+	err = fuse_simple_request(fm, &args);
+	if (err)
+		return err;
+
+	ext_out->mask = STATX_BASIC_STATS;
+	return 0;
+}
+
 /*
  * Check whether the dentry is still valid
  *
@@ -207,10 +272,11 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		goto invalid;
 	else if (time_before64(fuse_dentry_time(entry), get_jiffies_64()) ||
 		 (flags & (LOOKUP_EXCL | LOOKUP_REVAL | LOOKUP_RENAME_TARGET))) {
-		struct fuse_entry_out outarg;
-		FUSE_ARGS(args);
+		struct fuse_lookupx_out ext_out;
+		struct fuse_statx sx;
 		struct fuse_forget_link *forget;
 		u64 attr_version;
+		uint32_t lookupx_flags = FUSE_LOOKUPX_FOR_REVALIDATE;
 
 		/* For negative dentries, always do a fresh lookup */
 		if (!inode)
@@ -228,21 +294,23 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 			goto out;
 
 		attr_version = fuse_get_attr_version(fm->fc);
+		if (S_ISDIR(inode->i_mode))
+			lookupx_flags |= FUSE_LOOKUPX_TARGET_WAS_DIR;
 
 		parent = dget_parent(entry);
-		fuse_lookup_init(fm->fc, &args, get_node_id(d_inode(parent)),
-				 &entry->d_name, &outarg);
-		ret = fuse_simple_request(fm, &args);
+		ret = fuse_do_lookupx(fm, get_node_id(d_inode(parent)),
+					&entry->d_name, &ext_out,
+					lookupx_flags);
 		dput(parent);
 		/* Zero nodeid is same as -ENOENT */
-		if (!ret && !outarg.nodeid)
+		if (!ret && !ext_out.entry.nodeid)
 			ret = -ENOENT;
 		if (!ret) {
 			fi = get_fuse_inode(inode);
-			if (outarg.nodeid != get_node_id(inode) ||
-			    (bool) IS_AUTOMOUNT(inode) != (bool) (outarg.attr.flags & FUSE_ATTR_SUBMOUNT)) {
+			if (ext_out.entry.nodeid != get_node_id(inode) ||
+			    (bool) IS_AUTOMOUNT(inode) != (bool) (ext_out.entry.attr.flags & FUSE_ATTR_SUBMOUNT)) {
 				fuse_queue_forget(fm->fc, forget,
-						  outarg.nodeid, 1);
+						  ext_out.entry.nodeid, 1);
 				goto invalid;
 			}
 			spin_lock(&fi->lock);
@@ -252,15 +320,17 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		kfree(forget);
 		if (ret == -ENOMEM || ret == -EINTR)
 			goto out;
-		if (ret || fuse_invalid_attr(&outarg.attr) ||
-		    fuse_stale_inode(inode, outarg.generation, &outarg.attr))
+		if (ret || fuse_invalid_attr(&ext_out.entry.attr) ||
+		    fuse_stale_inode(inode, ext_out.entry.generation, &ext_out.entry.attr))
 			goto invalid;
 
 		forget_all_cached_acls(inode);
-		fuse_change_attributes(inode, &outarg.attr, NULL,
-				       ATTR_TIMEOUT(&outarg),
+		fuse_attr_to_statx(&ext_out.entry.attr, &sx, ext_out.mask);
+		fuse_change_attributes(inode, &ext_out.entry.attr, &sx,
+				       ATTR_TIMEOUT(&ext_out.entry),
 				       attr_version);
-		fuse_change_entry_timeout(entry, &outarg);
+		if ((ext_out.mask & STATX_BASIC_STATS) == STATX_BASIC_STATS)
+			fuse_change_entry_timeout(entry, &ext_out.entry);
 	} else if (inode) {
 		fi = get_fuse_inode(inode);
 		if (flags & LOOKUP_RCU) {
@@ -1181,6 +1251,28 @@ static void fuse_statx_to_attr(struct fuse_statx *sx, struct fuse_attr *attr)
 	attr->gid = sx->gid;
 	attr->rdev = new_encode_dev(MKDEV(sx->rdev_major, sx->rdev_minor));
 	attr->blksize = sx->blksize;
+}
+
+static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, uint32_t mask)
+{
+	memset(sx, 0, sizeof(*sx));
+	sx->mask = mask;
+	sx->ino = attr->ino;
+	sx->size = attr->size;
+	sx->blocks = attr->blocks;
+	sx->atime.tv_sec = attr->atime;
+	sx->mtime.tv_sec = attr->mtime;
+	sx->ctime.tv_sec = attr->ctime;
+	sx->atime.tv_nsec = attr->atimensec;
+	sx->mtime.tv_nsec = attr->mtimensec;
+	sx->ctime.tv_nsec = attr->ctimensec;
+	sx->mode = attr->mode;
+	sx->nlink = attr->nlink;
+	sx->uid = attr->uid;
+	sx->gid = attr->gid;
+	sx->rdev_major = MAJOR(attr->rdev);
+	sx->rdev_minor = MINOR(attr->rdev);
+	sx->blksize = attr->blksize;
 }
 
 /*
