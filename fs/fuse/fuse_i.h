@@ -918,6 +918,9 @@ struct fuse_conn {
 	/* do we have support for dlm in the fs? */
 	unsigned int dlm:1;
 
+	/* Is extended lookup implemented by fs? */
+	unsigned int lookupx:1;
+
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
