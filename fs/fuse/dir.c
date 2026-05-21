@@ -613,6 +613,39 @@ static void free_ext_value(struct fuse_args *args)
  * If the filesystem doesn't support this, then fall back to separate
  * 'mknod' + 'open' requests.
  */
+static void fuse_create_init(struct fuse_conn *fc, struct fuse_args *args,
+			     u64 nodeid, const struct qstr *name, u32 opcode,
+			     unsigned int flags, umode_t mode,
+			     struct fuse_create_in *inarg,
+			     struct fuse_entry_out *outentry,
+			     struct fuse_open_out *outopen)
+{
+	bool trunc = flags & O_TRUNC;
+
+	memset(inarg, 0, sizeof(*inarg));
+	memset(outentry, 0, sizeof(*outentry));
+	memset(outopen, 0, sizeof(*outopen));
+	inarg->flags = flags;
+	inarg->mode = mode;
+	inarg->umask = current_umask();
+	if (fc->handle_killpriv_v2 && trunc &&
+	    !(flags & O_EXCL) && !capable(CAP_FSETID))
+		inarg->open_flags |= FUSE_OPEN_KILL_SUIDGID;
+
+	args->opcode = opcode;
+	args->nodeid = nodeid;
+	args->in_numargs = 2;
+	args->in_args[0].size = sizeof(*inarg);
+	args->in_args[0].value = inarg;
+	args->in_args[1].size = name->len + 1;
+	args->in_args[1].value = name->name;
+	args->out_numargs = 2;
+	args->out_args[0].size = sizeof(*outentry);
+	args->out_args[0].value = outentry;
+	args->out_args[1].size = sizeof(*outopen);
+	args->out_args[1].value = outopen;
+}
+
 static int fuse_create_open(struct inode *dir, struct dentry *entry,
 			    struct file *file, unsigned int flags,
 			    umode_t mode, u32 opcode)
@@ -646,29 +679,9 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 		mode &= ~current_umask();
 
 	flags &= ~O_NOCTTY;
-	memset(&inarg, 0, sizeof(inarg));
-	memset(&outentry, 0, sizeof(outentry));
-	inarg.flags = flags;
-	inarg.mode = mode;
-	inarg.umask = current_umask();
 
-	if (fm->fc->handle_killpriv_v2 && trunc &&
-	    !(flags & O_EXCL) && !capable(CAP_FSETID)) {
-		inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
-	}
-
-	args.opcode = opcode;
-	args.nodeid = get_node_id(dir);
-	args.in_numargs = 2;
-	args.in_args[0].size = sizeof(inarg);
-	args.in_args[0].value = &inarg;
-	args.in_args[1].size = entry->d_name.len + 1;
-	args.in_args[1].value = entry->d_name.name;
-	args.out_numargs = 2;
-	args.out_args[0].size = sizeof(outentry);
-	args.out_args[0].value = &outentry;
-	args.out_args[1].size = sizeof(outopen);
-	args.out_args[1].value = &outopen;
+	fuse_create_init(fm->fc, &args, get_node_id(dir), &entry->d_name, opcode,
+			 flags, mode, &inarg, &outentry, &outopen);
 
 	err = get_create_ext(&args, dir, entry, mode);
 	if (err)
