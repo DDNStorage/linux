@@ -570,6 +570,14 @@ struct fuse_file_lock {
 #define FUSE_OPEN_KILL_SUIDGID	(1 << 0)
 
 /**
+ * Lookup flags
+ * FUSE_LOOKUPX_FOR_REVALIDATE: lookup called from revalidate
+ * FUSE_LOOKUPX_TARGET_WASDIR: (hint) the lookup target was a directory
+ */
+#define FUSE_LOOKUPX_FOR_REVALIDATE (1 << 0)
+#define FUSE_LOOKUPX_TARGET_WAS_DIR (1 << 1)
+
+/**
  * setxattr flags
  * FUSE_SETXATTR_ACL_KILL_SGID: Clear SGID when system.posix_acl_access is set
  */
@@ -654,6 +662,9 @@ enum fuse_opcode {
 	 */
 	FUSE_COMPOUND		= 101,
 
+	/* Extented lookup operation */
+	FUSE_LOOKUPX		= 102,
+
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
 
@@ -686,6 +697,15 @@ struct fuse_entry_out {
 	uint32_t	entry_valid_nsec;
 	uint32_t	attr_valid_nsec;
 	struct fuse_attr attr;
+};
+
+struct fuse_lookupx_in {
+	uint32_t	lookup_flags;
+};
+
+struct fuse_lookupx_out {
+	struct fuse_entry_out	entry;
+	uint32_t		mask;	/* Mask of valid attributes in statx format */
 };
 
 struct fuse_forget_in {
