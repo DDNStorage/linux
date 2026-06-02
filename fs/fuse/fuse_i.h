@@ -114,6 +114,15 @@ struct fuse_inode {
 	/** Time in jiffies until the file attributes are valid */
 	u64 i_time;
 
+	/*
+	 * Time in jiffies until mode/uid/gid (the permission-check subset of
+	 * STATX_BASIC_STATS) are valid. Tracked separately from i_time so that
+	 * a partial statx refresh covering only the perm bits can extend the
+	 * permission-check cache without falsely advancing i_time for the
+	 * other (un-refreshed) attributes.
+	 */
+	u64 i_perm_time;
+
 	/* Which attributes are invalid */
 	u32 inval_mask;
 

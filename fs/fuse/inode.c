@@ -265,6 +265,17 @@ static void fuse_change_attributes_common_sx(struct inode *inode,
 	}
 
 	/*
+	 * Permission-check cache: independent of i_time so that a partial
+	 * refresh which covers only mode/uid/gid (e.g. fuse_perm_getattr())
+	 * still extends the window during which fuse_permission() can hit
+	 * the cache. Requires all three perm bits because generic_permission()
+	 * needs the full triple.
+	 */
+	if ((returned_attrs & (STATX_MODE | STATX_UID | STATX_GID)) ==
+	    (STATX_MODE | STATX_UID | STATX_GID))
+		fi->i_perm_time = attr_valid;
+
+	/*
 	 * Only update inode fields for attributes that were actually returned.
 	 * TYPE is part of i_mode but already set during inode creation.
 	 */
@@ -375,6 +386,7 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	wake_up_all(&fc->attr_version_waitq);
 	fi->i_time = attr_valid;
+	fi->i_perm_time = attr_valid;
 
 	inode->i_ino     = fuse_squash_ino(attr->ino);
 	inode->i_mode    = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
