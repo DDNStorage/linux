@@ -329,8 +329,7 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		fuse_change_attributes(inode, &ext_out.entry.attr, &sx,
 				       ATTR_TIMEOUT(&ext_out.entry),
 				       attr_version);
-		if ((ext_out.mask & STATX_BASIC_STATS) == STATX_BASIC_STATS)
-			fuse_change_entry_timeout(entry, &ext_out.entry);
+		fuse_change_entry_timeout(entry, &ext_out.entry);
 	} else if (inode) {
 		fi = get_fuse_inode(inode);
 		if (flags & LOOKUP_RCU) {
