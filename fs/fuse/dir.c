@@ -212,13 +212,15 @@ static int fuse_do_lookupx(struct fuse_mount *fm, u64 nodeid,
 		goto fallback;
 
 	args.opcode = FUSE_LOOKUPX;
-	args.in_numargs = 3;
+	args.in_numargs = 4;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = 0;
 	args.in_args[1].value = NULL;
-	args.in_args[2].size = name->len + 1;
+	args.in_args[2].size = name->len;
 	args.in_args[2].value = name->name;
+	args.in_args[3].size = 1;
+	args.in_args[3].value = "";
 	args.out_numargs = 1;
 	args.out_args[0].size = sizeof(struct fuse_lookupx_out);
 	args.out_args[0].value = ext_out;
@@ -236,10 +238,12 @@ static int fuse_do_lookupx(struct fuse_mount *fm, u64 nodeid,
 
 fallback:
 	args.opcode = FUSE_LOOKUP;
-	args.in_numargs = 2;
+	args.in_numargs = 3;
 	fuse_set_zero_arg0(&args);
-	args.in_args[1].size = name->len + 1;
+	args.in_args[1].size = name->len;
 	args.in_args[1].value = name->name;
+	args.in_args[2].size = 1;
+	args.in_args[2].value = "";
 	args.out_numargs = 1;
 	args.out_args[0].size = sizeof(struct fuse_entry_out);
 	args.out_args[0].value = &ext_out->entry;
