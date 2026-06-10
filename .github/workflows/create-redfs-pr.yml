@@ -12,11 +12,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Checks-out to a different directory to avoid following checkout removing it.
-      - uses: actions/checkout@v6
+      - name: Checkout Linux source repo
+        uses: actions/checkout@v6
         with:
+          fetch-depth: 10
           path: linux
 
-      - name: Try to checkout sync-${{ github.ref_name }} if it exists
+      - name: Generate commit message
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_NAME: ${{ github.repository }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          pushd linux
+          echo -e "Sync with $REPO_NAME branch $BRANCH_NAME\n" > ../commit.msg
+          echo -e "Sync with $REPO_NAME branch $BRANCH_NAME PR $PR_NUMBER" >> ../commit.msg
+          echo -e "$PR_TITLE\n" >> ../commit.msg
+          echo -e "(commit: ${{ github.sha }})\n" >> ../commit.msg
+          echo "Getting git log $BASE_SHA..$HEAD_SHA"
+          RET=0
+          git log --format="- %h %s" $BASE_SHA..$HEAD_SHA >> ../commit.msg || RET=$?
+          if [ $RET -ne 0 ]; then
+            echo "Failed to get git log with range, try to get log with single commit (too many commits?)."
+            git log --format="- %s" $HEAD_SHA >> ../commit.msg || RET=$?
+            if [ $RET -ne 0 ]; then
+              echo "Failed to get git log, exit with error."
+              exit 1
+            fi
+          fi
+          echo "Generated commit message:"
+          cat ../commit.msg
+          popd
+
+      - name: Try to checkout redfs branch sync-${{ github.ref_name }} if it exists
         uses: actions/checkout@v6
         id: try-checkout
         continue-on-error: true
@@ -27,7 +58,7 @@ jobs:
           path: redfs
           token: ${{ secrets.REDFS_TOKEN }}
 
-      - name: Fallback to checkout main
+      - name: Fallback to checkout redfs branch main
         if: steps.try-checkout.outcome == 'failure'
         uses: actions/checkout@v6
         with:
@@ -65,10 +96,9 @@ jobs:
           pushd redfs
           ./copy-from-linux-branch.sh $GITHUB_WORKSPACE/linux ${kerver}
           git add src/$kerver
-          echo -e "Sync with ${{ github.repository }} branch ${{ github.ref_name }}\n" > ../commit.msg
-          echo -e "Sync with ${{ github.repository }} branch ${{ github.ref_name }} by commit" >> ../commit.msg
-          echo -e "${{ github.sha }}" >> ../commit.msg
           RET=0
+          echo "Committing changes with message:"
+          cat ../commit.msg
           git commit -F ../commit.msg 2> ../commit.log || RET=$?;
           if [ -s ../commit.log ]; then
             echo "Error detcted in commit:"
