@@ -14,7 +14,33 @@ jobs:
       # Checks-out to a different directory to avoid following checkout removing it.
       - uses: actions/checkout@v6
         with:
+          fetch-depth: 10
           path: linux
+
+      - name: Generate commit message
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pushd linux
+          echo -e "Sync with ${{ github.repository }} branch ${{ github.ref_name }}\n" > ../commit.msg
+          echo -e "Sync with ${{ github.repository }} branch ${{ github.ref_name }} at commit" >> ../commit.msg
+          echo -e "${{ github.sha }}\n" >> commit.msg
+          echo "Getting logs $BASE_SHA..$HEAD_SHA"
+          RET=0
+          git log --format="- %s" $BASE_SHA..$HEAD_SHA >> ../commit.msg || RET=$?
+          if [ $RET -ne 0 ]; then
+            echo "Failed to get git log with range, try to get log with single commit."
+            git log --format="- %s" $HEAD_SHA >> ../commit.msg || RET=$?
+            if [ $RET -ne 0 ]; then
+              echo "Failed to get git log, exit with error."
+              exit 1
+            fi
+          fi
+          cat ../commit.msg
+          popd
 
       - name: Try to checkout sync-${{ github.ref_name }} if it exists
         uses: actions/checkout@v6
@@ -65,9 +91,6 @@ jobs:
           pushd redfs
           ./copy-from-linux-branch.sh $GITHUB_WORKSPACE/linux ${kerver}
           git add src/$kerver
-          echo -e "Sync with ${{ github.repository }} branch ${{ github.ref_name }}\n" > ../commit.msg
-          echo -e "Sync with ${{ github.repository }} branch ${{ github.ref_name }} by commit" >> ../commit.msg
-          echo -e "${{ github.sha }}" >> ../commit.msg
           RET=0
           git commit -F ../commit.msg 2> ../commit.log || RET=$?;
           if [ -s ../commit.log ]; then
