@@ -2252,10 +2252,12 @@ static int fuse_write_begin(struct file *file, struct address_space *mapping,
 	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
 	struct page *page;
 	loff_t fsize;
-	int err = -ENOMEM;
+	int err;
 
 	WARN_ON(!fc->writeback_cache);
 
+retry:
+	err = -ENOMEM;
 	page = grab_cache_page_write_begin(mapping, index);
 	if (!page)
 		goto error;
@@ -2285,6 +2287,13 @@ success:
 cleanup:
 	unlock_page(page);
 	put_page(page);
+	/*
+	 * ->write_begin has no AOP_TRUNCATED_PAGE contract; a positive
+	 * return would pass the "status < 0" check in
+	 * generic_perform_write() and crash on an unset *pagep.
+	 */
+	if (err == AOP_TRUNCATED_PAGE)
+		goto retry;
 error:
 	return err;
 }
