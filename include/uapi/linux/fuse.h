@@ -429,8 +429,8 @@ struct fuse_file_lock {
  * FUSE_OVER_IO_URING: Indicate that client supports io-uring
  * FUSE_INVAL_INODE_ENTRY: invalidate inode aliases when doing inode invalidation
  * FUSE_EXPIRE_INODE_ENTRY: expire inode aliases when doing inode invalidation
- * FUSE_ALIGN_PG_ORDER: page order (power of 2 exponent for number of pages) for
- *			optimal io-size alignment
+ * FUSE_ALIGN_PG_ORDER: alignment order (power of 2 exponent of the IO size
+ *			in bytes) for optimal io-size alignment
  * FUSE_URING_REDUCED_Q: Client (kernel) supports less queues - Server is free
  *			 to register between 1 and nr-core io-uring queues
  */
@@ -926,7 +926,8 @@ struct fuse_init_in {
 #define FUSE_COMPAT_22_INIT_OUT_SIZE 24
 
 /*
- * align_page_order: Number of pages for optimal IO, or a multiple of that
+ * align_page_order: log2 of the optimal IO size in bytes; IO is optimal
+ * when sized and aligned to (1 << align_page_order) or a multiple of it
  */
 struct fuse_init_out {
 	uint32_t	major;
