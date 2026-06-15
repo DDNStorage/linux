@@ -184,6 +184,68 @@ out:
 	return ret;
 }
 
+static ssize_t fuse_conn_writethrough_threshold_read(struct file *file,
+						     char __user *buf,
+						     size_t len, loff_t *ppos)
+{
+	struct fuse_conn *fc;
+	unsigned val;
+
+	fc = fuse_ctl_file_conn_get(file);
+	if (!fc)
+		return 0;
+
+	val = READ_ONCE(fc->writethrough_threshold);
+	fuse_conn_put(fc);
+
+	return fuse_conn_limit_read(file, buf, len, ppos, val);
+}
+
+static ssize_t fuse_conn_writethrough_threshold_write(struct file *file,
+						      const char __user *buf,
+						      size_t count, loff_t *ppos)
+{
+	struct fuse_conn *fc;
+	char kbuf[32];
+	unsigned long long val;
+	char *end;
+
+	if (*ppos)
+		return -EINVAL;
+	if (count == 0 || count >= sizeof(kbuf))
+		return -EINVAL;
+	if (copy_from_user(kbuf, buf, count))
+		return -EFAULT;
+	kbuf[count] = '\0';
+
+	/* memparse accepts a bare suffix without a digit; require a digit */
+	if (kbuf[0] < '0' || kbuf[0] > '9')
+		return -EINVAL;
+
+	val = memparse(kbuf, &end);
+	end = skip_spaces(end);
+	if (*end)
+		return -EINVAL;
+	if (val > UINT_MAX)
+		return -EINVAL;
+
+	fc = fuse_ctl_file_conn_get(file);
+	if (!fc)
+		return -ENOENT;
+
+	WRITE_ONCE(fc->writethrough_threshold, (unsigned int)val);
+	fuse_conn_put(fc);
+
+	return count;
+}
+
+static const struct file_operations fuse_conn_writethrough_threshold_ops = {
+	.open = nonseekable_open,
+	.read = fuse_conn_writethrough_threshold_read,
+	.write = fuse_conn_writethrough_threshold_write,
+	.llseek = no_llseek,
+};
+
 static const struct file_operations fuse_ctl_abort_ops = {
 	.open = nonseekable_open,
 	.write = fuse_conn_abort_write,
@@ -278,7 +340,10 @@ int fuse_ctl_add_conn(struct fuse_conn *fc)
 				 1, NULL, &fuse_conn_max_background_ops) ||
 	    !fuse_ctl_add_dentry(parent, fc, "congestion_threshold",
 				 S_IFREG | 0600, 1, NULL,
-				 &fuse_conn_congestion_threshold_ops))
+				 &fuse_conn_congestion_threshold_ops) ||
+	    !fuse_ctl_add_dentry(parent, fc, "writethrough_threshold",
+				 S_IFREG | 0600, 1, NULL,
+				 &fuse_conn_writethrough_threshold_ops))
 		goto err;
 
 	return 0;

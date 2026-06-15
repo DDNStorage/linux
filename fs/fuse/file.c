@@ -1483,6 +1483,7 @@ static bool fuse_use_writeback_cache(struct fuse_conn *fc, struct kiocb *iocb,
 				     struct iov_iter *from)
 {
 	size_t count = iov_iter_count(from);
+	unsigned int wt;
 	u64 align;
 	bool ret;
 
@@ -1492,6 +1493,10 @@ static bool fuse_use_writeback_cache(struct fuse_conn *fc, struct kiocb *iocb,
 	/* these rely on the semantics of their current paths */
 	if (iocb->ki_flags & (IOCB_DIRECT | IOCB_APPEND | IOCB_NOWAIT))
 		return true;
+
+	wt = READ_ONCE(fc->writethrough_threshold);
+	if (wt && count >= wt)
+		return false;
 
 	align = fc->alignment_pages ?
 		(u64)fc->alignment_pages << PAGE_SHIFT : PAGE_SIZE;
