@@ -1464,6 +1464,42 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
 	}
 }
 
+
+/*
+ * With writeback caching the request size seen by the server depends on
+ * how many contiguous dirty pages the flusher finds, which is bounded by
+ * dirty throttling: with BDI_CAP_STRICTLIMIT the dirty window can degrade
+ * to a single page under streaming writes, turning large application
+ * writes into page-sized requests.
+ *
+ * Writes that already match the server's preferred alignment gain
+ * nothing from accumulating in the page cache, so send them through
+ * fuse_perform_write() instead, which packs requests up to max_write.
+ * They create no dirty pages, hence no DLM write lock needs to be cached
+ * for them.  Unaligned writes keep using the writeback cache, where they
+ * can merge with neighbouring data.
+ */
+static bool fuse_use_writeback_cache(struct fuse_conn *fc, struct kiocb *iocb,
+				     struct iov_iter *from)
+{
+	size_t count = iov_iter_count(from);
+	u64 align;
+	bool ret;
+
+	if (!fc->big_writes)
+		return true;
+
+	/* these rely on the semantics of their current paths */
+	if (iocb->ki_flags & (IOCB_DIRECT | IOCB_APPEND | IOCB_NOWAIT))
+		return true;
+
+	align = fc->alignment_pages ?
+		(u64)fc->alignment_pages << PAGE_SHIFT : PAGE_SIZE;
+
+	ret = !IS_ALIGNED(iocb->ki_pos, align) || !IS_ALIGNED((u64)count, align);
+	return ret;
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1485,6 +1521,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 						file_inode(file))) {
 			goto writethrough;
 		}
+
+		if (!fuse_use_writeback_cache(fc, iocb, from))
+			goto writethrough;
 
 		/* if we have dlm support acquire the lock for the area
 		 * we are writing into */
