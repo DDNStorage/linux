@@ -1681,6 +1681,16 @@ static ssize_t fuse_writeback_write_iter(struct kiocb *iocb,
 
 retry:
 	/*
+	 * Reset before each iomap call so retry_needed only reflects what
+	 * happened in the most recent call.  iomap may set retry_needed
+	 * during an internal iteration that then recovers and completes
+	 * the write fully; without the reset the flag would survive into
+	 * the next iteration with iov_iter already drained, and iomap
+	 * would re-enter with len==0 and livelock on a 0-length mapping.
+	 */
+	retry_state.retry_needed = false;
+
+	/*
 	 * Use iomap so that we can do granular uptodate reads
 	 * and granular dirty tracking for large folios.
 	 */
@@ -1702,10 +1712,8 @@ retry:
 	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE
 	 * retry support.
 	 */
-	if (retry_state.retry_needed) {
-		retry_state.retry_needed = false;
+	if (retry_state.retry_needed && iov_iter_count(from))
 		goto retry;
-	}
 
 	/* Remove from xarray now that we're done */
 	xa_erase(&fc->dlm_retry_tasks, task_key);
