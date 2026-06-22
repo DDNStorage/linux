@@ -3550,6 +3550,20 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
 
-	if (enable_large_folios)
-		mapping_set_large_folios(inode->i_mapping);
+	if (enable_large_folios) {
+		/*
+		 * Readahead and writeback batch whole folios into a single
+		 * request, capped at min(fc->max_pages, fc->max_read/PAGE_SIZE)
+		 * pages.  The page cache must therefore never build a folio
+		 * larger than that, or fuse_readahead() trips WARN_ON(!pages)
+		 * and then dereferences a NULL ap->folios[0] in
+		 * fuse_send_readpages().  Bound the folio order to the request
+		 * limit instead of MAX_PAGECACHE_ORDER.
+		 */
+		unsigned int max_pages = min(fc->max_pages,
+					     fc->max_read >> PAGE_SHIFT);
+
+		mapping_set_folio_order_range(inode->i_mapping, 0,
+					      ilog2(max_pages ?: 1));
+	}
 }
