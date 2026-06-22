@@ -47,7 +47,7 @@
 #define FUSE_NAME_MAX (PATH_MAX - 1)
 
 /** Number of dentries for each connection in the control filesystem */
-#define FUSE_CTL_NUM_DENTRIES 5
+#define FUSE_CTL_NUM_DENTRIES 6
 
 /* Frequency (in seconds) of request timeout checks, if opted into */
 #define FUSE_TIMEOUT_TIMER_FREQ 15
@@ -1044,6 +1044,9 @@ struct fuse_conn {
 
 	/* The foffset alignment in PAGE */
 	unsigned int alignment_pages;
+
+	/* Buffered writes >= this size bypass the writeback cache (0 = off) */
+	unsigned int writethrough_threshold;
 
 	/**
 	 * XArray tracking tasks that need DLM retry.
