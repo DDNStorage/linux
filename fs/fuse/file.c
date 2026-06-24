@@ -1709,6 +1709,33 @@ static bool fuse_use_writeback_cache(struct fuse_conn *fc, struct kiocb *iocb,
 	return ret;
 }
 
+/*
+ * @return true if an exclusive lock is needed for a cached (buffered) write.
+ */
+static bool fuse_cache_wr_exclusive_lock(struct kiocb *iocb, bool cache_mode)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	/*
+	 * Without the DLM the inode rwsem is the only writer exclusion, and
+	 * outside writeback-cache mode the write is covered by neither the DLM
+	 * write lock nor the synchronous-server path described above.
+	 */
+	if (!fc->dlm || !cache_mode)
+		return true;
+
+	/* O_DIRECT writes fall back to generic_file_direct_write(). */
+	if (iocb->ki_flags & IOCB_DIRECT)
+		return true;
+
+	/* Append needs the eventual EOF - always needs an exclusive lock. */
+	if (iocb->ki_flags & IOCB_APPEND)
+		return true;
+
+	return false;
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1718,7 +1745,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = mapping->host;
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	bool writeback = false;
+	bool cache_mode = false;
+	bool exclusive;
 
 	if (fc->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1727,9 +1757,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (err)
 			return err;
 
-		if ((!fc->handle_killpriv_v2 ||
-		     !setattr_should_drop_suidgid(idmap, file_inode(file))) &&
-		    fuse_use_writeback_cache(fc, iocb, from)) {
+		cache_mode = !fc->handle_killpriv_v2 ||
+			     !setattr_should_drop_suidgid(idmap, file_inode(file));
+
+		if (cache_mode && fuse_use_writeback_cache(fc, iocb, from)) {
 			writeback = true;
 
 			/*
@@ -1757,7 +1788,12 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 	}
 
-	inode_lock(inode);
+	exclusive = fuse_cache_wr_exclusive_lock(iocb, cache_mode);
+	if (exclusive) {
+		inode_lock(inode);
+	} else {
+		inode_lock_shared(inode);
+	}
 
 	err = count = generic_write_checks(iocb, from);
 	if (err <= 0)
@@ -1776,7 +1812,51 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = direct_write_fallback(iocb, from, written,
 						fuse_perform_write(iocb, from));
 	} else if (writeback) {
+		loff_t pos = iocb->ki_pos;
+		loff_t end = pos + count;
+		loff_t orig_size = 0;
+		bool extended = false;
+
+		if (fc->dlm && !exclusive && end > i_size_read(inode)) {
+			/*
+			 * Lockless pre-check above keeps in-bounds writes off
+			 * fi->lock; under the shared inode lock i_size only grows
+			 * (extenders take fi->lock, truncate is excluded), so a
+			 * stale read can only over-trigger this slow path, never
+			 * miss an extension.  Re-check authoritatively here.
+			 */
+			spin_lock(&fi->lock);
+			orig_size = i_size_read(inode);
+			if (end > orig_size) {
+				i_size_write(inode, end);
+				extended = true;
+			}
+			spin_unlock(&fi->lock);
+
+			/* Zero the tail of the folio straddling the old EOF. */
+			if (extended && orig_size < pos)
+				pagecache_isize_extended(inode, orig_size, pos);
+		}
+
 		written = fuse_writeback_write_iter(iocb, from, file);
+
+		/*
+		 * Reconcile the speculative extension with what was actually
+		 * written.  Only retract the tail if no concurrent extender has
+		 * pushed i_size past our claim; otherwise [reached, end) is a
+		 * legitimate hole inside their extension and must remain.
+		 */
+		if (extended) {
+			loff_t reached = written > 0 ? pos + written : orig_size;
+
+			if (reached < end) {
+				spin_lock(&fi->lock);
+				if (i_size_read(inode) == end)
+					i_size_write(inode, reached);
+				spin_unlock(&fi->lock);
+			}
+		}
+
 		if (written < 0) {
 			err = written;
 			goto out;
@@ -1785,7 +1865,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = fuse_perform_write(iocb, from);
 	}
 out:
-	inode_unlock(inode);
+	if (exclusive)
+		inode_unlock(inode);
+	else
+		inode_unlock_shared(inode);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
 
