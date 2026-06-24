@@ -1709,6 +1709,52 @@ static bool fuse_use_writeback_cache(struct fuse_conn *fc, struct kiocb *iocb,
 	return ret;
 }
 
+/*
+ * @return true if an exclusive lock is needed for a cached (buffered) write.
+ *
+ * Buffered writes normally take the inode lock exclusively, serialising every
+ * writer to the same inode even when they target disjoint regions.  When the
+ * connection uses the DLM (fc->dlm) and the write goes through the iomap
+ * writeback path, fuse_get_dlm_write_lock() has already acquired a DLM write
+ * lock for the byte range being written.  The DLM is then the authority that
+ * serialises writers across the cluster, so the inode rwsem no longer has to
+ * provide that exclusion - it only needs to keep i_size and the file-modified
+ * bookkeeping stable.  Such writes may therefore share the inode lock, letting
+ * multiple writers to disjoint regions of one file proceed concurrently
+ * (e.g. MPI-IO / IOR shared-file workloads).
+ *
+ * This is only valid for writes that neither append nor extend i_size: those
+ * still need an exclusive lock to update i_size safely.
+ */
+static bool fuse_cache_wr_exclusive_lock(struct kiocb *iocb,
+					 struct iov_iter *from, bool writeback)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	/*
+	 * Only safe when the DLM holds the write lock for the range, which is
+	 * exactly the fc->dlm + iomap writeback path (see fuse_get_dlm_write_lock()
+	 * above).  Without the DLM the inode rwsem is the only writer exclusion.
+	 */
+	if (!fc->dlm || !writeback)
+		return true;
+
+	/* O_DIRECT writes fall back to generic_file_direct_write(). */
+	if (iocb->ki_flags & IOCB_DIRECT)
+		return true;
+
+	/* Append needs the eventual EOF - always needs an exclusive lock. */
+	if (iocb->ki_flags & IOCB_APPEND)
+		return true;
+
+	/* Extending i_size needs serialisation against other writers. */
+	if (fuse_io_past_eof(iocb, from))
+		return true;
+
+	return false;
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1719,6 +1765,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool writeback = false;
+	bool exclusive;
 
 	if (fc->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -1757,7 +1804,25 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 	}
 
-	inode_lock(inode);
+	exclusive = fuse_cache_wr_exclusive_lock(iocb, from, writeback);
+	if (exclusive) {
+		inode_lock(inode);
+	} else {
+		inode_lock_shared(inode);
+		/*
+		 * i_size was sampled without the lock; a racing write may have
+		 * extended the file.  Re-check under the lock and escalate to
+		 * exclusive if this write now reaches past EOF.  While the
+		 * shared lock is held no one can extend i_size (extending
+		 * writes take the lock exclusively), so it stays stable for the
+		 * duration of the write.
+		 */
+		if (fuse_io_past_eof(iocb, from)) {
+			inode_unlock_shared(inode);
+			inode_lock(inode);
+			exclusive = true;
+		}
+	}
 
 	err = count = generic_write_checks(iocb, from);
 	if (err <= 0)
@@ -1785,7 +1850,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = fuse_perform_write(iocb, from);
 	}
 out:
-	inode_unlock(inode);
+	if (exclusive)
+		inode_unlock(inode);
+	else
+		inode_unlock_shared(inode);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
 
