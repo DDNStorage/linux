@@ -257,6 +257,13 @@ enum {
 	FUSE_I_BTIME,
 	/* Wants or already has page cache IO */
 	FUSE_I_CACHE_IO_MODE,
+	/*
+	 * Latched into direct IO because several entities have the file open
+	 * and were contending on the exclusive inode lock of the cached write
+	 * path.  Reads and writes are routed direct (shared-lock parallel dio)
+	 * until the last writer closes.  See fuse_open()/fuse_file_io_open().
+	 */
+	FUSE_I_FORCE_DIO,
 };
 
 struct fuse_conn;
@@ -1048,6 +1055,18 @@ struct fuse_conn {
 	/* Buffered writes >= this size bypass the writeback cache (0 = off) */
 	unsigned int writethrough_threshold;
 
+	/*
+	 * Latch an inode into direct IO once it is open for writing by enough
+	 * entities to contend on the exclusive inode lock in the cached write
+	 * path.  The value is the number of *other* writers that must already
+	 * hold the inode before the latch trips: 0 forces DIO on the first
+	 * writer, 1 on the second (i.e. as soon as a second writer appears --
+	 * the historic on/off behaviour), N on the (N+1)th.  -1 disables the
+	 * feature.  Requires the server to tolerate concurrent direct writes
+	 * (as cluster/parallel filesystems do).
+	 */
+	int force_dio_on_contention;
+
 	/**
 	 * XArray tracking tasks that need DLM retry.
 	 * Maps task pointer -> struct fuse_dlm_retry.
@@ -1602,6 +1621,35 @@ void fuse_inode_uncached_io_end(struct fuse_inode *fi);
 
 int fuse_file_io_open(struct file *file, struct inode *inode);
 void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
+
+/* Inode latched into forced direct IO due to multi-opener lock contention */
+static inline bool fuse_inode_force_dio(struct inode *inode)
+{
+	return test_bit(FUSE_I_FORCE_DIO, &get_fuse_inode(inode)->state);
+}
+
+/*
+ * True when the inode is contended enough to force direct IO: at least
+ * @threshold writers are already linked on write_files, besides the opener or
+ * remote modifier that prompted the check.  @threshold is fc->force_dio_on_-
+ * contention: 0 trips on the first writer, 1 on the second, N on the (N+1)th,
+ * and a negative value disables the feature.  Must be called with fi->lock held.
+ */
+static inline bool fuse_writers_contended(struct fuse_inode *fi, int threshold)
+{
+	struct fuse_file *ff;
+	int count = 0;
+
+	if (threshold < 0)
+		return false;
+
+	list_for_each_entry(ff, &fi->write_files, write_entry) {
+		if (count >= threshold)
+			return true;
+		count++;
+	}
+	return count >= threshold;
+}
 
 /* file.c */
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,

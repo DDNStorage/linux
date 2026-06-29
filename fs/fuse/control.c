@@ -264,6 +264,64 @@ static const struct file_operations fuse_conn_writethrough_threshold_ops = {
 	.write = fuse_conn_writethrough_threshold_write,
 };
 
+static ssize_t fuse_conn_force_dio_on_contention_read(struct file *file,
+						      char __user *buf,
+						      size_t len, loff_t *ppos)
+{
+	struct fuse_conn *fc;
+	char tmp[32];
+	size_t size;
+	int val;
+
+	fc = fuse_ctl_file_conn_get(file);
+	if (!fc)
+		return 0;
+
+	val = READ_ONCE(fc->force_dio_on_contention);
+	fuse_conn_put(fc);
+
+	size = sprintf(tmp, "%d\n", val);
+	return simple_read_from_buffer(buf, len, ppos, tmp, size);
+}
+
+static ssize_t fuse_conn_force_dio_on_contention_write(struct file *file,
+						       const char __user *buf,
+						       size_t count, loff_t *ppos)
+{
+	struct fuse_conn *fc;
+	int val;
+	int err;
+
+	if (*ppos)
+		return -EINVAL;
+
+	/*
+	 * -1 disables; otherwise the number of other writers that must already
+	 * hold the inode before it is latched into direct IO (0 = first writer,
+	 * 1 = second writer, ...).
+	 */
+	err = kstrtoint_from_user(buf, count, 0, &val);
+	if (err)
+		return err;
+	if (val < -1)
+		return -EINVAL;
+
+	fc = fuse_ctl_file_conn_get(file);
+	if (!fc)
+		return -ENOENT;
+
+	WRITE_ONCE(fc->force_dio_on_contention, val);
+	fuse_conn_put(fc);
+
+	return count;
+}
+
+static const struct file_operations fuse_conn_force_dio_on_contention_ops = {
+	.open = nonseekable_open,
+	.read = fuse_conn_force_dio_on_contention_read,
+	.write = fuse_conn_force_dio_on_contention_write,
+};
+
 static struct dentry *fuse_ctl_add_dentry(struct dentry *parent,
 					  struct fuse_conn *fc,
 					  const char *name, int mode,
@@ -333,7 +391,10 @@ int fuse_ctl_add_conn(struct fuse_conn *fc)
 				 &fuse_conn_congestion_threshold_ops) ||
 	    !fuse_ctl_add_dentry(parent, fc, "writethrough_threshold",
 				 S_IFREG | 0600, NULL,
-				 &fuse_conn_writethrough_threshold_ops))
+				 &fuse_conn_writethrough_threshold_ops) ||
+	    !fuse_ctl_add_dentry(parent, fc, "force_dio_on_contention",
+				 S_IFREG | 0600, NULL,
+				 &fuse_conn_force_dio_on_contention_ops))
 		goto err;
 
 	return 0;

@@ -1203,6 +1203,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	atomic_set(&fc->num_waiting, 0);
 	fc->max_background = FUSE_DEFAULT_MAX_BACKGROUND;
 	fc->congestion_threshold = FUSE_DEFAULT_CONGESTION_THRESHOLD;
+	fc->force_dio_on_contention = -1;	/* disabled by default */
 	atomic64_set(&fc->khctr, 0);
 	fc->polled_files = RB_ROOT;
 	fc->blocked = 0;

@@ -350,6 +350,8 @@ static int fuse_open(struct inode *inode, struct file *file)
 	bool is_truncate = (file->f_flags & O_TRUNC) && fc->atomic_o_trunc;
 	bool is_wb_truncate = is_truncate && fc->writeback_cache;
 	bool dax_truncate = is_truncate && FUSE_IS_DAX(inode);
+	bool force_dio = false;
+	int dio_threshold = READ_ONCE(fc->force_dio_on_contention);
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -358,7 +360,26 @@ static int fuse_open(struct inode *inode, struct file *file)
 	if (err)
 		return err;
 
-	if (is_wb_truncate || dax_truncate)
+	/*
+	 * If this file is opened for writing while another writer already has
+	 * the inode open, the cached write path (fuse_cache_write_iter())
+	 * serializes them on the exclusive inode lock.  Latch the inode into
+	 * direct IO so writes use the shared-lock parallel dio path instead.
+	 * The page cache is flushed and dropped below (fuse_launder_folio()
+	 * writes back dirty folios during the invalidate), making the switch
+	 * coherent.  Disabled for DAX, passthrough/backing and mmapped inodes,
+	 * which cannot bypass the page cache.
+	 */
+	if (dio_threshold >= 0 &&
+	    (file->f_mode & FMODE_WRITE) && fc->writeback_cache &&
+	    !FUSE_IS_DAX(inode) && !fuse_inode_backing(fi) &&
+	    !mapping_mapped(inode->i_mapping)) {
+		spin_lock(&fi->lock);
+		force_dio = fuse_writers_contended(fi, dio_threshold);
+		spin_unlock(&fi->lock);
+	}
+
+	if (is_wb_truncate || dax_truncate || force_dio)
 		inode_lock(inode);
 
 	if (dax_truncate) {
@@ -368,7 +389,7 @@ static int fuse_open(struct inode *inode, struct file *file)
 			goto out_inode_unlock;
 	}
 
-	if (is_wb_truncate || dax_truncate)
+	if (is_wb_truncate || dax_truncate || force_dio)
 		fuse_set_nowrite(inode);
 
 	err = fuse_do_open(fm, get_node_id(inode), file, false);
@@ -381,18 +402,28 @@ static int fuse_open(struct inode *inode, struct file *file)
 			fuse_truncate_update_attr(inode, file);
 	}
 
-	if (is_wb_truncate || dax_truncate)
+	if (is_wb_truncate || dax_truncate || force_dio)
 		fuse_release_nowrite(inode);
 	if (!err) {
 		if (is_truncate)
 			truncate_pagecache(inode, 0);
-		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+		else if (force_dio && !fuse_inode_backing(fi) &&
+			 !mapping_mapped(inode->i_mapping)) {
+			/*
+			 * Latch direct IO and drop the page cache regardless of
+			 * FOPEN_KEEP_CACHE.  Still under inode_lock, so any other
+			 * writer is blocked in fuse_cache_write_iter() and will
+			 * observe the latch when it proceeds.
+			 */
+			set_bit(FUSE_I_FORCE_DIO, &fi->state);
+			invalidate_inode_pages2(inode->i_mapping);
+		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
 			invalidate_inode_pages2(inode->i_mapping);
 	}
 	if (dax_truncate)
 		filemap_invalidate_unlock(inode->i_mapping);
 out_inode_unlock:
-	if (is_wb_truncate || dax_truncate)
+	if (is_wb_truncate || dax_truncate || force_dio)
 		inode_unlock(inode);
 
 	return err;
@@ -411,6 +442,17 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	if (likely(fi)) {
 		spin_lock(&fi->lock);
 		list_del(&ff->write_entry);
+		/*
+		 * Leave forced direct IO mode once the last writer is gone;
+		 * a lone (or no) writer no longer contends on the inode lock.
+		 * Restore FUSE_I_CACHE_IO_MODE for any frozen cached opens.
+		 */
+		if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
+		    list_empty(&fi->write_files)) {
+			clear_bit(FUSE_I_FORCE_DIO, &fi->state);
+			if (fi->iocachectr > 0)
+				set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
+		}
 		spin_unlock(&fi->lock);
 	}
 	spin_lock(&fc->lock);
@@ -1513,9 +1555,15 @@ static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool force_dio = test_bit(FUSE_I_FORCE_DIO, &fi->state);
 
-	/* Server side has to advise that it supports parallel dio writes. */
-	if (!(ff->open_flags & FOPEN_PARALLEL_DIRECT_WRITES))
+	/*
+	 * Server side has to advise that it supports parallel dio writes.
+	 * When the inode is latched into forced direct IO due to multi-opener
+	 * contention, parallel writes are used unconditionally: the page cache
+	 * has been flushed and is bypassed for this inode.
+	 */
+	if (!force_dio && !(ff->open_flags & FOPEN_PARALLEL_DIRECT_WRITES))
 		return true;
 
 	/*
@@ -1526,7 +1574,7 @@ static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from
 		return true;
 
 	/* shared locks are not allowed with parallel page cache IO */
-	if (test_bit(FUSE_I_CACHE_IO_MODE, &fi->state))
+	if (!force_dio && test_bit(FUSE_I_CACHE_IO_MODE, &fi->state))
 		return true;
 
 	/* Parallel dio beyond EOF is not supported, at least for now. */
@@ -1553,9 +1601,16 @@ static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
 		 * should be performed only after taking shared inode lock.
 		 * Previous past eof check was without inode lock and might
 		 * have raced, so check it again.
+		 *
+		 * Under the forced-dio latch the cached/uncached accounting is
+		 * bypassed (the latch already guarantees the cache is flushed
+		 * and not repopulated), so just take the shared lock, only
+		 * re-checking the past-eof condition.  The latch is stable
+		 * while the shared lock is held, keeping start/end balanced.
 		 */
 		if (fuse_io_past_eof(iocb, from) ||
-		    fuse_inode_uncached_io_start(fi, NULL) != 0) {
+		    (!test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
+		     fuse_inode_uncached_io_start(fi, NULL) != 0)) {
 			inode_unlock_shared(inode);
 			inode_lock(inode);
 			*exclusive = true;
@@ -1571,8 +1626,13 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
 	if (exclusive) {
 		inode_unlock(inode);
 	} else {
-		/* Allow opens in caching mode after last parallel dio end */
-		fuse_inode_uncached_io_end(fi);
+		/*
+		 * Allow opens in caching mode after last parallel dio end.
+		 * Skipped under the forced-dio latch, which never took an
+		 * uncached_io reference in fuse_dio_lock().
+		 */
+		if (!test_bit(FUSE_I_FORCE_DIO, &fi->state))
+			fuse_inode_uncached_io_end(fi);
 		inode_unlock_shared(inode);
 	}
 }
@@ -1709,6 +1769,8 @@ static bool fuse_use_writeback_cache(struct fuse_conn *fc, struct kiocb *iocb,
 	return ret;
 }
 
+static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from);
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1719,6 +1781,15 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool writeback = false;
+
+	/*
+	 * The inode may have been latched into forced direct IO after this
+	 * write was routed here but before it acquired any lock.  Re-route to
+	 * the direct path (before taking a DLM lock) so we do not repopulate
+	 * the page cache that the latch just dropped.
+	 */
+	if (fuse_inode_force_dio(inode))
+		return fuse_direct_write_iter(iocb, from);
 
 	if (fc->writeback_cache) {
 		/* Update size (EOF optimization) and mode (SUID clearing) */
@@ -2086,7 +2157,7 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return fuse_dax_read_iter(iocb, to);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if (ff->open_flags & FOPEN_DIRECT_IO)
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
 		return fuse_direct_read_iter(iocb, to);
 	else if (fuse_file_passthrough(ff))
 		return fuse_passthrough_read_iter(iocb, to);
@@ -2107,7 +2178,7 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		return fuse_dax_write_iter(iocb, from);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if (ff->open_flags & FOPEN_DIRECT_IO)
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
 		return fuse_direct_write_iter(iocb, from);
 	else if (fuse_file_passthrough(ff))
 		return fuse_passthrough_write_iter(iocb, from);
@@ -2727,6 +2798,27 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 		return fuse_passthrough_mmap(file, vma);
 	else if (fuse_inode_backing(get_fuse_inode(inode)))
 		return -ENODEV;
+
+	/*
+	 * If the inode was latched into forced direct IO due to multi-opener
+	 * contention, a mapping needs the page cache, so revert to caching
+	 * mode.  The exclusive inode lock drains in-flight parallel (shared
+	 * lock) dio writes before the page cache is reused.  Cached opens that
+	 * were frozen while latched are still counted in iocachectr, so restore
+	 * FUSE_I_CACHE_IO_MODE for them.
+	 */
+	if (fuse_inode_force_dio(inode)) {
+		struct fuse_inode *fi = get_fuse_inode(inode);
+
+		inode_lock(inode);
+		spin_lock(&fi->lock);
+		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
+		if (fi->iocachectr > 0)
+			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
+		spin_unlock(&fi->lock);
+		invalidate_inode_pages2(file->f_mapping);
+		inode_unlock(inode);
+	}
 
 	/*
 	 * FOPEN_DIRECT_IO handling is special compared to O_DIRECT,
