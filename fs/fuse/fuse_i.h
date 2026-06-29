@@ -186,6 +186,23 @@ struct fuse_inode {
 
 			/* dlm locked areas we have sent lock requests for */
 			struct fuse_dlm_cache dlm_locked_areas;
+
+			/*
+			 * Serializes buffered-write page-cache dirtying against
+			 * the forced-direct-IO latch transitions that cannot
+			 * take the inode lock -- most importantly
+			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
+			 * may be delivered by the same server thread that still
+			 * owes a reply to an in-flight write holding the inode
+			 * lock.  The buffered writer holds this for read around
+			 * the dirtying and re-checks the latch under it; the
+			 * latch set/clear sites hold it for write around their
+			 * page-cache invalidate + latch update.  The writer's
+			 * read-side section must stay free of server round-trips
+			 * (under fc->dlm the partial-write RMW read is skipped),
+			 * or the down_write() could wait on the server.
+			 */
+			struct rw_semaphore wb_inval_rwsem;
 		};
 
 		/* readdir cache (directory only) */

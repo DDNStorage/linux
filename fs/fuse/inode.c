@@ -764,6 +764,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	struct inode *inode;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
+	int dio_threshold;
 
 	inode = fuse_ilookup(fc, nodeid, NULL);
 	if (!inode)
@@ -806,8 +807,49 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 								pg_end == -1 ? 0 :
 								(offset + len - 1));
 
-		invalidate_inode_pages2_range(inode->i_mapping,
-					      pg_start, pg_end);
+		/*
+		 * A data invalidation means another (remote) entity is modifying
+		 * the file.  If it is also open for writing here, latch the inode
+		 * into direct IO (when enabled), as for the open-time multi-writer
+		 * case.  Take wb_inval_rwsem for write so the buffered write path
+		 * -- which holds it for read across its dirtying and re-checks the
+		 * latch under it -- cannot strand dirty folios after the cache is
+		 * dropped.  Use a trylock and never block: this may run on the
+		 * server thread that still owes an in-flight write (holding the
+		 * inode lock) its reply, so blocking on the rwsem (or the inode
+		 * lock) would deadlock.  If a writer is active, skip the latch
+		 * this round (best effort); the invalidate still runs.  Only
+		 * regular files initialise the rwsem (it shares storage with the
+		 * readdir-cache union arm), so gate on S_ISREG.  The latch is
+		 * whole-inode, so when set drop the whole mapping rather than just
+		 * the notified range, or dirty folios outside it would be invisible
+		 * to the forced direct reads (stale read / lost write).
+		 */
+		dio_threshold = READ_ONCE(fc->force_dio_on_contention);
+
+		if (S_ISREG(inode->i_mode) && dio_threshold >= 0 &&
+		    fc->writeback_cache && !FUSE_IS_DAX(inode) &&
+		    !fuse_inode_backing(fi) && !mapping_mapped(inode->i_mapping) &&
+		    down_write_trylock(&fi->wb_inval_rwsem)) {
+			bool latched = false;
+
+			spin_lock(&fi->lock);
+			if (fuse_writers_contended(fi, dio_threshold)) {
+				set_bit(FUSE_I_FORCE_DIO, &fi->state);
+				latched = true;
+			}
+			spin_unlock(&fi->lock);
+
+			if (latched)
+				invalidate_inode_pages2(inode->i_mapping);
+			else
+				invalidate_inode_pages2_range(inode->i_mapping,
+							      pg_start, pg_end);
+			up_write(&fi->wb_inval_rwsem);
+		} else {
+			invalidate_inode_pages2_range(inode->i_mapping,
+						      pg_start, pg_end);
+		}
 	}
 	iput(inode);
 	return 0;

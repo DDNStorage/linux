@@ -405,19 +405,24 @@ static int fuse_open(struct inode *inode, struct file *file)
 	if (is_wb_truncate || dax_truncate || force_dio)
 		fuse_release_nowrite(inode);
 	if (!err) {
+		/*
+		 * Latch into forced direct IO whenever a second writer is
+		 * contending, independently of the O_TRUNC page-cache handling
+		 * below -- an O_TRUNC multi-writer open must switch to direct IO
+		 * too.  Drop the page cache regardless of FOPEN_KEEP_CACHE.
+		 * Still under inode_lock, so a writer contending in
+		 * fuse_cache_write_iter() re-checks the latch after it acquires
+		 * the inode lock and re-routes to direct IO instead of
+		 * repopulating the cache dropped here.
+		 */
+		bool latch = force_dio && !fuse_inode_backing(fi) &&
+			     !mapping_mapped(inode->i_mapping);
+
+		if (latch)
+			set_bit(FUSE_I_FORCE_DIO, &fi->state);
 		if (is_truncate)
 			truncate_pagecache(inode, 0);
-		else if (force_dio && !fuse_inode_backing(fi) &&
-			 !mapping_mapped(inode->i_mapping)) {
-			/*
-			 * Latch direct IO and drop the page cache regardless of
-			 * FOPEN_KEEP_CACHE.  Still under inode_lock, so any other
-			 * writer is blocked in fuse_cache_write_iter() and will
-			 * observe the latch when it proceeds.
-			 */
-			set_bit(FUSE_I_FORCE_DIO, &fi->state);
-			invalidate_inode_pages2(inode->i_mapping);
-		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+		else if (latch || !(ff->open_flags & FOPEN_KEEP_CACHE))
 			invalidate_inode_pages2(inode->i_mapping);
 	}
 	if (dax_truncate)
@@ -491,8 +496,24 @@ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_release_args *ra = &ff->args->release_args;
 	int opcode = isdir ? FUSE_RELEASEDIR : FUSE_RELEASE;
+	bool was_force_dio = test_bit(FUSE_I_FORCE_DIO, &fi->state);
 
 	fuse_prepare_release(fi, ff, open_flags, opcode, false);
+
+	/*
+	 * If this release dropped the last writer, fuse_prepare_release()
+	 * cleared the forced-direct-IO latch (under fi->lock).  Drop any clean
+	 * folios a read racing the latch may have repopulated, so they cannot
+	 * be served stale once caching mode resumes.  No inode lock or
+	 * wb_inval_rwsem: release may run on the fuse server thread (async
+	 * fput from aio completion), where blocking on a contended inode lock
+	 * could stall the connection.  Writes were routed direct while
+	 * latched, so only clean folios exist and this invalidate is
+	 * server-free; the last writer is gone, so no forced-dio writer can
+	 * race the drop.
+	 */
+	if (was_force_dio && !test_bit(FUSE_I_FORCE_DIO, &fi->state))
+		invalidate_inode_pages2(inode->i_mapping);
 
 	if (ra && ff->flock) {
 		ra->inarg.release_flags |= FUSE_RELEASE_FLOCK_UNLOCK;
@@ -1778,9 +1799,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct address_space *mapping = file->f_mapping;
 	ssize_t written = 0;
 	struct inode *inode = mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool writeback = false;
+	bool wb_guard = false;
 
 	/*
 	 * The inode may have been latched into forced direct IO after this
@@ -1830,6 +1853,39 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	inode_lock(inode);
 
+	/*
+	 * The forced-direct-IO latch may have been set by a second writer's
+	 * open() while we blocked acquiring the inode lock (fuse_open() holds
+	 * it across the latch + page-cache invalidate).  Re-check now that we
+	 * hold the lock and re-route to the direct path rather than repopulate
+	 * the just-dropped cache.  The DLM write-lock notification issued above
+	 * is harmless: the direct path performs its own server coordination.
+	 */
+	if (fuse_inode_force_dio(inode)) {
+		inode_unlock(inode);
+		return fuse_direct_write_iter(iocb, from);
+	}
+
+	/*
+	 * When force_dio_on_contention is enabled, hold wb_inval_rwsem for
+	 * read across the page-cache dirtying so a concurrent
+	 * NOTIFY_INVAL_INODE -- which latches the inode into direct IO under
+	 * the write side of this lock (via trylock) -- cannot strand the
+	 * folios we are about to write.  Re-check the latch under it and
+	 * re-route to the direct path if set.  Gated on the knob so writeback
+	 * mounts without the feature never touch the rwsem, and taken before
+	 * task_io_account_write() so a re-route is not double-counted.
+	 */
+	wb_guard = READ_ONCE(fc->force_dio_on_contention) >= 0;
+	if (wb_guard) {
+		down_read(&fi->wb_inval_rwsem);
+		if (fuse_inode_force_dio(inode)) {
+			up_read(&fi->wb_inval_rwsem);
+			inode_unlock(inode);
+			return fuse_direct_write_iter(iocb, from);
+		}
+	}
+
 	err = count = generic_write_checks(iocb, from);
 	if (err <= 0)
 		goto out;
@@ -1856,6 +1912,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = fuse_perform_write(iocb, from);
 	}
 out:
+	if (wb_guard)
+		up_read(&fi->wb_inval_rwsem);
 	inode_unlock(inode);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
@@ -2810,14 +2868,21 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	if (fuse_inode_force_dio(inode)) {
 		struct fuse_inode *fi = get_fuse_inode(inode);
 
-		inode_lock(inode);
+		/*
+		 * Revert without the inode lock or wb_inval_rwsem: ->mmap runs
+		 * under mmap_lock, and the buffered write path holds both the
+		 * inode lock and wb_inval_rwsem across a fault on the user buffer
+		 * (which takes mmap_lock), so taking either here would invert
+		 * lock order (ABBA).  Clearing the latch and dropping the cache
+		 * is sufficient -- writers re-check the latch and route to cached
+		 * IO once it is clear, and in-flight parallel dio drains itself.
+		 */
 		spin_lock(&fi->lock);
 		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
 		if (fi->iocachectr > 0)
 			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		spin_unlock(&fi->lock);
 		invalidate_inode_pages2(file->f_mapping);
-		inode_unlock(inode);
 	}
 
 	/*
@@ -3631,6 +3696,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->iocachectr = 0;
 	init_waitqueue_head(&fi->page_waitq);
 	init_waitqueue_head(&fi->direct_io_waitq);
+	init_rwsem(&fi->wb_inval_rwsem);
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
