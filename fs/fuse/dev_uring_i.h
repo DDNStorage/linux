@@ -111,17 +111,6 @@ struct fuse_ring_queue {
 	bool stopped;
 };
 
-struct fuse_queue_map {
-	/* Tracks which queues are registered */
-	cpumask_var_t registered_q_mask;
-
-	/* number of registered queues */
-	size_t nr_queues;
-
-	/* cpu to qid mapping */
-	int *cpu_to_qid;
-};
-
 /**
  * Describes if uring is for communication and holds alls the data needed
  * for uring communication
@@ -145,12 +134,6 @@ struct fuse_ring {
 	 * Log ring entry states on stop when entries cannot be released
 	 */
 	unsigned int stop_debug_log : 1;
-
-	/* per numa node queue tracking */
-	struct fuse_queue_map *numa_q_map;
-
-	/* all queue tracking */
-	struct fuse_queue_map q_map;
 
 	/* Tracks which queues are available (empty) globally */
 	cpumask_var_t avail_q_mask;

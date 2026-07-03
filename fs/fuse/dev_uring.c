@@ -22,12 +22,6 @@ MODULE_PARM_DESC(enable_uring,
 #define FUSE_RING_HEADER_PG 0
 #define FUSE_RING_PAYLOAD_PG 1
 
-/* Threshold that determines if a better queue should be searched for */
-#define FUSE_URING_Q_THRESHOLD 2
-
-/* Number of (re)tries to find a better queue */
-#define FUSE_URING_Q_TRIES 3
-
 /* redfs only to allow patch backports */
 #define IO_URING_F_TASK_DEAD (1 << 13)
 
@@ -235,25 +229,6 @@ static void io_pages_free(struct page ***pages, int npages)
 	*pages = NULL;
 }
 
-static void fuse_ring_destruct_q_map(struct fuse_queue_map *q_map)
-{
-	free_cpumask_var(q_map->registered_q_mask);
-	kfree(q_map->cpu_to_qid);
-}
-
-static void fuse_uring_destruct_q_masks(struct fuse_ring *ring)
-{
-	int node;
-
-	fuse_ring_destruct_q_map(&ring->q_map);
-
-	if (ring->numa_q_map) {
-		for (node = 0; node < ring->nr_numa_nodes; node++)
-			fuse_ring_destruct_q_map(&ring->numa_q_map[node]);
-		kfree(ring->numa_q_map);
-	}
-}
-
 static void fuse_ring_destruct_q_masks(struct fuse_ring *ring)
 {
 	free_cpumask_var(ring->avail_q_mask);
@@ -305,46 +280,10 @@ void fuse_uring_destruct(struct fuse_conn *fc)
 		ring->queues[qid] = NULL;
 	}
 
-	fuse_uring_destruct_q_masks(ring);
 	fuse_ring_destruct_q_masks(ring);
 	kfree(ring->queues);
 	kfree(ring);
 	fc->ring = NULL;
-}
-
-static int fuse_uring_init_q_map(struct fuse_queue_map *q_map, size_t nr_cpu)
-{
-	if (!zalloc_cpumask_var(&q_map->registered_q_mask, GFP_KERNEL_ACCOUNT))
-		return -ENOMEM;
-
-	q_map->cpu_to_qid = kcalloc(nr_cpu, sizeof(*q_map->cpu_to_qid),
-				    GFP_KERNEL_ACCOUNT);
-	if (!q_map->cpu_to_qid)
-		return -ENOMEM;
-
-	return 0;
-}
-
-static int fuse_uring_create_q_masks(struct fuse_ring *ring, size_t nr_queues)
-{
-	int err, node;
-
-	err = fuse_uring_init_q_map(&ring->q_map, nr_queues);
-	if (err)
-		return err;
-
-	ring->numa_q_map = kcalloc(ring->nr_numa_nodes,
-				   sizeof(*ring->numa_q_map),
-				   GFP_KERNEL_ACCOUNT);
-	if (!ring->numa_q_map)
-		return -ENOMEM;
-	for (node = 0; node < ring->nr_numa_nodes; node++) {
-		err = fuse_uring_init_q_map(&ring->numa_q_map[node],
-					    nr_queues);
-		if (err)
-			return err;
-	}
-	return 0;
 }
 
 static int fuse_ring_create_q_masks(struct fuse_ring *ring, int nr_queues)
@@ -355,9 +294,9 @@ static int fuse_ring_create_q_masks(struct fuse_ring *ring, int nr_queues)
 	if (!zalloc_cpumask_var(&ring->registered_q_mask, GFP_KERNEL_ACCOUNT))
 		return -ENOMEM;
 
-	ring->per_numa_avail_q_mask = kmalloc_array(ring->nr_numa_nodes,
-						    sizeof(struct cpumask *),
-						    GFP_KERNEL_ACCOUNT);
+	ring->per_numa_avail_q_mask = kcalloc(ring->nr_numa_nodes,
+					      sizeof(*ring->per_numa_avail_q_mask),
+					      GFP_KERNEL_ACCOUNT);
 	if (!ring->per_numa_avail_q_mask)
 		return -ENOMEM;
 	for (int node = 0; node < ring->nr_numa_nodes; node++)
@@ -365,9 +304,9 @@ static int fuse_ring_create_q_masks(struct fuse_ring *ring, int nr_queues)
 					GFP_KERNEL_ACCOUNT))
 			return -ENOMEM;
 
-	ring->numa_registered_q_mask = kmalloc_array(ring->nr_numa_nodes,
-						     sizeof(struct cpumask *),
-						     GFP_KERNEL_ACCOUNT);
+	ring->numa_registered_q_mask = kcalloc(ring->nr_numa_nodes,
+					       sizeof(*ring->numa_registered_q_mask),
+					       GFP_KERNEL_ACCOUNT);
 	if (!ring->numa_registered_q_mask)
 		return -ENOMEM;
 	for (int node = 0; node < ring->nr_numa_nodes; node++) {
@@ -404,10 +343,6 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 	max_payload_size = max(FUSE_MIN_READ_BUFFER, fc->max_write);
 	max_payload_size = max(max_payload_size, fc->max_pages * PAGE_SIZE);
 
-	err = fuse_uring_create_q_masks(ring, nr_queues);
-	if (err)
-		goto out_err;
-
 	err = fuse_ring_create_q_masks(ring, nr_queues);
 	if (err)
 		goto out_err;
@@ -431,34 +366,10 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 	return ring;
 
 out_err:
-	fuse_uring_destruct_q_masks(ring);
 	fuse_ring_destruct_q_masks(ring);
 	kfree(ring->queues);
 	kfree(ring);
 	return res;
-}
-
-static void fuse_uring_cpu_qid_mapping(struct fuse_ring *ring, int qid,
-				       struct fuse_queue_map *q_map,
-				       int node)
-{
-	int cpu, qid_idx, mapping_count = 0;
-	size_t nr_queues;
-
-	cpumask_set_cpu(qid, q_map->registered_q_mask);
-	nr_queues = cpumask_weight(q_map->registered_q_mask);
-	for (cpu = 0; cpu < ring->max_nr_queues; cpu++) {
-		if (node != -1 && cpu_to_node(cpu) != node)
-			continue;
-
-		qid_idx = mapping_count % nr_queues;
-		q_map->cpu_to_qid[cpu] = cpumask_nth(qid_idx,
-						     q_map->registered_q_mask);
-		mapping_count++;
-		pr_debug("%s node=%d qid=%d qid_idx=%d nr_queues=%zu %d->%d\n",
-			 __func__, node, qid, qid_idx, nr_queues, cpu,
-			 q_map->cpu_to_qid[cpu]);
-	}
 }
 
 static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
@@ -467,7 +378,6 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 	struct fuse_conn *fc = ring->fc;
 	struct fuse_ring_queue *queue;
 	struct list_head *pq;
-	int node;
 
 	queue = kzalloc(sizeof(*queue), GFP_KERNEL_ACCOUNT);
 	if (!queue)
@@ -506,21 +416,6 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 	 * write_once and lock as the caller mostly doesn't take the lock at all
 	 */
 	WRITE_ONCE(ring->queues[qid], queue);
-
-	/* Static mapping from cpu to per numa queues */
-	node = cpu_to_node(qid);
-	fuse_uring_cpu_qid_mapping(ring, qid, &ring->numa_q_map[node], node);
-
-	/*
-	 * smp_store_release, as the variable is read without fc->lock and
-	 * we need to avoid compiler re-ordering of updating the nr_queues
-	 * and setting ring->numa_queues[node].cpu_to_qid above
-	 */
-	smp_store_release (&ring->numa_q_map[node].nr_queues,
-			   ring->numa_q_map[node].nr_queues + 1);
-
-	/* global mapping */
-	fuse_uring_cpu_qid_mapping(ring, qid, &ring->q_map, -1);
 
 	spin_unlock(&fc->lock);
 
@@ -701,13 +596,6 @@ void fuse_uring_stop_queues(struct fuse_ring *ring)
 			cpumask_clear_cpu(qid,
 					  ring->per_numa_avail_q_mask[node]);
 		}
-	}
-
-	/* Reset all queue masks, we won't process any more IO */
-	cpumask_clear(ring->q_map.registered_q_mask);
-	for (node = 0; node < ring->nr_numa_nodes; node++) {
-		if (ring->numa_q_map)
-			cpumask_clear(ring->numa_q_map[node].registered_q_mask);
 	}
 
 	if (atomic_read(&ring->queue_refs) > 0) {
