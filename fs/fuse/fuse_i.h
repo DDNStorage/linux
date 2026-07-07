@@ -119,6 +119,20 @@ struct dlm_locked_area
 	size_t size;
 };
 
+/*
+ * Force-DIO switch trigger: an exponentially weighted moving average of the
+ * interval (in jiffies) between FUSE_NOTIFY_INVAL_INODE data invalidations for
+ * a file.  When the average spacing falls below FUSE_NOTIFY_DIO_INTERVAL -- a
+ * remote writer streaming invalidations -- and the file is open for writing
+ * here, it is latched into direct IO.  These are the source-level (not
+ * externally tunable) parameters of the heuristic: EWMA weight 1/2^SHIFT,
+ * seeded and capped at SEED so it takes a short burst rather than a single
+ * notify to trip.
+ */
+#define FUSE_NOTIFY_DIO_INTERVAL	max_t(unsigned long, HZ / 10, 1)
+#define FUSE_NOTIFY_EWMA_SHIFT		2
+#define FUSE_NOTIFY_EWMA_SEED		(2 * FUSE_NOTIFY_DIO_INTERVAL)
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -186,6 +200,34 @@ struct fuse_inode {
 
 			/* dlm locked areas we have sent lock requests for */
 			struct fuse_dlm_cache dlm_locked_areas;
+
+			/*
+			 * Serializes buffered-write page-cache dirtying against
+			 * the forced-direct-IO latch transition driven by
+			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
+			 * may be delivered by the same server thread that still
+			 * owes a reply to an in-flight write holding the inode
+			 * lock.  The buffered writer holds this for read around
+			 * the dirtying and re-checks the latch under it; the
+			 * NOTIFY latch site takes it for write (trylock, never
+			 * blocking) around its page-cache invalidate + latch set.
+			 * Only regular files initialise it -- it shares storage
+			 * with the readdir-cache union arm.
+			 */
+			struct rw_semaphore wb_inval_rwsem;
+
+			/*
+			 * Rate of FUSE_NOTIFY_INVAL_INODE data invalidations
+			 * for this whole file: notify_stamp is the jiffies of
+			 * the last one, notify_interval_ewma the EWMA of the
+			 * inter-arrival interval (jiffies, scaled by
+			 * 2^FUSE_NOTIFY_EWMA_SHIFT).  A rapid stream (short
+			 * average interval) with a local writer latches the
+			 * inode into direct IO.  Protected by fi->lock; regular
+			 * files only (shares the readdir-cache union arm).
+			 */
+			unsigned long notify_stamp;
+			unsigned int notify_interval_ewma;
 		};
 
 		/* readdir cache (directory only) */
@@ -257,6 +299,14 @@ enum {
 	FUSE_I_BTIME,
 	/* Wants or already has page cache IO */
 	FUSE_I_CACHE_IO_MODE,
+	/*
+	 * Latched into direct IO: a NOTIFY_INVAL_INODE arrived while the file
+	 * was open for writing here, so another (remote) entity is modifying it
+	 * concurrently.  Reads and writes are routed direct (shared-lock
+	 * parallel dio) until the last writer closes or the inode is mmapped.
+	 * See fuse_reverse_inval_inode()/fuse_file_io_open().
+	 */
+	FUSE_I_FORCE_DIO,
 };
 
 struct fuse_conn;
@@ -1599,6 +1649,12 @@ void fuse_inode_uncached_io_end(struct fuse_inode *fi);
 
 int fuse_file_io_open(struct file *file, struct inode *inode);
 void fuse_file_io_release(struct fuse_file *ff, struct inode *inode);
+
+/* Inode latched into forced direct IO after a remote-modify notification */
+static inline bool fuse_inode_force_dio(struct inode *inode)
+{
+	return test_bit(FUSE_I_FORCE_DIO, &get_fuse_inode(inode)->state);
+}
 
 /* file.c */
 struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,

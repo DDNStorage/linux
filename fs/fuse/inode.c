@@ -757,6 +757,35 @@ static void fuse_invalidate_inode_entry(struct inode *inode)
 	}
 }
 
+/*
+ * Fold one FUSE_NOTIFY_INVAL_INODE data invalidation into the per-inode
+ * moving average of the notification inter-arrival interval and report whether
+ * the file is now "hot" -- notifications are arriving fast enough (short
+ * average interval) that a remote writer is repeatedly invalidating it.  The
+ * average is an EWMA (weight 1/2^FUSE_NOTIFY_EWMA_SHIFT); the sample is clamped
+ * to FUSE_NOTIFY_EWMA_SEED so a notify after a long idle only cools the average
+ * and cannot overflow the accumulator.  Must be called under fi->lock; called
+ * for every data invalidation so the average stays current even while no local
+ * writer is open.
+ */
+static bool fuse_notify_inval_hot(struct fuse_inode *fi)
+{
+	unsigned long now = jiffies;
+	unsigned long sample;
+	unsigned int avg;
+
+	sample = min_t(unsigned long, now - fi->notify_stamp,
+		       FUSE_NOTIFY_EWMA_SEED);
+	fi->notify_stamp = now;
+
+	/* E += sample - (E >> SHIFT); avg = E >> SHIFT */
+	fi->notify_interval_ewma += sample -
+		(fi->notify_interval_ewma >> FUSE_NOTIFY_EWMA_SHIFT);
+	avg = fi->notify_interval_ewma >> FUSE_NOTIFY_EWMA_SHIFT;
+
+	return avg < FUSE_NOTIFY_DIO_INTERVAL;
+}
+
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len)
 {
@@ -806,8 +835,70 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 								pg_end == -1 ? 0 :
 								(offset + len - 1));
 
-		invalidate_inode_pages2_range(inode->i_mapping,
-					      pg_start, pg_end);
+		/*
+		 * A data invalidation means another (remote) entity is modifying
+		 * the file.  Keep a moving average of how fast these notifications
+		 * arrive for the whole inode; when they come in a rapid stream --
+		 * a remote writer repeatedly invalidating the file -- and it is
+		 * also open for writing here, latch the inode into direct IO:
+		 * reads and writes are served direct (from the server) until the
+		 * last writer closes or the inode is mmapped.  A lone or occasional
+		 * notify keeps the average high and does not trip the switch.  Only
+		 * under writeback+dlm, where the buffered write's RMW read is
+		 * skipped so its wb_inval_rwsem read-side section is free of server
+		 * round-trips.
+		 *
+		 * fuse_notify_inval_hot() updates the average under fi->lock and is
+		 * called for every data invalidation so it stays current even while
+		 * no local writer is open.  When it trips, take wb_inval_rwsem for
+		 * write so the buffered write path -- which holds it for read across
+		 * its dirtying and re-checks the latch under it -- cannot strand
+		 * dirty folios after the cache is dropped.  Use a trylock and never
+		 * block: this may run on the server thread that still owes an
+		 * in-flight write (holding the inode lock) its reply, so blocking on
+		 * the rwsem or the inode lock would deadlock.  If the writer has
+		 * gone, skip the latch this round (best effort); the invalidate
+		 * still runs.  Only regular files initialise the average and the
+		 * rwsem (they share storage with the readdir-cache union arm), so
+		 * gate on S_ISREG.  When latched, drop the whole mapping rather than
+		 * just the notified range, or dirty folios outside it would be
+		 * invisible to the forced direct reads (stale read / lost write).
+		 */
+		if (S_ISREG(inode->i_mode) && fc->writeback_cache && fc->dlm &&
+		    !FUSE_IS_DAX(inode) && !fuse_inode_backing(fi) &&
+		    !mapping_mapped(inode->i_mapping)) {
+			bool hot, has_writer;
+
+			spin_lock(&fi->lock);
+			hot = fuse_notify_inval_hot(fi);
+			has_writer = !list_empty(&fi->write_files);
+			spin_unlock(&fi->lock);
+
+			if (hot && has_writer && !fuse_inode_force_dio(inode) &&
+			    down_write_trylock(&fi->wb_inval_rwsem)) {
+				bool latched = false;
+
+				spin_lock(&fi->lock);
+				if (!list_empty(&fi->write_files)) {
+					set_bit(FUSE_I_FORCE_DIO, &fi->state);
+					latched = true;
+				}
+				spin_unlock(&fi->lock);
+
+				if (latched)
+					invalidate_inode_pages2(inode->i_mapping);
+				else
+					invalidate_inode_pages2_range(inode->i_mapping,
+								      pg_start, pg_end);
+				up_write(&fi->wb_inval_rwsem);
+			} else {
+				invalidate_inode_pages2_range(inode->i_mapping,
+							      pg_start, pg_end);
+			}
+		} else {
+			invalidate_inode_pages2_range(inode->i_mapping,
+						      pg_start, pg_end);
+		}
 	}
 	iput(inode);
 	return 0;
