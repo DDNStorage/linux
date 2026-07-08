@@ -1691,6 +1691,45 @@ retry:
 
 static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from);
 
+/*
+ * @return true if an exclusive inode lock is needed for a cached (buffered)
+ * write.
+ *
+ * Buffered writes normally hold the inode rwsem exclusively, serialising all
+ * writers even on disjoint ranges.  The DLM-serialised iomap writeback path is
+ * the exception: the DLM already excludes cluster-wide, and i_size is committed
+ * under fi->lock rather than the inode rwsem (see fuse_cache_write_iter()), so
+ * disjoint writers (MPI-IO / IOR) may share the lock.  Mirrors
+ * fuse_dio_wr_exclusive_lock() for the direct path.
+ */
+static bool fuse_cache_wr_exclusive_lock(struct kiocb *iocb, bool writeback)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	/* Only the DLM-serialised iomap writeback path relaxes the lock. */
+	if (!fc->dlm || !writeback)
+		return true;
+
+	/* O_DIRECT writes fall back to generic_file_direct_write(). */
+	if (iocb->ki_flags & IOCB_DIRECT)
+		return true;
+
+	/* Append needs the eventual EOF - always needs an exclusive lock. */
+	if (iocb->ki_flags & IOCB_APPEND)
+		return true;
+
+	return false;
+}
+
+static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
+{
+	if (exclusive)
+		inode_unlock(inode);
+	else
+		inode_unlock_shared(inode);
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1703,6 +1742,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	bool writeback = false;
 	bool wb_guard = false;
+	bool exclusive = true;
 
 	/*
 	 * The inode may have been latched into forced direct IO -- by a
@@ -1750,7 +1790,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 	}
 
-	inode_lock(inode);
+	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
+	if (exclusive)
+		inode_lock(inode);
+	else
+		inode_lock_shared(inode);
 
 	/*
 	 * The forced-direct-IO latch feature is active under writeback+dlm;
@@ -1768,7 +1812,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		down_read(&fi->wb_inval_rwsem);
 		if (fuse_inode_force_dio(inode)) {
 			up_read(&fi->wb_inval_rwsem);
-			inode_unlock(inode);
+			fuse_cache_wr_unlock(inode, exclusive);
 			return fuse_direct_write_iter(iocb, from);
 		}
 	}
@@ -1790,7 +1834,66 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		written = direct_write_fallback(iocb, from, written,
 						fuse_perform_write(iocb, from));
 	} else if (writeback) {
+		loff_t pos = iocb->ki_pos;
+		loff_t end = pos + count;
+		loff_t orig_size = 0;
+		bool extended = false;
+
+		/*
+		 * i_size is not protected by the shared lock in inode->i_rwsem. 
+		 * So if iomap_write_iter() grew EOF past i_size via its normal 
+		 * unlocked read-modify-write, two concurrent writers could race 
+		 * and one's update would get lost.
+		 * To avoid this, claim the extension up front under fi->lock, 
+		 * so iomap sees pos + written <= i_size and never touches i_size 
+		 * itself. The update can then safely happen here, the same way 
+		 * fuse_write_update_attr() commits size on the direct io path.
+		 *
+		 * The lockless pre-check below avoids needlessly locking fi->lock 
+		 * if writes fall within the existing i_size. 
+		 * Operations that grow the file size take fi->lock, whereas a 
+		 * truncate holds the inode->i_rwsem exclusive. A stale read 
+		 * may over trigger this slow path, but it won’t miss an extension 
+		 * beyond i_size.
+		 *
+		 * The exclusive path keeps the classic behavior
+		 * iomap owns the i_size update, serialized by the inode lock.
+		 */
+		if (!exclusive && end > i_size_read(inode)) {
+			spin_lock(&fi->lock);
+			orig_size = i_size_read(inode);
+			if (end > orig_size) {
+				i_size_write(inode, end);
+				extended = true;
+			}
+			spin_unlock(&fi->lock);
+
+			/* Zero the tail of the folio straddling the old EOF. */
+			if (extended && orig_size < pos)
+				pagecache_isize_extended(inode, orig_size, pos);
+		}
+
 		written = fuse_writeback_write_iter(iocb, from, file);
+
+		/*
+		 * Reconcile the speculative extension with what was actually
+		 * written (short write, error, or nothing written all retract
+		 * to the reached position).  Only retract if no concurrent
+		 * extender has pushed i_size past our claim; otherwise
+		 * [reached, end) is a legitimate hole inside their extension and
+		 * must remain.
+		 */
+		if (extended) {
+			loff_t reached = written > 0 ? pos + written : orig_size;
+
+			if (reached < end) {
+				spin_lock(&fi->lock);
+				if (i_size_read(inode) == end)
+					i_size_write(inode, reached);
+				spin_unlock(&fi->lock);
+			}
+		}
+
 		if (written < 0) {
 			err = written;
 			goto out;
@@ -1801,7 +1904,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 out:
 	if (wb_guard)
 		up_read(&fi->wb_inval_rwsem);
-	inode_unlock(inode);
+	fuse_cache_wr_unlock(inode, exclusive);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
 
