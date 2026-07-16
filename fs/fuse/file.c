@@ -1457,7 +1457,7 @@ static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from
 }
 
 static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
-			  bool *exclusive)
+			  bool *exclusive, bool *uncached)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -1476,19 +1476,28 @@ static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
 		 *
 		 * Under the forced-dio latch the cached/uncached accounting is
 		 * bypassed (the latch guarantees the cache is flushed and not
-		 * repopulated), so only re-check the past-eof condition.
+		 * repopulated), so no reference is taken.  Report back through
+		 * *uncached whether one actually was, so fuse_dio_unlock() can
+		 * drop it based on that decision rather than re-testing the
+		 * latch, which the notify-storm path can toggle mid-write.
 		 */
-		if (fuse_io_past_eof(iocb, from) ||
-		    (!test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
-		     fuse_inode_uncached_io_start(fi) != 0)) {
+		if (fuse_io_past_eof(iocb, from)) {
 			inode_unlock_shared(inode);
 			inode_lock(inode);
 			*exclusive = true;
+		} else if (!test_bit(FUSE_I_FORCE_DIO, &fi->state)) {
+			if (fuse_inode_uncached_io_start(fi) != 0) {
+				inode_unlock_shared(inode);
+				inode_lock(inode);
+				*exclusive = true;
+			} else {
+				*uncached = true;
+			}
 		}
 	}
 }
 
-static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
+static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive, bool uncached)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -1496,12 +1505,8 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
 	if (exclusive) {
 		inode_unlock(inode);
 	} else {
-		/*
-		 * Allow opens in caching mode after last parallel dio end.
-		 * Skipped under the forced-dio latch, which never took an
-		 * uncached_io reference in fuse_dio_lock().
-		 */
-		if (!test_bit(FUSE_I_FORCE_DIO, &fi->state))
+		/* Allow opens in caching mode after last parallel dio end */
+		if (uncached)
 			fuse_inode_uncached_io_end(fi);
 		inode_unlock_shared(inode);
 	}
@@ -1861,10 +1866,11 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 	struct address_space *mapping = inode->i_mapping;
 	loff_t pos = iocb->ki_pos;
+	bool exclusive = false;
+	bool uncached = false;
 	ssize_t res;
-	bool exclusive;
 
-	fuse_dio_lock(iocb, from, &exclusive);
+	fuse_dio_lock(iocb, from, &exclusive, &uncached);
 	res = generic_write_checks(iocb, from);
 	if (res > 0) {
 		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
@@ -1885,7 +1891,7 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				(pos + res - 1) >> PAGE_SHIFT);
 		}
 	}
-	fuse_dio_unlock(iocb, exclusive);
+	fuse_dio_unlock(iocb, exclusive, uncached);
 
 	return res;
 }
