@@ -43,8 +43,8 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
 bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 			      uint64_t end, enum fuse_page_lock_mode mode);
 
-/* this is the interface to the filesystem */
-void fuse_get_dlm_write_lock(struct file *file, loff_t offset,
-				    size_t length);
+/* This is the interface to the filesystem */
+void fuse_get_dlm_lock(struct file *file, loff_t offset,
+		       size_t length, enum fuse_page_lock_mode mode);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */
