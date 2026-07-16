@@ -1122,11 +1122,16 @@ static void fuse_readahead(struct readahead_control *rac)
 	}
 }
 
+static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to);
+
 static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
+	ssize_t res;
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -1147,7 +1152,29 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		fuse_get_dlm_lock(file, iocb->ki_pos,
 				  iov_iter_count(to), FUSE_PAGE_LOCK_READ);
 
-	return generic_file_read_iter(iocb, to);
+	/*
+	 * Fence the cache-serving read against a NOTIFY invalidate so we never
+	 * hand back a folio the server has just superseded.  The gate read side
+	 * is per-CPU cheap; the NOTIFY holds the write side with priority.
+	 * Re-check the forced-DIO latch under it: if a storm latched us while we
+	 * waited on a pending writer, reroute to direct like the buffered write
+	 * path, so we do not repopulate the cache the latch just dropped.
+	 * wb_sem is NULL on non-writeback+dlm mounts (gate inactive).
+	 */
+	if (wb_sem) {
+		percpu_down_read(wb_sem);
+		if (fuse_inode_force_dio(inode)) {
+			percpu_up_read(wb_sem);
+			return fuse_direct_read_iter(iocb, to);
+		}
+	}
+
+	res = generic_file_read_iter(iocb, to);
+
+	if (wb_sem)
+		percpu_up_read(wb_sem);
+
+	return res;
 }
 
 static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
@@ -1530,6 +1557,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t err;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
 	bool wb_guard = false;
 
 	/*
@@ -1569,12 +1597,13 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 
 		/*
-		 * Hold wb_inval_rwsem for read across the page-cache dirtying
-		 * so a concurrent NOTIFY_INVAL_INODE -- which latches the inode
-		 * under the write side of this lock via a non-blocking trylock
-		 * -- cannot strand the folios we are about to write.  Re-check
-		 * the latch under it (it may have been set while we blocked on
-		 * the inode lock) and re-route to the direct path if set.
+		 * Hold the coherency gate (wb_inval_rwsem) for read across the
+		 * page-cache dirtying so a concurrent NOTIFY_INVAL_INODE --
+		 * which takes the write side (blocking, with priority) around
+		 * its invalidate + latch set -- cannot strand the folios we are
+		 * about to write.  Re-check the latch under it (it may have been
+		 * set while we blocked on the inode lock) and re-route to the
+		 * direct path if set.
 		 *
 		 * generic_file_write_iter() is open-coded here so the gate can
 		 * be taken inside the inode lock.  The order matters: every
@@ -1582,13 +1611,13 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * that a writer holding i_rwsem exclusive can wait out gate
 		 * readers without deadlocking.
 		 */
-		wb_guard = fc->dlm;
+		wb_guard = !!wb_sem;
 
 		inode_lock(inode);
 		if (wb_guard) {
-			down_read(&fi->wb_inval_rwsem);
+			percpu_down_read(wb_sem);
 			if (fuse_inode_force_dio(inode)) {
-				up_read(&fi->wb_inval_rwsem);
+				percpu_up_read(wb_sem);
 				inode_unlock(inode);
 				return fuse_direct_write_iter(iocb, from);
 			}
@@ -1599,7 +1628,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			err = __generic_file_write_iter(iocb, from);
 
 		if (wb_guard)
-			up_read(&fi->wb_inval_rwsem);
+			percpu_up_read(wb_sem);
 		inode_unlock(inode);
 
 		if (err > 0)
@@ -1613,19 +1642,20 @@ writethrough:
 
 	/*
 	 * The forced-direct-IO latch feature is active under writeback+dlm;
-	 * hold wb_inval_rwsem for read across the page-cache dirtying so a
-	 * concurrent NOTIFY_INVAL_INODE -- which latches the inode under the
-	 * write side of this lock via a non-blocking trylock -- cannot strand
-	 * the folios we are about to write.  Re-check the latch under it (it may
-	 * have been set while we blocked on the inode lock) and re-route to the
-	 * direct path if set.  The DLM write lock taken above is harmless as the
-	 * direct path does its own server coordination.
+	 * hold the coherency gate (wb_inval_rwsem) for read across the
+	 * page-cache dirtying so a concurrent NOTIFY_INVAL_INODE -- which takes
+	 * the write side (blocking, with priority) around its invalidate + latch
+	 * set -- cannot strand the folios we are about to write.  Re-check the
+	 * latch under it (it may have been set while we blocked on the inode
+	 * lock) and re-route to the direct path if set.  The DLM write lock
+	 * taken above is harmless as the direct path does its own server
+	 * coordination.
 	 */
-	wb_guard = fc->writeback_cache && fc->dlm;
+	wb_guard = !!wb_sem;
 	if (wb_guard) {
-		down_read(&fi->wb_inval_rwsem);
+		percpu_down_read(wb_sem);
 		if (fuse_inode_force_dio(inode)) {
-			up_read(&fi->wb_inval_rwsem);
+			percpu_up_read(wb_sem);
 			inode_unlock(inode);
 			return fuse_direct_write_iter(iocb, from);
 		}
@@ -1654,7 +1684,7 @@ writethrough:
 	}
 out:
 	if (wb_guard)
-		up_read(&fi->wb_inval_rwsem);
+		percpu_up_read(wb_sem);
 	inode_unlock(inode);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
@@ -3428,6 +3458,7 @@ static const struct address_space_operations fuse_file_aops  = {
 void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
 
 	inode->i_fop = &fuse_file_operations;
 	inode->i_data.a_ops = &fuse_file_aops;
@@ -3439,7 +3470,23 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->iocachectr = 0;
 	init_waitqueue_head(&fi->page_waitq);
 	init_waitqueue_head(&fi->direct_io_waitq);
-	init_rwsem(&fi->wb_inval_rwsem);
+	/*
+	 * Coherency gate for the forced-direct-IO feature; only writeback+dlm
+	 * regular files need it.  A percpu_rw_semaphore embeds per-CPU state,
+	 * so allocate it out of line and only when the mount can use it rather
+	 * than paying it on every inode.  On failure leave it NULL: the gate
+	 * stays inactive (best-effort invalidate) and the inode is still usable.
+	 */
+	fi->wb_inval_rwsem = NULL;
+	if (fc->writeback_cache && fc->dlm) {
+		struct percpu_rw_semaphore *sem = kmalloc(sizeof(*sem), GFP_KERNEL);
+
+		if (sem && percpu_init_rwsem(sem)) {
+			kfree(sem);
+			sem = NULL;
+		}
+		fi->wb_inval_rwsem = sem;
+	}
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
 
