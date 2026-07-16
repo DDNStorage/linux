@@ -1559,7 +1559,7 @@ static bool fuse_dio_wr_exclusive_lock(struct kiocb *iocb, struct iov_iter *from
 }
 
 static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
-			  bool *exclusive)
+			  bool *exclusive, bool *uncached)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -1573,23 +1573,20 @@ static void fuse_dio_lock(struct kiocb *iocb, struct iov_iter *from,
 		 * New parallal dio allowed only if inode is not in caching
 		 * mode and denies new opens in caching mode. This check
 		 * should be performed only after taking shared inode lock.
-		 *
-		 * Under the forced-dio latch the uncached-io accounting is
-		 * bypassed entirely -- fuse_dio_unlock() likewise skips
-		 * fuse_inode_uncached_io_end() -- so do not take a reference
-		 * here.  An unbalanced start would drive fi->iocachectr
-		 * permanently negative and hang the next caching-mode open.
 		 */
-		if (!test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
-		    fuse_inode_uncached_io_start(fi, NULL) != 0) {
-			inode_unlock_shared(inode);
-			inode_lock(inode);
-			*exclusive = true;
+		if (!test_bit(FUSE_I_FORCE_DIO, &fi->state)) {
+			if (fuse_inode_uncached_io_start(fi, NULL) != 0) {
+				inode_unlock_shared(inode);
+				inode_lock(inode);
+				*exclusive = true;
+			} else {
+				*uncached = true;
+			}
 		}
 	}
 }
 
-static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
+static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive, bool uncached)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -1597,12 +1594,7 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive)
 	if (exclusive) {
 		inode_unlock(inode);
 	} else {
-		/*
-		 * Allow opens in caching mode after last parallel dio end.
-		 * Skipped under the forced-dio latch, which never took an
-		 * uncached_io reference in fuse_dio_lock().
-		 */
-		if (!test_bit(FUSE_I_FORCE_DIO, &fi->state))
+		if (uncached)
 			fuse_inode_uncached_io_end(fi);
 		inode_unlock_shared(inode);
 	}
@@ -2067,10 +2059,11 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct address_space *mapping = inode->i_mapping;
 	loff_t pos = iocb->ki_pos;
+	bool exclusive = false;
+	bool uncached = false;
 	ssize_t res;
-	bool exclusive;
 
-	fuse_dio_lock(iocb, from, &exclusive);
+	fuse_dio_lock(iocb, from, &exclusive, &uncached);
 	res = generic_write_checks(iocb, from);
 	if (res > 0) {
 		task_io_account_write(res);
@@ -2094,7 +2087,7 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				(pos + res - 1) >> PAGE_SHIFT);
 		}
 	}
-	fuse_dio_unlock(iocb, exclusive);
+	fuse_dio_unlock(iocb, exclusive, uncached);
 
 	return res;
 }
