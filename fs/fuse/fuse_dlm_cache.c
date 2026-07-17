@@ -454,9 +454,16 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 
 	/* Check if the entire range is covered */
 	while (range && current_start <= end) {
-		/* If we're checking for a specific mode, verify it matches */
-		if (lock_mode && range->mode != lock_mode) {
-			/* Wrong lock mode */
+		/*
+		 * The held lock must be at least as strong as the one
+		 * requested. A WRITE lock (exclusive) satisfies a READ
+		 * request, so only treat the range as uncovered when the
+		 * held mode is weaker than what we ask for. This avoids
+		 * re-requesting a READ lock for a range we already hold
+		 * a WRITE lock on (e.g. read-after-write).
+		 */
+		if (lock_mode && range->mode < lock_mode) {
+			/* Held lock is weaker than requested */
 			up_read(&cache->lock);
 			return false;
 		}
