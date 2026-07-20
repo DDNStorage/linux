@@ -400,6 +400,19 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	attr->mtimensec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
 	attr->ctimensec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
 
+	if (test_bit(FUSE_I_ATIME_DIRTY, &fi->state)) {
+		/*
+		 * The kernel updated atime, but another client may have
+		 * advanced it on the server. Keep whichever is newer.
+		 */
+		struct timespec64 atime = inode_get_atime(inode);
+		if ((u64) atime.tv_sec > attr->atime ||
+		    ((u64) atime.tv_sec == attr->atime &&
+		     (u32) atime.tv_nsec > attr->atimensec)) {
+			attr->atime = atime.tv_sec;
+			attr->atimensec = atime.tv_nsec;
+		}
+	}
 	inode_set_atime(inode, attr->atime, attr->atimensec);
 	/* mtime from server may be stale due to local buffered write */
 	if (!(cache_mask & STATX_MTIME)) {
@@ -571,6 +584,7 @@ static void fuse_init_inode(struct inode *inode, struct fuse_attr *attr,
 {
 	inode->i_mode = attr->mode & S_IFMT;
 	inode->i_size = attr->size;
+	inode_set_atime(inode, attr->atime, attr->atimensec);
 	inode_set_mtime(inode, attr->mtime, attr->mtimensec);
 	inode_set_ctime(inode, attr->ctime, attr->ctimensec);
 	if (S_ISREG(inode->i_mode)) {
@@ -655,7 +669,8 @@ retry:
 		return NULL;
 
 	if ((inode->i_state & I_NEW)) {
-		inode->i_flags |= S_NOATIME;
+		if (sb->s_flags & SB_NOATIME)
+			inode->i_flags |= S_NOATIME;
 		if (!fc->writeback_cache || !S_ISREG(attr->mode))
 			inode->i_flags |= S_NOCMTIME;
 		inode->i_generation = generation;

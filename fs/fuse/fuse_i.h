@@ -224,6 +224,10 @@ enum {
 	FUSE_I_BTIME,
 	/* Wants or already has page cache IO */
 	FUSE_I_CACHE_IO_MODE,
+	/* Locally updated atime needs to be flushed to the server */
+	FUSE_I_ATIME_DIRTY,
+	/* Locally updated mtime/ctime need to be flushed to the server */
+	FUSE_I_CMTIME_DIRTY,
 };
 
 struct fuse_conn;
