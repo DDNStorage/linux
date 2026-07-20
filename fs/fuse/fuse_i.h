@@ -201,27 +201,31 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Per-inode read/write coherency gate for the
-			 * forced-direct-IO feature.  Cache-serving buffered reads
-			 * and buffered writes hold it for read; being a
-			 * percpu_rw_semaphore the read side is per-CPU cheap and
-			 * scales on a shared file.  The NOTIFY invalidate
-			 * (fuse_reverse_inval_inode()) holds it for write, which
-			 * BLOCKS so the coherency notify has priority: it fences
-			 * cache-serving reads (and buffered writes) out for the
-			 * whole invalidate, so no folio a remote modify has
-			 * superseded is ever handed back.
-			 *
-			 * The write side may run on the server thread delivering
-			 * the notify, so a blocking writer is safe only under a
-			 * server that services request replies on threads other
-			 * than the one delivering the notify (see the NOTIFY site).
-			 *
-			 * Allocated out of line only for writeback+dlm regular
-			 * files (it shares storage with the readdir-cache union
-			 * arm); NULL on other mounts and on allocation failure,
-			 * where the gate is inactive and the invalidate falls back
-			 * to best-effort.
+			 * Server-materialized size: an upper bound for how far
+			 * the server holds file data.  Seeded from
+			 * server-reported attributes, advanced when the server
+			 * acknowledges data (writeback completion,
+			 * fuse_write_update_attr()), lowered again on
+			 * truncate.  A read-modify-write of a block starting
+			 * at or past this bound needs no READ request under a
+			 * held DLM write lock: the server has no data there
+			 * (see fuse_iomap_read_folio_range()).  Protected by
+			 * fi->lock.
+			 */
+			loff_t server_size;
+
+			/*
+			 * Serializes buffered-write page-cache dirtying against
+			 * the forced-direct-IO latch transition driven by
+			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
+			 * may be delivered by the same server thread that still
+			 * owes a reply to an in-flight write holding the inode
+			 * lock.  The buffered writer holds this for read around
+			 * the dirtying and re-checks the latch under it; the
+			 * NOTIFY latch site takes it for write (trylock, never
+			 * blocking) around its page-cache invalidate + latch set.
+			 * Only regular files initialise it -- it shares storage
+			 * with the readdir-cache union arm.
 			 */
 			struct percpu_rw_semaphore *wb_inval_rwsem;
 
