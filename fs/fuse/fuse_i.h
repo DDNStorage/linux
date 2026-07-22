@@ -136,6 +136,9 @@ struct fuse_inode {
 	/** 64 bit inode number */
 	u64 orig_ino;
 
+	/** Device ID for sub-root (orig_ino == fc->subvol_root_ino) */
+	dev_t sub_dev;
+
 	/** Version of last attribute change */
 	u64 attr_version;
 
@@ -583,6 +586,9 @@ struct fuse_fs_context {
 	unsigned int blksize;
 	const char *subtype;
 
+	/* Inode number for subvolume-root */
+	u64 subvol_root_ino;
+
 	/* DAX device, may be NULL */
 	struct dax_device *dax_dev;
 
@@ -897,6 +903,9 @@ struct fuse_conn {
 	/** Device ID from the root super block */
 	dev_t dev;
 
+	/** Inode number for subvolume (0 = disabled) */
+	u64 subvol_root_ino;
+
 	/** Dentries in the control filesystem */
 	struct dentry *ctl_dentry[FUSE_CTL_NUM_DENTRIES];
 
@@ -1019,6 +1028,11 @@ static inline u64 get_node_id(struct inode *inode)
 	return get_fuse_inode(inode)->nodeid;
 }
 
+static inline dev_t get_sub_dev(struct inode *inode)
+{
+	return get_fuse_inode(inode)->sub_dev;
+}
+
 static inline int invalid_nodeid(u64 nodeid)
 {
 	return !nodeid || nodeid == FUSE_ROOT_ID;
@@ -1099,12 +1113,13 @@ extern const struct dentry_operations fuse_root_dentry_operations;
 /**
  * Get a filled in inode
  */
-struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
-			int generation, struct fuse_attr *attr,
-			u64 attr_valid, u64 attr_version,
-			u64 evict_ctr);
+struct inode *fuse_iget(struct super_block *sb, dev_t sub_dev,
+			u64 nodeid, int generation,
+			struct fuse_attr *attr, u64 attr_valid,
+			u64 attr_version, u64 evict_ctr);
 
-int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
+int fuse_lookup_name(struct super_block *sb, dev_t sub_dev,
+		     u64 nodeid, const struct qstr *name,
 		     struct fuse_entry_out *outarg, struct inode **inode);
 
 /**

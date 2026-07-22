@@ -231,7 +231,8 @@ retry:
 		 * which bumps nlookup inside
 		 */
 	} else {
-		inode = fuse_iget(dir->i_sb, o->nodeid, o->generation,
+		inode = fuse_iget(dir->i_sb, get_sub_dev(dir),
+				  o->nodeid, o->generation,
 				  &o->attr, ATTR_TIMEOUT(o),
 				  attr_version, evict_ctr);
 		if (!inode)

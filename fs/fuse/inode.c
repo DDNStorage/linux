@@ -153,6 +153,7 @@ static void fuse_cleanup_submount_lookup(struct fuse_conn *fc,
 static void fuse_evict_inode(struct inode *inode)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn_super(inode->i_sb);
 
 	/* Will write inode on close/munmap and in all other dirtiers */
 	WARN_ON(inode->i_state & I_DIRTY_INODE);
@@ -160,8 +161,6 @@ static void fuse_evict_inode(struct inode *inode)
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
 	if (inode->i_sb->s_flags & SB_ACTIVE) {
-		struct fuse_conn *fc = get_fuse_conn(inode);
-
 		if (FUSE_IS_DAX(inode))
 			fuse_dax_inode_cleanup(inode);
 		if (fi->nlookup) {
@@ -191,6 +190,13 @@ static void fuse_evict_inode(struct inode *inode)
 		WARN_ON(!list_empty(&fi->queued_writes));
 		fuse_dlm_cache_release_locks(fi);
 	}
+	/*
+	 * Must be done here rather than in ->free_inode(), which is not
+	 * ordered against superblock destruction and thus must not touch
+	 * the fuse_conn.
+	 */
+	if (fi->sub_dev && fi->orig_ino == fc->subvol_root_ino)
+		free_anon_bdev(fi->sub_dev);
 }
 
 static int fuse_reconfigure(struct fs_context *fsc)
@@ -340,8 +346,6 @@ static void fuse_change_attributes_common_sx(struct inode *inode,
 	if (!fc->default_permissions)
 		inode->i_mode &= ~S_ISVTX;
 
-	fi->orig_ino = attr->ino;
-
 	/*
 	 * We are refreshing inode data and it is possible that another
 	 * client set suid/sgid or security.capability xattr. So clear
@@ -441,8 +445,6 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	fi->orig_i_mode = inode->i_mode;
 	if (!fc->default_permissions)
 		inode->i_mode &= ~S_ISVTX;
-
-	fi->orig_ino = attr->ino;
 
 	/*
 	 * We are refreshing inode data and it is possible that another
@@ -611,10 +613,10 @@ static int fuse_inode_set(struct inode *inode, void *_nodeidp)
 	return 0;
 }
 
-struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
-			int generation, struct fuse_attr *attr,
-			u64 attr_valid, u64 attr_version,
-			u64 evict_ctr)
+struct inode *fuse_iget(struct super_block *sb, dev_t sub_dev,
+			u64 nodeid, int generation,
+			struct fuse_attr *attr, u64 attr_valid,
+			u64 attr_version, u64 evict_ctr)
 {
 	struct inode *inode;
 	struct fuse_inode *fi;
@@ -654,12 +656,21 @@ retry:
 	if (!inode)
 		return NULL;
 
+	fi = get_fuse_inode(inode);
 	if ((inode->i_state & I_NEW)) {
 		inode->i_flags |= S_NOATIME;
 		if (!fc->writeback_cache || !S_ISREG(attr->mode))
 			inode->i_flags |= S_NOCMTIME;
 		inode->i_generation = generation;
 		fuse_init_inode(inode, attr, fc);
+		fi->orig_ino = attr->ino;
+		if (fc->subvol_root_ino && fi->orig_ino == fc->subvol_root_ino) {
+			int err = get_anon_bdev(&fi->sub_dev);
+			if (err)
+				pr_warn("failed to alloc anon bdev\n");
+		} else {
+			fi->sub_dev = sub_dev;
+		}
 		unlock_new_inode(inode);
 	} else if (fuse_stale_inode(inode, generation, attr)) {
 		/* nodeid was reused, any I/O on the old inode should fail */
@@ -670,7 +681,6 @@ retry:
 			goto retry;
 		}
 	}
-	fi = get_fuse_inode(inode);
 	spin_lock(&fi->lock);
 	fi->nlookup++;
 	spin_unlock(&fi->lock);
@@ -984,6 +994,7 @@ enum {
 	OPT_ALLOW_OTHER,
 	OPT_MAX_READ,
 	OPT_BLKSIZE,
+	OPT_SUBVOL_ROOT_INO,
 	OPT_ERR
 };
 
@@ -998,6 +1009,7 @@ static const struct fs_parameter_spec fuse_fs_parameters[] = {
 	fsparam_u32	("max_read",		OPT_MAX_READ),
 	fsparam_u32	("blksize",		OPT_BLKSIZE),
 	fsparam_string	("subtype",		OPT_SUBTYPE),
+	fsparam_u64	("subvol_root_ino",	OPT_SUBVOL_ROOT_INO),
 	{}
 };
 
@@ -1095,6 +1107,10 @@ static int fuse_parse_param(struct fs_context *fsc, struct fs_parameter *param)
 		if (!ctx->is_bdev)
 			return invalfc(fsc, "blksize only supported for fuseblk");
 		ctx->blksize = result.uint_32;
+		break;
+
+	case OPT_SUBVOL_ROOT_INO:
+		ctx->subvol_root_ino = result.uint_64;
 		break;
 
 	default:
@@ -1262,7 +1278,7 @@ static struct inode *fuse_get_root_inode(struct super_block *sb, unsigned mode)
 	attr.mode = mode;
 	attr.ino = FUSE_ROOT_ID;
 	attr.nlink = 1;
-	return fuse_iget(sb, FUSE_ROOT_ID, 0, &attr, 0, 0, 0);
+	return fuse_iget(sb, 0, FUSE_ROOT_ID, 0, &attr, 0, 0, 0);
 }
 
 struct fuse_inode_handle {
@@ -1289,8 +1305,8 @@ static struct dentry *fuse_get_dentry(struct super_block *sb,
 		if (!fc->export_support)
 			goto out_err;
 
-		err = fuse_lookup_name(sb, handle->nodeid, &name, &outarg,
-				       &inode);
+		err = fuse_lookup_name(sb, 0, handle->nodeid, &name,
+				       &outarg, &inode);
 		if (err && err != -ENOENT)
 			goto out_err;
 		if (err || !inode) {
@@ -1390,7 +1406,7 @@ static struct dentry *fuse_get_parent(struct dentry *child)
 	if (!fc->export_support)
 		return ERR_PTR(-ESTALE);
 
-	err = fuse_lookup_name(child_inode->i_sb, get_node_id(child_inode),
+	err = fuse_lookup_name(child_inode->i_sb, 0, get_node_id(child_inode),
 			       &dotdot_name, &outarg, &inode);
 	if (err) {
 		if (err == -ENOENT)
@@ -1524,8 +1540,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 			if (flags & FUSE_ATOMIC_O_TRUNC)
 				fc->atomic_o_trunc = 1;
 			if (arg->minor >= 9) {
-				/* LOOKUP has dependency on proto version */
-				if (flags & FUSE_EXPORT_SUPPORT)
+				if ((flags & FUSE_EXPORT_SUPPORT) &&
+				    !fc->subvol_root_ino)
 					fc->export_support = 1;
 			}
 			if (flags & FUSE_BIG_WRITES)
@@ -1673,6 +1689,12 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 	 */
 	if (fuse_uring_enabled())
 		flags |= FUSE_OVER_IO_URING;
+
+	if (fm->fc->subvol_root_ino) {
+		pr_warn("subvol_root_ino=%llu, disabling export_support\n",
+		        fm->fc->subvol_root_ino);
+		flags &= ~FUSE_EXPORT_SUPPORT;
+	}
 
 	ia->in.flags = flags;
 	ia->in.flags2 = flags >> 32;
@@ -1890,7 +1912,7 @@ static int fuse_fill_super_submount(struct super_block *sb,
 		return -ENOMEM;
 
 	fuse_fill_attr_from_inode(&root_attr, parent_fi);
-	root = fuse_iget(sb, parent_fi->nodeid, 0, &root_attr, 0, 0,
+	root = fuse_iget(sb, 0, parent_fi->nodeid, 0, &root_attr, 0, 0,
 			 fuse_get_evict_ctr(fm->fc));
 	/*
 	 * This inode is just a duplicate, so it is not looked up and
@@ -2032,6 +2054,7 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
 	fc->destroy = ctx->destroy;
 	fc->no_control = ctx->no_control;
 	fc->no_force_umount = ctx->no_force_umount;
+	fc->subvol_root_ino = ctx->subvol_root_ino;
 
 	err = -ENOMEM;
 	root = fuse_get_root_inode(sb, ctx->rootmode);
