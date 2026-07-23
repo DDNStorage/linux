@@ -706,16 +706,6 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		else
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
 
-		if (fc->dlm && fc->writeback_cache)
-			/* Invalidate the range exactly as the fuse server requested
-			 * except for the case where it sends -1.
-			 * Note that this can lead to some inconsistencies if
-			 * the fuse server sends unaligned data */
-			fuse_dlm_unlock_range(fi,
-						offset,
-						pg_end == -1 ? 0 :
-						(offset + len - 1));
-
 		/*
 		 * A data invalidation means another (remote) entity is modifying
 		 * the file.  Two things happen here:
@@ -771,6 +761,23 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 */
 			percpu_down_write(wb_sem);
 
+			/*
+			 * Revoke the DLM lock range under the gate write
+			 * side, atomically with the page drop: gate readers
+			 * re-validate their grant right after entering, and
+			 * a grant that passed that check must stay visible
+			 * for their whole gate hold.
+			 * The range is exactly what the fuse server
+			 * requested except for the case where it sends -1.
+			 * Note that this can lead to some inconsistencies
+			 * if the fuse server sends unaligned data.
+			 */
+			if (fc->dlm && fc->writeback_cache)
+				fuse_dlm_unlock_range(fi,
+							offset,
+							pg_end == -1 ? 0 :
+							(offset + len - 1));
+
 			if (hot && has_writer &&
 			    !fuse_inode_force_dio(inode)) {
 				spin_lock(&fi->lock);
@@ -799,6 +806,14 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
 						    nodeid);
 		} else {
+			/* No gate on this inode (mmapped, DAX, backing or
+			 * non-regular): drop the lock range unserialized,
+			 * as before. */
+			if (fc->dlm && fc->writeback_cache)
+				fuse_dlm_unlock_range(fi,
+							offset,
+							pg_end == -1 ? 0 :
+							(offset + len - 1));
 			invalidate_inode_pages2_range(inode->i_mapping,
 						      pg_start, pg_end);
 		}

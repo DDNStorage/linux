@@ -511,44 +511,82 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 }
 
 /**
+ * fuse_dlm_lock_is_held - check that a byte range is covered by a granted lock
+ * @fi:     the fuse inode
+ * @offset: byte offset into the file (need not be page-aligned)
+ * @length: length of the region in bytes (need not be page-aligned)
+ * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ *
+ * Re-validation helper for fuse_get_dlm_lock() callers: checks the same
+ * page-aligned range a fuse_get_dlm_lock() call with these arguments
+ * requests, against the live lock tree.
+ */
+bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
+			   size_t length, enum fuse_page_lock_mode mode)
+{
+	uint64_t end = (offset + length - 1) | (PAGE_SIZE - 1);
+
+	/*
+	 * An empty range needs no coverage.  Reporting it held keeps the
+	 * re-validating IO paths from re-requesting a lock the tree can
+	 * never show (the page-aligned end would invert below).
+	 */
+	if (!length)
+		return true;
+
+	return fuse_dlm_range_is_locked(fi, offset & PAGE_MASK, end, mode);
+}
+
+/**
  * fuse_get_dlm_lock - request a dlm lock from the fuse server
  * @file:   the file being accessed
  * @offset: byte offset into the file (need not be page-aligned)
  * @length: length of the region in bytes (need not be page-aligned)
  * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ *
+ * Return: 0 when the range is covered by a recorded grant on return,
+ * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
+ * recording it failed (covered cluster-wide, invisible to
+ * fuse_dlm_lock_is_held()), a negative error code otherwise.  Callers
+ * re-validating the grant must not re-request on a nonzero return or
+ * they would spin.
  */
-void fuse_get_dlm_lock(struct file *file, loff_t offset,
-		       size_t length, enum fuse_page_lock_mode mode)
+int fuse_get_dlm_lock(struct file *file, loff_t offset,
+		      size_t length, enum fuse_page_lock_mode mode)
 {
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_mount *fm = ff->fm;
-	uint64_t end = (offset + length - 1) | (PAGE_SIZE - 1);
-
-	/* note that the offset and length don't have to be page aligned here
-	 * but since we only get here on writeback caching we will send out
-	 * page aligned requests */
-	offset &= PAGE_MASK;
 
 	FUSE_ARGS(args);
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
 	int err;
 
+	/* An empty range needs no lock. */
+	if (!length)
+		return 0;
+
 	/* note that this can be run from different processes
 	 * at the same time. It is intentionally not protected
 	 * since a DLM implementation in the FUSE server should take care
-	 * of any races in lock requests */
-	if (fuse_dlm_range_is_locked(fi, offset, end, mode))
-		return; /* we already have this area locked */
+	 * of any races in lock requests.
+	 * The early exit uses the same helper the callers re-validate
+	 * with, so this check and a later fuse_dlm_lock_is_held() can
+	 * never disagree about what counts as covered. */
+	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
+		return 0; /* we already have this area locked */
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
 
-	inarg.start = offset;
-	inarg.end = end;
+	/* note that the offset and length don't have to be page aligned
+	 * here but since we only get here on writeback caching we will
+	 * send out page aligned requests */
+	inarg.start = offset & PAGE_MASK;
+	inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
 	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
 		FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
 
@@ -564,21 +602,31 @@ void fuse_get_dlm_lock(struct file *file, loff_t offset,
 	if (err == -ENOSYS) {
 		/* fuse server does not support dlm, save the info */
 		fc->dlm = 0;
-		return;
+		return err;
 	}
 
 	if (err)
-		return;
-	else
-		if (inarg.start < outarg.start ||
-		    inarg.end > outarg.end) {
-			/* fuse server is seriously broken */
-			pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",
-				inarg.start, inarg.end, outarg.start, outarg.end);
-			fuse_abort_conn(fc);
-			return;
-		} else {
-			/* ignore any errors here, there is no way we can react appropriately */
-			fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode);
-		}
+		return err;
+
+	if (inarg.start < outarg.start || inarg.end > outarg.end) {
+		/* fuse server is seriously broken */
+		pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",
+			inarg.start, inarg.end, outarg.start, outarg.end);
+		fuse_abort_conn(fc);
+		return -EIO;
+	}
+
+	/*
+	 * The server granted the lock; record it so
+	 * fuse_dlm_lock_is_held() sees it.  A failure to record
+	 * (small-allocation -ENOMEM) does not undo the grant: coverage
+	 * exists cluster-wide, only the local bookkeeping is missing.
+	 * Report that as FUSE_DLM_GRANT_UNRECORDED so callers neither
+	 * fail an IO that is actually covered nor keep re-requesting a
+	 * grant that will not become visible.
+	 */
+	if (fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode))
+		return FUSE_DLM_GRANT_UNRECORDED;
+
+	return 0;
 }

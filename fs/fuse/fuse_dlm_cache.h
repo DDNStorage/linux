@@ -17,6 +17,15 @@ struct fuse_inode;
 /* Lock modes for page ranges */
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
 
+/*
+ * fuse_get_dlm_lock() result: the server granted the lock but recording
+ * it locally failed, leaving the grant invisible to
+ * fuse_dlm_lock_is_held().  The IO is covered cluster-wide; the caller
+ * must proceed without re-validating (a re-request would spin) instead
+ * of failing the IO.
+ */
+#define FUSE_DLM_GRANT_UNRECORDED 1
+
 /* Page cache lock manager */
 struct fuse_dlm_cache {
 	/* Lock protecting the tree */
@@ -43,8 +52,12 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
 bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 			      uint64_t end, enum fuse_page_lock_mode mode);
 
+/* Re-validate a fuse_get_dlm_lock() grant against the live lock tree */
+bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
+			   size_t length, enum fuse_page_lock_mode mode);
+
 /* This is the interface to the filesystem */
-void fuse_get_dlm_lock(struct file *file, loff_t offset,
-		       size_t length, enum fuse_page_lock_mode mode);
+int fuse_get_dlm_lock(struct file *file, loff_t offset,
+		      size_t length, enum fuse_page_lock_mode mode);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */
