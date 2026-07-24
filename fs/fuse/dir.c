@@ -431,7 +431,8 @@ bool fuse_invalid_attr(struct fuse_attr *attr)
 	return !fuse_valid_type(attr->mode) || !fuse_valid_size(attr->size);
 }
 
-int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
+int fuse_lookup_name(struct super_block *sb, dev_t sub_dev,
+		     u64 nodeid, const struct qstr *name,
 		     struct fuse_entry_out *outarg, struct inode **inode)
 {
 	struct fuse_mount *fm = get_fuse_mount_super(sb);
@@ -468,7 +469,8 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
 		outarg->generation = 0;
 	}
 
-	*inode = fuse_iget(sb, outarg->nodeid, outarg->generation,
+	*inode = fuse_iget(sb, sub_dev,
+			   outarg->nodeid, outarg->generation,
 			   &outarg->attr, ATTR_TIMEOUT(outarg),
 			   attr_version, evict_ctr);
 	err = -ENOMEM;
@@ -498,7 +500,8 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
 		return ERR_PTR(-EIO);
 
 	locked = fuse_lock_inode(dir);
-	err = fuse_lookup_name(dir->i_sb, get_node_id(dir), &entry->d_name,
+	err = fuse_lookup_name(dir->i_sb, get_sub_dev(dir),
+			       get_node_id(dir), &entry->d_name,
 			       &outarg, &inode);
 	fuse_unlock_inode(dir, locked);
 	if (err == -ENOENT) {
@@ -756,7 +759,8 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	ff->fh = outopen.fh;
 	ff->nodeid = outentry.nodeid;
 	ff->open_flags = outopen.open_flags;
-	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
+	inode = fuse_iget(dir->i_sb, get_sub_dev(dir),
+			  outentry.nodeid, outentry.generation,
 			  &outentry.attr, ATTR_TIMEOUT(&outentry), 0, 0);
 	if (!inode) {
 		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
@@ -886,8 +890,9 @@ static int create_new_entry(struct fuse_mount *fm, struct fuse_args *args,
 	if ((outarg.attr.mode ^ mode) & S_IFMT)
 		goto out_put_forget_req;
 
-	inode = fuse_iget(dir->i_sb, outarg.nodeid, outarg.generation,
-			  &outarg.attr, ATTR_TIMEOUT(&outarg), 0, 0);
+	inode = fuse_iget(dir->i_sb, get_sub_dev(dir), outarg.nodeid,
+			  outarg.generation, &outarg.attr,
+			  ATTR_TIMEOUT(&outarg), 0, 0);
 	if (!inode) {
 		fuse_queue_forget(fm->fc, forget, outarg.nodeid, 1);
 		return -ENOMEM;
@@ -1207,8 +1212,9 @@ static void fuse_fillattr(struct inode *inode, struct fuse_attr *attr,
 {
 	unsigned int blkbits;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 
-	stat->dev = inode->i_sb->s_dev;
+	stat->dev = fi->sub_dev ? fi->sub_dev : inode->i_sb->s_dev;
 	stat->ino = attr->ino;
 	stat->mode = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
 	stat->nlink = attr->nlink;
@@ -1446,6 +1452,8 @@ retry:
 		generic_fillattr(&nop_mnt_idmap, sx_mask, inode, stat);
 		stat->mode = fi->orig_i_mode;
 		stat->ino = fi->orig_ino;
+		if (fi->sub_dev)
+			stat->dev = fi->sub_dev;
 		if (test_bit(FUSE_I_BTIME, &fi->state)) {
 			stat->btime = fi->i_btime;
 			stat->result_mask |= STATX_BTIME;
@@ -2247,8 +2255,9 @@ static int fuse_getattr(struct mnt_idmap *idmap,
 			 * If user explicitly requested *nothing* then don't
 			 * error out, but return st_dev only.
 			 */
+			struct fuse_inode *fi = get_fuse_inode(inode);
 			stat->result_mask = 0;
-			stat->dev = inode->i_sb->s_dev;
+			stat->dev = fi->sub_dev ? fi->sub_dev : inode->i_sb->s_dev;
 			return 0;
 		}
 		return -EACCES;
