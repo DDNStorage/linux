@@ -120,26 +120,25 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 			       uint64_t end)
 {
 	struct fuse_dlm_range *range, *next;
-	struct rb_node *node;
+	uint64_t first = start ? start - 1 : start;
+	uint64_t last = end < U64_MAX ? end + 1 : end;
 
 	if (!cache)
 		return;
 
-	/* Find the first range that might need merging */
-	range = NULL;
-	node = rb_first_cached(&cache->ranges);
-	while (node) {
-		range = rb_entry(node, struct fuse_dlm_range, rb);
-		if (range->end >= start - 1)
-			break;
-		node = rb_next(node);
-	}
-
-	if (!range || range->start > end + 1)
-		return;
+	/*
+	 * Find the first range that might need merging.  Directly adjacent
+	 * ranges can merge, hence the region is widened by one unit to each
+	 * side (saturating at the type bounds).  This must stay an
+	 * interval-tree lookup: the tree holds every cached grant of the
+	 * inode and strided writers grow it for the lifetime of the file,
+	 * so seeding the merge by walking from the tree minimum would make
+	 * every new grant cost a full scan.
+	 */
+	range = fuse_page_it_iter_first(&cache->ranges, first, last);
 
 	/* Try to merge ranges in and around the specified region */
-	while (range && range->start <= end + 1) {
+	while (range && range->start <= last) {
 		/* Get next range before we potentially modify the tree */
 		next = NULL;
 		if (rb_next(&range->rb)) {
@@ -150,11 +149,11 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 		/* Try to merge with next range if adjacent and same mode */
 		if (next && range->mode == next->mode &&
 		    range->end + 1 == next->start) {
-			/* Merge ranges */
-			range->end = next->end;
-
-			/* Remove next from tree */
+			/* Merge ranges: re-insert so __subtree_end is updated */
 			fuse_page_it_remove(next, &cache->ranges);
+			fuse_page_it_remove(range, &cache->ranges);
+			range->end = next->end;
+			fuse_page_it_insert(range, &cache->ranges);
 			kfree(next);
 
 			/* Continue with the same range */
@@ -188,6 +187,7 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range, *new_range, *next;
 	int lock_mode;
+	bool covered_to_end = false;
 	int ret = 0;
 	LIST_HEAD(to_lock);
 	LIST_HEAD(to_upgrade);
@@ -233,14 +233,17 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 		}
 
 		/* Move current_start past this range */
-		current_start = max(current_start, range->end + 1);
+		if (range->end >= end)
+			covered_to_end = true;
+		else
+			current_start = max(current_start, range->end + 1);
 
 		/* Move to next range */
 		range = next;
 	}
 
 	/* If there's a gap after the last range to the end, extend the range */
-	if (current_start <= end) {
+	if (!covered_to_end && current_start <= end) {
 		new_range = kmalloc(sizeof(*new_range), GFP_KERNEL);
 		if (!new_range) {
 			ret = -ENOMEM;
@@ -322,13 +325,17 @@ static int fuse_dlm_punch_hole(struct fuse_dlm_cache *cache, uint64_t start,
 
 	/* If the hole is at the beginning of the range */
 	if (start == range->start) {
+		fuse_page_it_remove(range, &cache->ranges);
 		range->start = end + 1;
+		fuse_page_it_insert(range, &cache->ranges);
 		goto out;
 	}
 
 	/* If the hole is at the end of the range */
 	if (end == range->end) {
+		fuse_page_it_remove(range, &cache->ranges);
 		range->end = start - 1;
+		fuse_page_it_insert(range, &cache->ranges);
 		goto out;
 	}
 
@@ -400,10 +407,14 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 			break;
 		} else if (start > range->start) {
 			/* Adjust the end of the range */
+			fuse_page_it_remove(range, &cache->ranges);
 			range->end = start - 1;
+			fuse_page_it_insert(range, &cache->ranges);
 		} else if (end < range->end) {
 			/* Adjust the start of the range */
+			fuse_page_it_remove(range, &cache->ranges);
 			range->start = end + 1;
+			fuse_page_it_insert(range, &cache->ranges);
 		} else {
 			/* Complete overlap, remove the range */
 			fuse_page_it_remove(range, &cache->ranges);
@@ -473,6 +484,12 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 			/* Found a gap */
 			up_read(&cache->lock);
 			return false;
+		}
+
+		/* Covered through the end of the requested range? */
+		if (range->end >= end) {
+			up_read(&cache->lock);
+			return true;
 		}
 
 		/* Move current_start past this range */
