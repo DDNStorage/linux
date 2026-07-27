@@ -750,8 +750,23 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	pgoff_t pg_end;
 
 	inode = fuse_ilookup(fc, nodeid, NULL);
-	if (!inode)
-		return -ENOENT;
+	if (!inode) {
+		/*
+		 * Not in the icache, but a LOOKUP/READDIRPLUS reply carrying
+		 * pre-invalidation attributes may be about to create it.  Bump
+		 * evict_ctr so that such a reply leaves the new inode's
+		 * attributes invalid (see fuse_change_attributes_common()),
+		 * then look up again in case the inode was hashed while we
+		 * were bumping.  ilookup5() and iget5_locked() serialize on
+		 * the inode hash lock, so if the second lookup still misses,
+		 * the creator inserted after it and is guaranteed to observe
+		 * the bumped counter.
+		 */
+		atomic64_inc(&fc->evict_ctr);
+		inode = fuse_ilookup(fc, nodeid, NULL);
+		if (!inode)
+			return -ENOENT;
+	}
 
 	fi = get_fuse_inode(inode);
 
