@@ -384,7 +384,6 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 		set_mask_bits(&fi->inval_mask, STATX_BASIC_STATS, 0);
 
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
-	wake_up_all(&fc->attr_version_waitq);
 	fi->i_time = attr_valid;
 	fi->i_perm_time = attr_valid;
 
@@ -772,17 +771,10 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	}
 
 	fi = get_fuse_inode(inode);
-
 	spin_lock(&fi->lock);
-	while (fi->attr_version == 0) {
-		spin_unlock(&fi->lock);
-		wait_event(fc->attr_version_waitq, READ_ONCE(fi->attr_version) != 0);
-		spin_lock(&fi->lock);
-	}
-
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	spin_unlock(&fi->lock);
-	
+
 	if (fc->inval_inode_entries)
 		fuse_invalidate_inode_entry(inode);
 	else if (fc->expire_inode_entries)
@@ -1200,7 +1192,6 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	refcount_set(&fc->count, 1);
 	atomic_set(&fc->dev_count, 1);
 	init_waitqueue_head(&fc->blocked_waitq);
-	init_waitqueue_head(&fc->attr_version_waitq);
 	fuse_iqueue_init(&fc->iq, fiq_ops, fiq_priv);
 	INIT_LIST_HEAD(&fc->bg_queue);
 	INIT_LIST_HEAD(&fc->entry);
