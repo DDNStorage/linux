@@ -701,6 +701,7 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 	struct fuse_entry_out outentry;
 	struct fuse_inode *fi;
 	struct fuse_file *ff;
+	u64 evict_ctr;
 	bool trunc = flags & O_TRUNC;
 
 	/* Userspace expects S_IFREG in create mode */
@@ -750,6 +751,8 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 	if (err)
 		goto out_free_ff;
 
+	evict_ctr = fuse_get_evict_ctr(fm->fc);
+
 	err = fuse_simple_idmap_request(idmap, fm, &args);
 	free_ext_value(&args);
 	if (err)
@@ -764,7 +767,7 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 	ff->nodeid = outentry.nodeid;
 	ff->open_flags = outopenp->open_flags;
 	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
-			  &outentry.attr, ATTR_TIMEOUT(&outentry), 0, 0);
+			  &outentry.attr, ATTR_TIMEOUT(&outentry), 0, evict_ctr);
 	if (!inode) {
 		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
 		fuse_sync_release(NULL, ff, flags);
@@ -862,6 +865,7 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
 	struct dentry *d;
 	int err;
 	struct fuse_forget_link *forget;
+	u64 evict_ctr;
 
 	if (fuse_is_bad(dir))
 		return -EIO;
@@ -882,6 +886,8 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
 			goto out_put_forget_req;
 	}
 
+	evict_ctr = fuse_get_evict_ctr(fm->fc);
+
 	err = fuse_simple_idmap_request(idmap, fm, args);
 	free_ext_value(args);
 	if (err)
@@ -895,7 +901,7 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
 		goto out_put_forget_req;
 
 	inode = fuse_iget(dir->i_sb, outarg.nodeid, outarg.generation,
-			  &outarg.attr, ATTR_TIMEOUT(&outarg), 0, 0);
+			  &outarg.attr, ATTR_TIMEOUT(&outarg), 0, evict_ctr);
 	if (!inode) {
 		fuse_queue_forget(fm->fc, forget, outarg.nodeid, 1);
 		return -ENOMEM;
