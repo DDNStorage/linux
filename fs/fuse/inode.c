@@ -217,6 +217,26 @@ static ino_t fuse_squash_ino(u64 ino64)
 }
 
 /*
+ * May attributes returned by a request be marked valid, i.e. cleared
+ * from inval_mask?
+ *
+ * Not if they come from a fuse_iget() call whose request raced with an
+ * evict or a reverse invalidation - either would have invalidated the
+ * result if the inode's attr_version would've been preserved.
+ *
+ * !evict_ctr -> this is not fuse_iget()
+ * fi->attr_version != 0 -> this is not a new inode
+ * evict_ctr == fuse_get_evict_ctr() -> no evicts or missed
+ * invalidations during the request
+ */
+static bool fuse_may_validate_attrs(struct fuse_conn *fc,
+				    struct fuse_inode *fi, u64 evict_ctr)
+{
+	return !evict_ctr || fi->attr_version ||
+	       evict_ctr == fuse_get_evict_ctr(fc);
+}
+
+/*
  * Handle statx-specific attribute updates with partial attribute support.
  */
 static void fuse_change_attributes_common_sx(struct inode *inode,
@@ -231,18 +251,8 @@ static void fuse_change_attributes_common_sx(struct inode *inode,
 
 	lockdep_assert_held(&fi->lock);
 
-	/*
-	 * Clear returned basic stats from invalid mask.
-	 *
-	 * Don't do this if this is coming from a fuse_iget() call and there
-	 * might have been a racing evict which would've invalidated the result
-	 * if the attr_version would've been preserved.
-	 *
-	 * !evict_ctr -> this is create
-	 * fi->attr_version != 0 -> this is not a new inode
-	 * evict_ctr == fuse_get_evict_ctr() -> no evicts while during request
-	 */
-	if (!evict_ctr || fi->attr_version || evict_ctr == fuse_get_evict_ctr(fc))
+	/* Clear returned basic stats from invalid mask */
+	if (fuse_may_validate_attrs(fc, fi, evict_ctr))
 		set_mask_bits(&fi->inval_mask, returned_attrs, 0);
 
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
@@ -369,18 +379,8 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 							evict_ctr);
 	}
 
-	/*
-	 * Clear basic stats from invalid mask.
-	 *
-	 * Don't do this if this is coming from a fuse_iget() call and there
-	 * might have been a racing evict which would've invalidated the result
-	 * if the attr_version would've been preserved.
-	 *
-	 * !evict_ctr -> this is create
-	 * fi->attr_version != 0 -> this is not a new inode
-	 * evict_ctr == fuse_get_evict_ctr() -> no evicts while during request
-	 */
-	if (!evict_ctr || fi->attr_version || evict_ctr == fuse_get_evict_ctr(fc))
+	/* Clear basic stats from invalid mask */
+	if (fuse_may_validate_attrs(fc, fi, evict_ctr))
 		set_mask_bits(&fi->inval_mask, STATX_BASIC_STATS, 0);
 
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
