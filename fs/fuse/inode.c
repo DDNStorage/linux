@@ -755,13 +755,17 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 *    (stale read / lost write).
 		 *
 		 * The gate (and the average) exist only for writeback+dlm regular
-		 * files, and not while mmapped; elsewhere wb_sem is NULL and the
-		 * invalidate runs unserialized (best-effort), as before.
+		 * files; elsewhere wb_sem is NULL and the invalidate runs
+		 * unserialized (best-effort), as before.  An mmapped inode
+		 * keeps the gate -- fuse_cache_read_iter() and
+		 * fuse_cache_write_iter() enter it unconditionally and rely
+		 * on the revoke staying fenced -- but is never latched:
+		 * a mapping needs the page cache, and fuse_file_mmap()
+		 * reverts any latch it races with.
 		 */
 		if (S_ISREG(inode->i_mode) && fc->writeback_cache &&
 		    fc->dlm && !FUSE_IS_DAX(inode) &&
-		    !fuse_inode_backing(fi) &&
-		    !mapping_mapped(inode->i_mapping))
+		    !fuse_inode_backing(fi))
 			wb_sem = fi->wb_inval_rwsem;
 
 		if (wb_sem) {
@@ -791,6 +795,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				fuse_dlm_revoke_inval_range(fi, offset, len);
 
 			if (hot && has_writer &&
+			    !mapping_mapped(inode->i_mapping) &&
 			    !fuse_inode_force_dio(inode)) {
 				spin_lock(&fi->lock);
 				if (!list_empty(&fi->write_files)) {
@@ -818,9 +823,9 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
 						    nodeid);
 		} else {
-			/* No gate on this inode (mmapped, DAX, backing or
-			 * non-regular): drop the lock range unserialized,
-			 * as before. */
+			/* No gate on this inode (DAX, backing, non-regular,
+			 * or the gate allocation failed): drop the lock
+			 * range unserialized (best-effort), as before. */
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
 			invalidate_inode_pages2_range(inode->i_mapping,
