@@ -32,6 +32,13 @@ struct fuse_dlm_cache {
 	struct rw_semaphore lock;
 	/* Interval tree of locked ranges */
 	struct rb_root_cached ranges;
+	/*
+	 * Bumped under @lock by every revocation
+	 * (fuse_dlm_unlock_range(), fuse_dlm_cache_release_locks());
+	 * lets fuse_get_dlm_lock() order recording a reply's grant
+	 * against revokes processed while the reply was in flight.
+	 */
+	uint64_t revoke_gen;
 };
 
 /* Initialize a page cache lock manager */
@@ -43,6 +50,14 @@ void fuse_dlm_cache_release_locks(struct fuse_inode *inode);
 /* Lock a range of pages */
 int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 			uint64_t end, enum fuse_page_lock_mode mode);
+
+/* As above, but refuse (-EAGAIN) if a revoke ran since @gen was sampled */
+int fuse_dlm_lock_range_gen(struct fuse_inode *inode, uint64_t start,
+			    uint64_t end, enum fuse_page_lock_mode mode,
+			    uint64_t gen);
+
+/* Sample the revocation generation (see fuse_dlm_lock_range_gen()) */
+uint64_t fuse_dlm_revoke_gen(struct fuse_inode *inode);
 
 /* Unlock a range of pages */
 int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
