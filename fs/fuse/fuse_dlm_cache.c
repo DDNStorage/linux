@@ -31,6 +31,12 @@ struct fuse_dlm_range {
 #define FUSE_PCACHE_LK_READ 1 /* Shared read lock */
 #define FUSE_PCACHE_LK_WRITE 2 /* Exclusive write lock */
 
+/*
+ * Bound on re-requesting a grant whose recording lost against a
+ * concurrent revoke; see fuse_get_dlm_lock().
+ */
+#define FUSE_DLM_RECORD_TRIES 3
+
 /* Interval tree definitions for page ranges */
 static inline uint64_t fuse_dlm_range_start(struct fuse_dlm_range *range)
 {
@@ -63,6 +69,7 @@ int fuse_dlm_cache_init(struct fuse_inode *inode)
 
 	init_rwsem(&cache->lock);
 	cache->ranges = RB_ROOT_CACHED;
+	cache->revoke_gen = 0;
 
 	return 0;
 }
@@ -84,6 +91,7 @@ void fuse_dlm_cache_release_locks(struct fuse_inode *inode)
 
 	/* Release all locks */
 	down_write(&cache->lock);
+	WRITE_ONCE(cache->revoke_gen, cache->revoke_gen + 1);
 	while ((node = rb_first_cached(&cache->ranges)) != NULL) {
 		range = rb_entry(node, struct fuse_dlm_range, rb);
 		fuse_page_it_remove(range, &cache->ranges);
@@ -166,11 +174,13 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 }
 
 /**
- * fuse_dlm_lock_range - Lock a range of pages
+ * __fuse_dlm_lock_range - Lock a range of pages
  * @cache: The page cache
  * @start: Start page offset
  * @end: End page offset
  * @mode: Lock mode (read or write)
+ * @genp: If non-NULL, the revocation generation sampled before the grant
+ *        was requested; recording fails with -EAGAIN if it has moved
  *
  * Add a locked range on the specified range of pages.
  * If parts of the range are already locked, only add the remaining parts.
@@ -181,8 +191,9 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
  *
  * Return: 0 on success, negative error code on failure
  */
-int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
-			uint64_t end, enum fuse_page_lock_mode mode)
+static int __fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
+				 uint64_t end, enum fuse_page_lock_mode mode,
+				 const uint64_t *genp)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range, *new_range, *next;
@@ -201,6 +212,17 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 						    FUSE_PCACHE_LK_WRITE;
 
 	down_write(&cache->lock);
+
+	/*
+	 * A revoke was processed after @genp was sampled; the grant this
+	 * record carries may be the very one it targeted (a revoke of a
+	 * not-yet-recorded grant removes nothing and would never be
+	 * retried).  Refuse, the caller re-requests.
+	 */
+	if (genp && cache->revoke_gen != *genp) {
+		up_write(&cache->lock);
+		return -EAGAIN;
+	}
 
 	/* Find all ranges that overlap with [start, end] */
 	range = fuse_page_it_iter_first(&cache->ranges, start, end);
@@ -297,6 +319,35 @@ out_free:
 	return ret;
 }
 
+int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
+			uint64_t end, enum fuse_page_lock_mode mode)
+{
+	return __fuse_dlm_lock_range(inode, start, end, mode, NULL);
+}
+
+int fuse_dlm_lock_range_gen(struct fuse_inode *inode, uint64_t start,
+			    uint64_t end, enum fuse_page_lock_mode mode,
+			    uint64_t gen)
+{
+	return __fuse_dlm_lock_range(inode, start, end, mode, &gen);
+}
+
+/**
+ * fuse_dlm_revoke_gen - sample the revocation generation
+ * @inode: the fuse inode
+ *
+ * Sampled before a FUSE_DLM_WB_LOCK request leaves the client.  The
+ * reply and a NOTIFY revoke can be serviced on different threads, so a
+ * revoke may be processed between the reply arriving and its grant
+ * being recorded.  fuse_dlm_lock_range_gen() re-checks the generation
+ * under the cache lock and refuses to record a grant such a revoke may
+ * have already killed.
+ */
+uint64_t fuse_dlm_revoke_gen(struct fuse_inode *inode)
+{
+	return READ_ONCE(inode->dlm_locked_areas.revoke_gen);
+}
+
 /**
  * fuse_dlm_punch_hole - Punch a hole in a locked range
  * @cache: The page cache
@@ -389,6 +440,14 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 		return -EINVAL;
 
 	down_write(&cache->lock);
+
+	/*
+	 * Unconditional, even when nothing overlaps: the revoke racing
+	 * with an in-flight grant finds an empty tree precisely because
+	 * the grant is not recorded yet, and the bump is what makes the
+	 * recording side notice (see fuse_dlm_lock_range_gen()).
+	 */
+	WRITE_ONCE(cache->revoke_gen, cache->revoke_gen + 1);
 
 	/* Find all ranges that overlap with [start, end] */
 	range = fuse_page_it_iter_first(&cache->ranges, start, end);
@@ -562,12 +621,15 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	FUSE_ARGS(args);
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
+	uint64_t gen;
+	int tries = FUSE_DLM_RECORD_TRIES;
 	int err;
 
 	/* An empty range needs no lock. */
 	if (!length)
 		return 0;
 
+restart:
 	/* note that this can be run from different processes
 	 * at the same time. It is intentionally not protected
 	 * since a DLM implementation in the FUSE server should take care
@@ -577,6 +639,16 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	 * never disagree about what counts as covered. */
 	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
 		return 0; /* we already have this area locked */
+
+	/*
+	 * Sample the revocation generation before the request leaves.
+	 * The reply and a NOTIFY revoke are serviced on different
+	 * threads, so a revoke aimed at the grant this request returns
+	 * can be processed before the grant is recorded below --
+	 * recording it anyway would resurrect a dead grant that no later
+	 * NOTIFY will ever remove.
+	 */
+	gen = fuse_dlm_revoke_gen(fi);
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
@@ -617,14 +689,32 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 
 	/*
 	 * The server granted the lock; record it so
-	 * fuse_dlm_lock_is_held() sees it.  A failure to record
-	 * (small-allocation -ENOMEM) does not undo the grant: coverage
-	 * exists cluster-wide, only the local bookkeeping is missing.
-	 * Report that as FUSE_DLM_GRANT_UNRECORDED so callers neither
-	 * fail an IO that is actually covered nor keep re-requesting a
-	 * grant that will not become visible.
+	 * fuse_dlm_lock_is_held() sees it.
 	 */
-	if (fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode))
+	err = fuse_dlm_lock_range_gen(fi, outarg.start, outarg.end, mode, gen);
+	if (err == -EAGAIN) {
+		/*
+		 * A revoke was processed while the request was in flight;
+		 * the grant may already be dead, so re-request instead of
+		 * recording it.  Bounded: a revoke storm must not pin the
+		 * IO here -- past the bound the failure is reported like
+		 * any other request failure (the write path fails the
+		 * write, the read path serves unlocked).
+		 */
+		if (--tries)
+			goto restart;
+		return -EAGAIN;
+	}
+
+	/*
+	 * A failure to record (small-allocation -ENOMEM) does not undo
+	 * the grant: coverage exists cluster-wide, only the local
+	 * bookkeeping is missing.  Report that as
+	 * FUSE_DLM_GRANT_UNRECORDED so callers neither fail an IO that
+	 * is actually covered nor keep re-requesting a grant that will
+	 * not become visible.
+	 */
+	if (err)
 		return FUSE_DLM_GRANT_UNRECORDED;
 
 	return 0;
