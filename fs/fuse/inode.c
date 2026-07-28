@@ -666,6 +666,25 @@ static bool fuse_notify_inval_hot(struct fuse_inode *fi)
 	return avg < FUSE_NOTIFY_DIO_INTERVAL;
 }
 
+/*
+ * Revoke the DLM grants backing an invalidated byte range.  Grants are
+ * recorded page-aligned, so widen the revoke to page boundaries: dropping
+ * more than the server invalidated only costs a re-request, dropping less
+ * would leave a stale grant that fuse_dlm_lock_is_held() keeps trusting.
+ * len <= 0 means "invalidate to EOF" (see fuse_notify_inval_inode()) and
+ * revokes through U64_MAX -- it must not become an inverted range, which
+ * fuse_dlm_unlock_range() rejects without removing anything.
+ */
+static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
+					loff_t len)
+{
+	uint64_t start = (uint64_t)offset & PAGE_MASK;
+	uint64_t end = len <= 0 ? U64_MAX :
+		       (((uint64_t)offset + len - 1) | (PAGE_SIZE - 1));
+
+	fuse_dlm_unlock_range(fi, start, end);
+}
+
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len)
 {
@@ -767,16 +786,9 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * re-validate their grant right after entering, and
 			 * a grant that passed that check must stay visible
 			 * for their whole gate hold.
-			 * The range is exactly what the fuse server
-			 * requested except for the case where it sends -1.
-			 * Note that this can lead to some inconsistencies
-			 * if the fuse server sends unaligned data.
 			 */
 			if (fc->dlm && fc->writeback_cache)
-				fuse_dlm_unlock_range(fi,
-							offset,
-							pg_end == -1 ? 0 :
-							(offset + len - 1));
+				fuse_dlm_revoke_inval_range(fi, offset, len);
 
 			if (hot && has_writer &&
 			    !fuse_inode_force_dio(inode)) {
@@ -810,10 +822,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * non-regular): drop the lock range unserialized,
 			 * as before. */
 			if (fc->dlm && fc->writeback_cache)
-				fuse_dlm_unlock_range(fi,
-							offset,
-							pg_end == -1 ? 0 :
-							(offset + len - 1));
+				fuse_dlm_revoke_inval_range(fi, offset, len);
 			invalidate_inode_pages2_range(inode->i_mapping,
 						      pg_start, pg_end);
 		}
