@@ -1833,9 +1833,12 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		return fuse_direct_write_iter(iocb, from);
 
 	if (fc->writeback_cache) {
-		/* Update size (EOF optimization) and mode (SUID clearing) */
-		err = fuse_update_attributes(mapping->host, file,
-					     STATX_SIZE | STATX_MODE);
+		/* Update mode for SUID clearing, and also update size if the file
+		 * is opened with O_APPEND mode.
+		 */
+		u32 request_mask = (file->f_flags & O_APPEND) ?
+				   (STATX_SIZE | STATX_MODE) : STATX_MODE;
+		err = fuse_update_attributes(mapping->host, file, request_mask);
 		if (err)
 			return err;
 
