@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/page-flags.h>
+#include <linux/task_work.h>
 
 static bool __read_mostly enable_uring;
 module_param(enable_uring, bool, 0644);
@@ -99,8 +100,8 @@ static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
 	}
 }
 
-static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
-			       int error)
+static void __fuse_uring_req_end(struct fuse_ring_ent *ent,
+				 struct fuse_req *req, int error)
 {
 	struct fuse_ring_queue *queue = ent->queue;
 	struct fuse_ring *ring = queue->ring;
@@ -123,6 +124,43 @@ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
 		req->out.h.error = error;
 
 	clear_bit(FR_SENT, &req->flags);
+}
+
+static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
+			       int error)
+{
+	__fuse_uring_req_end(ent, req, error);
+	fuse_request_end(req);
+}
+
+static void fuse_uring_req_end_work(struct callback_head *work)
+{
+	struct fuse_req *req = container_of(work, struct fuse_req,
+					    ring_end_work);
+
+	fuse_request_end(req);
+}
+
+/*
+ * On the commit path ->uring_cmd() runs with ctx->uring_lock held by
+ * io_uring_enter(). fuse_request_end() wakes the request submitter, which
+ * typically preempts the ring task right away (same CPU) - while the mutex
+ * is still held. Defer the completion to task work, which runs once the
+ * submission path has released the lock (in io_cqring_wait() or on return
+ * to userspace), so the ring task can finish its critical section first.
+ */
+static void fuse_uring_req_end_deferred(struct fuse_ring_ent *ent,
+					struct fuse_req *req, int error,
+					unsigned int issue_flags)
+{
+	__fuse_uring_req_end(ent, req, error);
+
+	if (!(issue_flags & IO_URING_F_UNLOCKED)) {
+		init_task_work(&req->ring_end_work, fuse_uring_req_end_work);
+		if (!task_work_add(current, &req->ring_end_work, TWA_RESUME))
+			return;
+	}
+
 	fuse_request_end(req);
 }
 
@@ -1059,7 +1097,7 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
 
 	err = fuse_uring_copy_from_ring(ring, req, ent);
 out:
-	fuse_uring_req_end(ent, req, err);
+	fuse_uring_req_end_deferred(ent, req, err, issue_flags);
 }
 
 /*

@@ -558,6 +558,8 @@ struct fuse_req {
 #ifdef CONFIG_FUSE_IO_URING
 	void *ring_entry;
 	void *ring_queue;
+	/** Defers fuse_request_end() to the ring task's task work */
+	struct callback_head ring_end_work;
 #endif
 	/** When (in jiffies) the request was created */
 	unsigned long create_time;
