@@ -710,6 +710,7 @@ static void fuse_prune_aliases(struct inode *inode)
 
 	spin_lock(&inode->i_lock);
 	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
+		fuse_entry_invalidated(dentry);
 		fuse_invalidate_entry_cache(dentry);
 	}
 	spin_unlock(&inode->i_lock);
@@ -726,6 +727,7 @@ static void fuse_invalidate_inode_entry(struct inode *inode)
 		dentry = d_find_alias(inode);
 		if (dentry) {
 			d_invalidate(dentry);
+			fuse_entry_invalidated(dentry);
 			fuse_invalidate_entry_cache(dentry);
 			dput(dentry);
 		}
@@ -737,6 +739,7 @@ static void fuse_invalidate_inode_entry(struct inode *inode)
 			if (!d_unhashed(dentry))
 				__d_drop(dentry);
 			spin_unlock(&dentry->d_lock);
+			fuse_entry_invalidated(dentry);
 			fuse_invalidate_entry_cache(dentry);
 		}
 		spin_unlock(&inode->i_lock);

@@ -1264,6 +1264,8 @@ void fuse_invalidate_attr_mask(struct inode *inode, u32 mask);
 
 void fuse_invalidate_entry_cache(struct dentry *entry);
 
+void fuse_entry_invalidated(struct dentry *entry);
+
 void fuse_invalidate_atime(struct inode *inode);
 
 u64 fuse_time_to_jiffies(u64 sec, u32 nsec);

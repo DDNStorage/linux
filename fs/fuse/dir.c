@@ -139,6 +139,26 @@ static void fuse_dir_changed(struct inode *dir)
 }
 
 /*
+ * Note in the parent directory that one of its entries was invalidated.
+ *
+ * This bumps the same change counter as fuse_dir_changed(), which doubles as a
+ * generation for the parent's entry cache: fuse_dentry_revalidate() samples it
+ * before sending its LOOKUP and refuses to re-arm the entry timeout if it moved
+ * meanwhile.
+ *
+ * Only for invalidations coming from the server - a plain
+ * fuse_invalidate_entry_cache() (a negative lookup, say) must not bump the
+ * counter, or it would needlessly drop the readdir cache as well.
+ */
+void fuse_entry_invalidated(struct dentry *entry)
+{
+	/* d_lock keeps d_parent stable; a live child pins its parent inode */
+	spin_lock(&entry->d_lock);
+	inode_maybe_inc_iversion(d_inode(entry->d_parent), false);
+	spin_unlock(&entry->d_lock);
+}
+
+/*
  * Mark the attributes as stale due to an atime change.  Avoid the invalidate if
  * atime is not used.
  */
@@ -275,7 +295,7 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		struct fuse_lookupx_out ext_out;
 		struct fuse_statx sx;
 		struct fuse_forget_link *forget;
-		u64 attr_version;
+		u64 attr_version, dir_version;
 		uint32_t lookupx_flags = FUSE_LOOKUPX_FOR_REVALIDATE;
 
 		/* For negative dentries, always do a fresh lookup */
@@ -298,6 +318,19 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 			lookupx_flags |= FUSE_LOOKUPX_TARGET_WAS_DIR;
 
 		parent = dget_parent(entry);
+		/*
+		 * Unlike ->lookup() and the create paths, revalidate runs
+		 * without the parent's i_rwsem, so it does not exclude
+		 * fuse_reverse_inval_entry().  An invalidation for this name
+		 * can therefore land while the LOOKUP is in flight, and
+		 * re-arming the entry timeout from the reply below would
+		 * silently undo it - permanently so for FUSE_EXPIRE_ONLY and
+		 * for fuse_prune_aliases(), which leave the dentry hashed.
+		 *
+		 * Sample the parent's entry-cache generation here and compare
+		 * it once the reply is in.
+		 */
+		dir_version = inode_query_iversion(d_inode(parent));
 		ret = fuse_do_lookupx(fm, get_node_id(d_inode(parent)),
 					&entry->d_name, &ext_out,
 					lookupx_flags);
@@ -329,7 +362,11 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 		fuse_change_attributes(inode, &ext_out.entry.attr, &sx,
 				       ATTR_TIMEOUT(&ext_out.entry),
 				       attr_version);
-		fuse_change_entry_timeout(entry, &ext_out.entry);
+
+		parent = dget_parent(entry);
+		if (inode_peek_iversion(d_inode(parent)) == dir_version)
+			fuse_change_entry_timeout(entry, &ext_out.entry);
+		dput(parent);
 	} else if (inode) {
 		fi = get_fuse_inode(inode);
 		if (flags & LOOKUP_RCU) {
