@@ -1960,7 +1960,7 @@ static struct fuse_file *fuse_write_file_get(struct fuse_inode *fi)
 int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	struct fuse_file *ff;
+	struct fuse_file *ff = NULL;
 	int err;
 
 	/*
@@ -1974,7 +1974,8 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	 */
 	WARN_ON(wbc->for_reclaim);
 
-	ff = __fuse_write_file_get(fi);
+	if (S_ISREG(inode->i_mode))
+		ff = __fuse_write_file_get(fi);
 	err = fuse_flush_times(inode, ff);
 	if (ff)
 		fuse_file_put(ff, false);

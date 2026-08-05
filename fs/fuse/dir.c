@@ -144,6 +144,10 @@ static void fuse_dir_changed(struct inode *dir)
  */
 void fuse_invalidate_atime(struct inode *inode)
 {
+	/* don't invalidate atime if it's updated by kernel locally */
+	if (!(inode->i_flags & S_NOATIME))
+		return;
+
 	if (!IS_RDONLY(inode))
 		fuse_invalidate_attr_mask(inode, STATX_ATIME);
 }
@@ -1011,6 +1015,9 @@ static void fuse_update_ctime_in_cache(struct inode *inode)
 {
 	if (!IS_NOCMTIME(inode)) {
 		inode_set_ctime_current(inode);
+		/* see comment in fuse_update_time() */
+		smp_mb__before_atomic();
+		set_bit(FUSE_I_CMTIME_DIRTY, &get_fuse_inode(inode)->state);
 		mark_inode_dirty_sync(inode);
 		fuse_flush_time_update(inode);
 	}
@@ -1947,11 +1954,43 @@ static void fuse_setattr_fill(struct fuse_conn *fc, struct fuse_args *args,
 }
 
 /*
- * Flush inode->i_mtime to the server
+ * Record which timestamps the VFS updated locally, so that
+ * fuse_flush_times() only sends the ones that are actually dirty.
+ */
+static int fuse_update_time(struct inode *inode, int flags)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	int updated;
+	int dirty_flags = 0;
+
+	updated = inode_update_timestamps(inode, flags);
+	if (updated & (S_ATIME|S_MTIME|S_CTIME)) {
+		/*
+		 * Pair with smp_mb__after_atomic() in redfs_flush_times().
+		 * Ensure timestamps are visible before we set the dirty bits.
+		 */
+		smp_mb__before_atomic();
+
+		if (updated & S_ATIME)
+			set_bit(FUSE_I_ATIME_DIRTY, &fi->state);
+		if (updated & (S_CTIME | S_MTIME))
+			set_bit(FUSE_I_CMTIME_DIRTY, &fi->state);
+
+		dirty_flags = inode->i_sb->s_flags & SB_LAZYTIME ? I_DIRTY_TIME : I_DIRTY_SYNC;
+	}
+
+	__mark_inode_dirty(inode, dirty_flags);
+
+	return 0;
+}
+
+/*
+ * Flush locally maintained timestamps to the server
  */
 int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	FUSE_ARGS(args);
 	struct fuse_setattr_in inarg;
 	struct fuse_attr_out outarg;
@@ -1959,14 +1998,44 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outarg, 0, sizeof(outarg));
 
-	inarg.valid = FATTR_MTIME;
-	inarg.mtime = inode_get_mtime_sec(inode);
-	inarg.mtimensec = inode_get_mtime_nsec(inode);
-	if (fm->fc->minor >= 23) {
-		inarg.valid |= FATTR_CTIME;
-		inarg.ctime = inode_get_ctime_sec(inode);
-		inarg.ctimensec = inode_get_ctime_nsec(inode);
+	/*
+	 * Only flush the timestamps that were dirtied locally.  The other
+	 * cached values originate from the server and pushing them back
+	 * could overwrite newer server state.
+	 */
+	if (test_and_clear_bit(FUSE_I_CMTIME_DIRTY, &fi->state)) {
+		/*
+		 * Pair with smp_mb__before_atomic() in redfs_update_time().
+		 * If we clear the dirty bit, we must see the matching or
+		 * the subsequent ctime/mtime.
+		 */
+		smp_mb__after_atomic();
+
+		inarg.valid |= FATTR_MTIME;
+		inarg.mtime = inode_get_mtime_sec(inode);
+		inarg.mtimensec = inode_get_mtime_nsec(inode);
+		if (fm->fc->minor >= 23) {
+			inarg.valid |= FATTR_CTIME;
+			inarg.ctime = inode_get_ctime_sec(inode);
+			inarg.ctimensec = inode_get_ctime_nsec(inode);
+		}
 	}
+	if (test_and_clear_bit(FUSE_I_ATIME_DIRTY, &fi->state)) {
+		smp_mb__after_atomic();
+
+		/*
+		 * The server, not the client, is the authority of timestamps.
+		 * Ask the server to update atime according the dirty value.
+		 * FATTR_ATIME_NOW tells the server that the update is not
+		 * from utimes(2)
+		 */
+		inarg.valid |= FATTR_ATIME | FATTR_ATIME_NOW;
+		inarg.atime = inode_get_atime_sec(inode);
+		inarg.atimensec = inode_get_atime_nsec(inode);
+	}
+	if (!inarg.valid)
+		return 0;
+
 	if (ff) {
 		inarg.valid |= FATTR_FH;
 		inarg.fh = ff->fh;
@@ -2106,6 +2175,10 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 	}
 
 	spin_lock(&fi->lock);
+	/* explicitly set atime, discard the local dirty value */
+	if ((attr->ia_valid & ATTR_ATIME) && (attr->ia_valid & ATTR_ATIME_SET))
+		clear_bit(FUSE_I_ATIME_DIRTY, &fi->state);
+
 	/* the kernel maintains i_mtime locally */
 	if (trust_local_cmtime) {
 		if (attr->ia_valid & ATTR_MTIME)
@@ -2272,6 +2345,7 @@ static const struct inode_operations fuse_dir_inode_operations = {
 	.mknod		= fuse_mknod,
 	.permission	= fuse_permission,
 	.getattr	= fuse_getattr,
+	.update_time	= fuse_update_time,
 	.listxattr	= fuse_listxattr,
 	.get_inode_acl	= fuse_get_inode_acl,
 	.get_acl	= fuse_get_acl,
@@ -2295,6 +2369,7 @@ static const struct inode_operations fuse_common_inode_operations = {
 	.setattr	= fuse_setattr,
 	.permission	= fuse_permission,
 	.getattr	= fuse_getattr,
+	.update_time	= fuse_update_time,
 	.listxattr	= fuse_listxattr,
 	.get_inode_acl	= fuse_get_inode_acl,
 	.get_acl	= fuse_get_acl,
@@ -2307,6 +2382,7 @@ static const struct inode_operations fuse_symlink_inode_operations = {
 	.setattr	= fuse_setattr,
 	.get_link	= fuse_get_link,
 	.getattr	= fuse_getattr,
+	.update_time	= fuse_update_time,
 	.listxattr	= fuse_listxattr,
 };
 
