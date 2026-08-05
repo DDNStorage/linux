@@ -840,6 +840,9 @@ struct fuse_conn {
 	/*  expire inode entries when doing inode invalidation */
 	unsigned expire_inode_entries:1;
 
+	/*  mark writeback-initiated SETATTR requests with FATTR_WRITEBACK */
+	unsigned setattr_writeback:1;
+
 	/*
 	 * The following bitfields are only for optimization purposes
 	 * and hence races in setting them will not cause malfunction
