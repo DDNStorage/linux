@@ -885,6 +885,9 @@ struct fuse_conn {
 	/* Does the filesystem support compound operations? */
 	unsigned int compound_open_getattr:1;
 
+	/* Does the filesystem support compound atomic-open (LOOKUP+CREATE)? */
+	unsigned int compound_lookup_create:1;
+
 	/** The number of requests waiting for completion */
 	atomic_t num_waiting;
 

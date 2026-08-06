@@ -1212,6 +1212,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 
 	/* module option for now */
 	fc->compound_open_getattr = enable_compound;
+	fc->compound_lookup_create = enable_compound;
 
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);

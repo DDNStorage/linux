@@ -52,8 +52,18 @@ int fuse_compound_add(struct fuse_compound_req *compound,
 	return 0;
 }
 
-static void *fuse_copy_response_per_req(struct fuse_args *args,
-				     char *resp)
+/*
+ * Copy a slot's payload into the caller's out_args structs.
+ *
+ * @avail is the slot's actual payload size (op_hdr->len minus the slot's
+ * fuse_out_header). The caller is responsible for ensuring @resp..+@avail is
+ * within the response buffer.
+ *
+ * Returns 0 on success, -EIO if the slot is shorter than the declared args
+ * sum. Trailing bytes beyond the args sum are ignored (forward-compat).
+ */
+static int fuse_copy_response_per_req(struct fuse_args *args,
+				      char *resp, size_t avail)
 {
 	int i;
 	size_t copied = 0;
@@ -62,14 +72,17 @@ static void *fuse_copy_response_per_req(struct fuse_args *args,
 		struct fuse_arg current_arg = args->out_args[i];
 		size_t arg_size = current_arg.size;
 
-		if (current_arg.value && arg_size > 0) {
-			memcpy(current_arg.value,
-			       (char *)resp + copied, arg_size);
-			copied += arg_size;
-		}
+		if (!current_arg.value || arg_size == 0)
+			continue;
+
+		if (copied + arg_size > avail)
+			return -EIO;
+
+		memcpy(current_arg.value, resp + copied, arg_size);
+		copied += arg_size;
 	}
 
-	return (char *)resp + copied;
+	return 0;
 }
 
 int fuse_compound_get_error(struct fuse_compound_req *compound, int op_idx)
@@ -77,12 +90,20 @@ int fuse_compound_get_error(struct fuse_compound_req *compound, int op_idx)
 	return compound->op_errors[op_idx];
 }
 
+/*
+ * Parse one slot's response. An empty slot (payload size 0) leaves the
+ * caller's out_args untouched -- by convention callers zero-init their
+ * out structs, so an empty slot means "no result for this op". Slots
+ * with payload must contain at least the args sum; extra trailing bytes
+ * are ignored. The returned pointer always advances by op_hdr->len.
+ */
 static void *fuse_compound_parse_one_op(struct fuse_compound_req *compound,
 					int op_index, void *op_out_data,
 					void *response_end)
 {
 	struct fuse_out_header *op_hdr = op_out_data;
 	struct fuse_args *args = compound->op_args[op_index];
+	size_t payload_size;
 
 	if (op_hdr->len < sizeof(struct fuse_out_header))
 		return NULL;
@@ -94,11 +115,15 @@ static void *fuse_compound_parse_one_op(struct fuse_compound_req *compound,
 	if (op_hdr->error != 0)
 		compound->op_errors[op_index] = op_hdr->error;
 
-	if (args && op_hdr->len > sizeof(struct fuse_out_header))
-		return fuse_copy_response_per_req(args, op_out_data +
-					       sizeof(struct fuse_out_header));
+	payload_size = op_hdr->len - sizeof(struct fuse_out_header);
 
-	/* No response data, just advance past the header */
+	if (args && payload_size > 0) {
+		if (fuse_copy_response_per_req(args,
+				(char *)op_out_data + sizeof(struct fuse_out_header),
+				payload_size) < 0)
+			return NULL;
+	}
+
 	return (char *)op_out_data + op_hdr->len;
 }
 
@@ -232,10 +257,25 @@ ssize_t fuse_compound_send(struct fuse_compound_req *compound)
 
 	actual_response_size = args.out_args[1].size;
 
-	if (actual_response_size < sizeof(struct fuse_compound_out)) {
-		pr_info_ratelimited("FUSE: compound response too small (%zu bytes, minimum %zu bytes)\n",
-				    actual_response_size,
-				    sizeof(struct fuse_compound_out));
+	/*
+	 * compound_header (out_args[0]) is fixed-size and already validated
+	 * by fuse_simple_request; check that the server didn't claim more
+	 * results than we requested, and that the payload at least leaves
+	 * room for one fuse_out_header per claimed result.
+	 */
+	if (compound->result_header.count > compound->compound_header.count) {
+		pr_info_ratelimited("FUSE: compound response claims %u ops, request had %u\n",
+				    compound->result_header.count,
+				    compound->compound_header.count);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (actual_response_size <
+	    compound->result_header.count * sizeof(struct fuse_out_header)) {
+		pr_info_ratelimited("FUSE: compound payload too small for %u ops (%zu bytes)\n",
+				    compound->result_header.count,
+				    actual_response_size);
 		ret = -EINVAL;
 		goto out;
 	}
