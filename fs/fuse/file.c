@@ -1978,6 +1978,21 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					     &dlm_unrecorded);
 		if (err)
 			return err;
+
+		/*
+		 * The request above may have found that the server has no DLM
+		 * at all, in which case it cleared fc->dlm.  The relaxed shared
+		 * lock was chosen just before, while fc->dlm still read 1, and
+		 * it is only sound under DLM: the shared path claims the i_size
+		 * extension up front, which stops iomap from zeroing beyond
+		 * EOF, and the zero-fill that replaces it in
+		 * fuse_iomap_read_folio_range() is itself gated on fc->dlm.
+		 * Left as chosen, an expanding write would fall through to a
+		 * READ of a range that cannot hold data -- which fails outright
+		 * on a handle the client opened write-only.  Re-decide now,
+		 * while no lock is held yet.
+		 */
+		exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 	}
 
 	if (exclusive)
