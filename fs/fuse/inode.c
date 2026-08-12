@@ -41,6 +41,19 @@ bool __read_mostly enable_large_folios = true;
 module_param(enable_large_folios, bool, 0644);
 MODULE_PARM_DESC(enable_large_folios, "Enable large folios support");
 
+/*
+ * Gate for the notify-driven direct-IO latch (see
+ * fuse_reverse_inval_inode()): when a remote writer keeps invalidating a
+ * file that is also open for writing here, the inode is switched to
+ * direct IO until its last writer closes.  Off by default -- it trades
+ * the writeback cache away for the duration, which only pays off on
+ * workloads that actually see such storms.
+ */
+static bool __read_mostly enable_notify_dio;
+module_param(enable_notify_dio, bool, 0644);
+MODULE_PARM_DESC(enable_notify_dio,
+		 "Latch a contended inode to direct IO on an invalidation notify storm");
+
 static struct kmem_cache *fuse_inode_cachep;
 struct list_head fuse_conn_list;
 DEFINE_MUTEX(fuse_mutex);
@@ -752,7 +765,13 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 *    writer closes or it is mmapped.  When latched, drop the whole
 		 *    mapping rather than just the notified range, or dirty folios
 		 *    outside it would be invisible to the forced direct reads
-		 *    (stale read / lost write).
+		 *    (stale read / lost write).  Latching is opt-in via the
+		 *    enable_notify_dio module parameter and off by default; the
+		 *    average is kept up to date either way, so enabling it at
+		 *    runtime takes effect on the next storm rather than after a
+		 *    warm-up.  Clearing it at runtime stops new latches but lets
+		 *    already-latched inodes run out on the usual exits (last
+		 *    writer closes, or mmap).
 		 *
 		 * The gate (and the average) exist only for writeback+dlm regular
 		 * files; elsewhere wb_sem is NULL and the invalidate runs
@@ -794,7 +813,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
 
-			if (hot && has_writer &&
+			if (enable_notify_dio && hot && has_writer &&
 			    !mapping_mapped(inode->i_mapping) &&
 			    !fuse_inode_force_dio(inode)) {
 				spin_lock(&fi->lock);
