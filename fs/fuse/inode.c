@@ -492,7 +492,7 @@ u32 fuse_get_cache_mask(struct inode *inode)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 
-	if (!fc->writeback_cache || !S_ISREG(inode->i_mode))
+	if (!fc->writeback_cache || !S_ISREG(inode->i_mode) || fc->dlm)
 		return 0;
 
 	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
