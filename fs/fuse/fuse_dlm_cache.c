@@ -31,12 +31,6 @@ struct fuse_dlm_range {
 #define FUSE_PCACHE_LK_READ 1 /* Shared read lock */
 #define FUSE_PCACHE_LK_WRITE 2 /* Exclusive write lock */
 
-/*
- * Bound on re-requesting a grant whose recording lost against a
- * concurrent revoke; see fuse_get_dlm_lock().
- */
-#define FUSE_DLM_RECORD_TRIES 3
-
 /* Interval tree definitions for page ranges */
 static inline uint64_t fuse_dlm_range_start(struct fuse_dlm_range *range)
 {
@@ -622,7 +616,6 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
 	uint64_t gen;
-	int tries = FUSE_DLM_RECORD_TRIES;
 	int err;
 
 	/* An empty range needs no lock. */
@@ -696,14 +689,14 @@ restart:
 		/*
 		 * A revoke was processed while the request was in flight;
 		 * the grant may already be dead, so re-request instead of
-		 * recording it.  Bounded: a revoke storm must not pin the
-		 * IO here -- past the bound the failure is reported like
-		 * any other request failure (the write path fails the
-		 * write, the read path serves unlocked).
+		 * recording it.  Retry until a grant survives long enough to
+		 * be recorded: giving up here would hand the caller an error
+		 * for a range no one else holds, and the write path turns
+		 * that into a failed write.  Each pass makes a fresh server
+		 * round trip, so a revoke storm throttles this loop rather
+		 * than spinning it.
 		 */
-		if (--tries)
-			goto restart;
-		return -EAGAIN;
+		goto restart;
 	}
 
 	/*
