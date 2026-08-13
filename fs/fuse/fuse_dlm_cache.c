@@ -487,10 +487,14 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 }
 
 /**
- * request a dlm lock from the fuse server
+ * fuse_get_dlm_lock - request a dlm lock from the fuse server
+ * @file:   the file being accessed
+ * @offset: byte offset into the file (need not be page-aligned)
+ * @length: length of the region in bytes (need not be page-aligned)
+ * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
  */
-void fuse_get_dlm_write_lock(struct file *file, loff_t offset,
-				    size_t length)
+void fuse_get_dlm_lock(struct file *file, loff_t offset,
+		       size_t length, enum fuse_page_lock_mode mode)
 {
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
@@ -500,7 +504,7 @@ void fuse_get_dlm_write_lock(struct file *file, loff_t offset,
 	uint64_t end = (offset + length - 1) | (PAGE_SIZE - 1);
 
 	/* note that the offset and length don't have to be page aligned here
-     * but since we only get here on writeback caching we will send out
+	 * but since we only get here on writeback caching we will send out
 	 * page aligned requests */
 	offset &= PAGE_MASK;
 
@@ -513,8 +517,7 @@ void fuse_get_dlm_write_lock(struct file *file, loff_t offset,
 	 * at the same time. It is intentionally not protected
 	 * since a DLM implementation in the FUSE server should take care
 	 * of any races in lock requests */
-	if (fuse_dlm_range_is_locked(fi, offset,
-				    end, FUSE_PAGE_LOCK_WRITE))
+	if (fuse_dlm_range_is_locked(fi, offset, end, mode))
 		return; /* we already have this area locked */
 
 	memset(&inarg, 0, sizeof(inarg));
@@ -522,7 +525,8 @@ void fuse_get_dlm_write_lock(struct file *file, loff_t offset,
 
 	inarg.start = offset;
 	inarg.end = end;
-	inarg.type = FUSE_DLM_LOCK_WRITE;
+	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
+		FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
 
 	args.opcode = FUSE_DLM_WB_LOCK;
 	args.nodeid = get_node_id(inode);
@@ -551,8 +555,6 @@ void fuse_get_dlm_write_lock(struct file *file, loff_t offset,
 			return;
 		} else {
 			/* ignore any errors here, there is no way we can react appropriately */
-			fuse_dlm_lock_range(fi, outarg.start,
-					    		outarg.end,
-					    		FUSE_PAGE_LOCK_WRITE);
+			fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode);
 		}
 }
