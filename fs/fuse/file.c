@@ -1138,6 +1138,12 @@ static void fuse_readahead(struct readahead_control *rac)
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to);
 
+/*
+ * Bound on re-requesting a revoked DLM grant before a cached read is
+ * served unlocked; see fuse_cache_read_iter().
+ */
+#define FUSE_DLM_READ_RETRIES 3
+
 static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
@@ -1146,6 +1152,7 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
 	ssize_t res;
+	int lock_err = 0;
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -1163,8 +1170,9 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	/* if we have dlm support acquire a read lock for the area
 	 * we are reading from. */
 	if (fc->writeback_cache && fc->dlm)
-		fuse_get_dlm_lock(file, iocb->ki_pos,
-				  iov_iter_count(to), FUSE_PAGE_LOCK_READ);
+		lock_err = fuse_get_dlm_lock(file, iocb->ki_pos,
+					     iov_iter_count(to),
+					     FUSE_PAGE_LOCK_READ);
 
 	/*
 	 * Fence the cache-serving read against a NOTIFY invalidate so we never
@@ -1176,10 +1184,43 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * wb_sem is NULL on non-writeback+dlm mounts (gate inactive).
 	 */
 	if (wb_sem) {
+		int tries = FUSE_DLM_READ_RETRIES;
+
+retry:
 		percpu_down_read(wb_sem);
 		if (fuse_inode_force_dio(inode)) {
 			percpu_up_read(wb_sem);
 			return fuse_direct_read_iter(iocb, to);
+		}
+		/*
+		 * The DLM lock was requested before entering the gate, and
+		 * the NOTIFY invalidate we may just have waited on revokes
+		 * locks under the gate write side.  Re-check the grant here
+		 * and re-request with the gate dropped, so a
+		 * FUSE_DLM_WB_LOCK round trip never parks a pending
+		 * invalidate behind our own gate hold.  Once the check
+		 * passes the lock cannot go away for the rest of the gate
+		 * hold.  A failed or unrecorded request falls through
+		 * unlocked, as before: the retry is taken even then (the
+		 * latch must be re-checked under the re-entered gate), so
+		 * lock_err has to stay sticky across it -- seeded by the
+		 * pre-gate request above -- or a grant that failed would
+		 * be re-requested forever.  The retry is also bounded: a
+		 * remote writer can revoke each successful grant before
+		 * the gate is re-entered, and a reader-only inode has no
+		 * force-DIO latch to end such a storm, so after
+		 * FUSE_DLM_READ_RETRIES re-requests the read is served
+		 * unlocked rather than looping without bound.
+		 */
+		if (!lock_err && fc->dlm && tries-- > 0 &&
+		    !fuse_dlm_lock_is_held(fi, iocb->ki_pos,
+					   iov_iter_count(to),
+					   FUSE_PAGE_LOCK_READ)) {
+			percpu_up_read(wb_sem);
+			lock_err = fuse_get_dlm_lock(file, iocb->ki_pos,
+						     iov_iter_count(to),
+						     FUSE_PAGE_LOCK_READ);
+			goto retry;
 		}
 	}
 
@@ -1585,6 +1626,26 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
 		inode_unlock_shared(inode);
 }
 
+/*
+ * Request the DLM write lock covering a cached write.  -ENOSYS cleared
+ * fc->dlm: the server has no DLM, proceed as a plain cached write.  Any
+ * other failure means the cache would be dirtied without DLM coverage -
+ * the caller must fail the write instead.  A granted-but-unrecorded
+ * lock (positive return) is covered cluster-wide; proceed, but flag it
+ * so the in-gate re-validation skips a check an invisible grant could
+ * never pass.
+ */
+static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
+				  bool *unrecorded)
+{
+	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+
+	if (err < 0 && err != -ENOSYS)
+		return err;
+	*unrecorded = err > 0;
+	return 0;
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1598,6 +1659,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
 	bool wb_guard = false;
 	bool exclusive = true;
+	bool dlm_unrecorded = false;
+	loff_t dlm_pos = 0;
+	size_t dlm_len = 0;
 
 	/*
 	 * The inode may have been latched into forced direct IO -- by a
@@ -1625,22 +1689,31 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			goto writethrough;
 		}
 
-		/* if we have dlm support acquire the lock for the area
-		 * we are writing into */
-		if (fc->dlm) {
-			/* note that a file opened with O_APPEND will have relative values
-			 * in ki_pos. This code is here for convenience and for libfuse overlay test.
-			 * Filesystems should handle O_APPEND with 'direct io' to additionally
-			 * get the performance benefits of 'parallel direct writes'. */
-			loff_t pos = file->f_flags & O_APPEND ? i_size_read(inode) + iocb->ki_pos : iocb->ki_pos;
-			size_t length = iov_iter_count(from);
-			fuse_get_dlm_lock(file, pos, length,
-					  FUSE_PAGE_LOCK_WRITE);
+		exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
+
+		/*
+		 * Request the DLM write lock before taking i_rwsem: the request
+		 * is an unbounded cluster round trip, and holding the
+		 * writer-priority rwsem across it would park a truncate -- and
+		 * behind it every later writer -- for the duration.  The
+		 * grant-to-use window this leaves open is closed by the in-gate
+		 * re-validation below.  Only the append case must wait for the
+		 * lock: its range depends on i_size, which is stable only under
+		 * the exclusive inode lock.
+		 */
+		if (fc->dlm && !(iocb->ki_flags & IOCB_APPEND)) {
+			dlm_pos = iocb->ki_pos;
+			dlm_len = iov_iter_count(from);
+
+			err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
+						     &dlm_unrecorded);
+			if (err)
+				return err;
 		}
 
 		/*
-		 * Open-code generic_file_write_iter() so that wb_inval_rwsem
-		 * can be held for read across the page-cache dirtying: a
+		 * Open-code generic_file_write_iter() so that the coherency
+		 * gate can be held for read across the page-cache dirtying: a
 		 * concurrent NOTIFY_INVAL_INODE -- which takes the write side
 		 * of that gate (blocking, with priority) around its invalidate
 		 * + latch set -- must not be able to strand the folios we are
@@ -1651,28 +1724,66 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * coordination.  wb_sem is NULL on mounts where the gate is
 		 * inactive.
 		 */
-		exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
 		if (exclusive)
 			inode_lock(inode);
 		else
 			inode_lock_shared(inode);
+
+		/* note that this small code dup will save us a lot of headache later
+		 * when appends are done concurrently without using parallel direct writes */
+		if (fc->dlm && (iocb->ki_flags & IOCB_APPEND)) {
+			/*
+			 * An append write lands at the current EOF no matter
+			 * what ki_pos holds: generic_write_checks() rewrites
+			 * ki_pos to i_size for IOCB_APPEND, and i_size is
+			 * stable here because append writes hold the inode lock
+			 * exclusive.  Lock where the data will land.
+			 */
+			dlm_pos = i_size_read(inode);
+			dlm_len = iov_iter_count(from);
+
+			err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
+						     &dlm_unrecorded);
+			if (err)
+				goto wb_out;
+		}
+
 		if (wb_sem) {
+			wb_guard = true;
+retry:
 			percpu_down_read(wb_sem);
 			if (fuse_inode_force_dio(inode)) {
 				percpu_up_read(wb_sem);
 				fuse_cache_wr_unlock(inode, exclusive);
 				return fuse_direct_write_iter(iocb, from);
 			}
+			if (fc->dlm && !dlm_unrecorded &&
+			    !fuse_dlm_lock_is_held(fi, dlm_pos, dlm_len,
+						   FUSE_PAGE_LOCK_WRITE)) {
+				percpu_up_read(wb_sem);
+				err = fuse_cache_wr_dlm_lock(file, dlm_pos,
+							     dlm_len,
+							     &dlm_unrecorded);
+				if (err) {
+					/* The gate is already dropped; funnel
+					 * the failure through the one audited
+					 * exit. */
+					wb_guard = false;
+					goto wb_out;
+				}
+				goto retry;
+			}
 		}
 		written = generic_write_checks(iocb, from);
 		if (written > 0)
 			written = __generic_file_write_iter(iocb, from);
-		if (wb_sem)
+wb_out:
+		if (wb_guard)
 			percpu_up_read(wb_sem);
 		fuse_cache_wr_unlock(inode, exclusive);
 		if (written > 0)
 			written = generic_write_sync(iocb, written);
-		return written;
+		return written ? written : err;
 	}
 
 writethrough:
