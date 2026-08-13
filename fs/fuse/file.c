@@ -1502,6 +1502,45 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive, bool uncached)
 
 static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from);
 
+/*
+ * @return true if an exclusive inode lock is needed for a cached (buffered)
+ * write.
+ *
+ * Buffered writes normally hold the inode rwsem exclusively, serialising all
+ * writers even on disjoint ranges.  The DLM-serialised writeback path is
+ * the exception: the DLM already excludes cluster-wide, and i_size is committed
+ * under fi->lock rather than the inode rwsem (see fuse_write_end()), so
+ * disjoint writers (MPI-IO / IOR) may share the lock.  Mirrors
+ * fuse_dio_wr_exclusive_lock() for the direct path.
+ */
+static bool fuse_cache_wr_exclusive_lock(struct kiocb *iocb, bool writeback)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	/* Only the DLM-serialised writeback path relaxes the lock. */
+	if (!fc->dlm || !writeback)
+		return true;
+
+	/* O_DIRECT writes fall back to generic_file_direct_write(). */
+	if (iocb->ki_flags & IOCB_DIRECT)
+		return true;
+
+	/* Append needs the eventual EOF - always needs an exclusive lock. */
+	if (iocb->ki_flags & IOCB_APPEND)
+		return true;
+
+	return false;
+}
+
+static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
+{
+	if (exclusive)
+		inode_unlock(inode);
+	else
+		inode_unlock_shared(inode);
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1513,6 +1552,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	bool wb_guard = false;
+	bool exclusive = true;
 
 	/*
 	 * The inode may have been latched into forced direct IO -- by a
@@ -1562,12 +1602,16 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * coordination.  The forced-direct-IO latch feature is only
 		 * active under writeback+dlm, so the guard follows fc->dlm.
 		 */
-		inode_lock(inode);
+		exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
+		if (exclusive)
+			inode_lock(inode);
+		else
+			inode_lock_shared(inode);
 		if (fc->dlm) {
 			down_read(&fi->wb_inval_rwsem);
 			if (fuse_inode_force_dio(inode)) {
 				up_read(&fi->wb_inval_rwsem);
-				inode_unlock(inode);
+				fuse_cache_wr_unlock(inode, exclusive);
 				return fuse_direct_write_iter(iocb, from);
 			}
 		}
@@ -1576,7 +1620,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			written = __generic_file_write_iter(iocb, from);
 		if (fc->dlm)
 			up_read(&fi->wb_inval_rwsem);
-		inode_unlock(inode);
+		fuse_cache_wr_unlock(inode, exclusive);
 		if (written > 0)
 			written = generic_write_sync(iocb, written);
 		return written;
@@ -2490,8 +2534,28 @@ static int fuse_write_end(struct file *file, struct address_space *mapping,
 		folio_mark_uptodate(folio);
 	}
 
-	if (pos > inode->i_size)
-		i_size_write(inode, pos);
+	/*
+	 * On the DLM writeback path the inode rwsem may be held shared (see
+	 * fuse_cache_wr_exclusive_lock()), so i_size is no longer serialised
+	 * by it.  Commit the extension monotonically under fi->lock -- the
+	 * same way fuse_write_update_attr() does on the direct path -- rather
+	 * than by an unlocked read-modify-write two concurrent extenders could
+	 * lose an update to.
+	 *
+	 * Growing i_size just behind the write cursor, rather than claiming
+	 * the whole extension up front, also keeps fuse_write_begin()'s
+	 * beyond-EOF optimisation effective: folios wholly past EOF are zeroed
+	 * locally instead of sending the server a read-modify-write READ for
+	 * data that does not exist yet.
+	 */
+	if (pos > inode->i_size) {
+		struct fuse_inode *fi = get_fuse_inode(inode);
+
+		spin_lock(&fi->lock);
+		if (pos > inode->i_size)
+			i_size_write(inode, pos);
+		spin_unlock(&fi->lock);
+	}
 
 	folio_mark_dirty(folio);
 
