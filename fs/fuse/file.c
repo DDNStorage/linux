@@ -2327,10 +2327,12 @@ static int fuse_write_begin(struct file *file, struct address_space *mapping,
 	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
 	struct folio *folio;
 	loff_t fsize;
-	int err = -ENOMEM;
+	int err;
 
 	WARN_ON(!fc->writeback_cache);
 
+retry:
+	err = -ENOMEM;
 	folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
 			mapping_gfp_mask(mapping));
 	if (IS_ERR(folio))
@@ -2361,6 +2363,18 @@ success:
 cleanup:
 	folio_unlock(folio);
 	folio_put(folio);
+	/*
+	 * The DLM refused the read because a conflicting lock is held, and
+	 * fuse_do_readpage() asked for the page to be dropped and the read
+	 * retried.  ->write_begin() has no way to pass that request on:
+	 * generic_perform_write() only inspects negative returns, so an
+	 * AOP_TRUNCATED_PAGE escaping here would be taken for success and
+	 * the uninitialised *foliop dereferenced.  Retry here instead, now
+	 * that the folio lock the revoke was waiting for has been dropped.
+	 * Each pass costs a server round trip, which throttles the loop.
+	 */
+	if (err == AOP_TRUNCATED_PAGE)
+		goto retry;
 error:
 	return err;
 }
