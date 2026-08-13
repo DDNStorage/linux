@@ -496,8 +496,10 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	loff_t oldsize;
 	struct timespec64 old_mtime;
 	bool have_size = !sx || (sx->mask & STATX_SIZE);
+	u64 srv_size;
 
 	spin_lock(&fi->lock);
+	srv_size = attr->size;
 
 	/*
 	 * In case of writeback_cache enabled, writes update mtime, ctime and
@@ -522,6 +524,18 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 		spin_unlock(&fi->lock);
 		return;
 	}
+
+	/*
+	 * srv_size is the size the server reported before the writeback
+	 * cache_mask above replaced attr->size with the local value.  It
+	 * bounds how far the server can hold data, letting the buffered write
+	 * path zero-fill expansion read-modify-writes instead of sending READ
+	 * requests, see fuse_write_begin().  Only ever grow it here: stale
+	 * attributes were rejected above and truncation lowers it directly.
+	 */
+	if (have_size && S_ISREG(inode->i_mode) &&
+	    (loff_t) srv_size > fi->server_size)
+		fi->server_size = srv_size;
 
 	old_mtime = inode_get_mtime(inode);
 	fuse_change_attributes_common(inode, attr, sx, attr_valid, cache_mask,
