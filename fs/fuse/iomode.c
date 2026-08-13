@@ -233,6 +233,16 @@ int fuse_file_io_open(struct file *file, struct inode *inode)
 	    !(ff->open_flags & FOPEN_PASSTHROUGH))
 		return 0;
 
+	/*
+	 * The inode was latched into direct IO after a remote-modify
+	 * notification arrived while it was open for writing here.  Open this
+	 * file uncached as well so its IO is routed direct and it does not
+	 * re-enter caching mode.
+	 */
+	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
+	    !(ff->open_flags & FOPEN_PASSTHROUGH))
+		return 0;
+
 	if (ff->open_flags & FOPEN_PASSTHROUGH)
 		err = fuse_file_passthrough_open(inode, file);
 	else
