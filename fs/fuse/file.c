@@ -1137,7 +1137,8 @@ static void fuse_readahead(struct readahead_control *rac)
 
 static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	struct inode *inode = iocb->ki_filp->f_mapping->host;
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 
 	/*
@@ -1152,6 +1153,12 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		if (err)
 			return err;
 	}
+
+	/* if we have dlm support acquire a read lock for the area
+	 * we are reading from. */
+	if (fc->writeback_cache && fc->dlm)
+		fuse_get_dlm_lock(file, iocb->ki_pos,
+				  iov_iter_count(to), FUSE_PAGE_LOCK_READ);
 
 	return generic_file_read_iter(iocb, to);
 }
@@ -1586,7 +1593,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			 * get the performance benefits of 'parallel direct writes'. */
 			loff_t pos = file->f_flags & O_APPEND ? i_size_read(inode) + iocb->ki_pos : iocb->ki_pos;
 			size_t length = iov_iter_count(from);
-			fuse_get_dlm_write_lock(file, pos, length);
+			fuse_get_dlm_lock(file, pos, length,
+					  FUSE_PAGE_LOCK_WRITE);
 		}
 
 		/*
@@ -2596,7 +2604,7 @@ static void fuse_vma_close(struct vm_area_struct *vma)
 /**
  * Request a DLM lock from the FUSE server.
  *
- * This routine is similar to fuse_get_dlm_write_lock(), but it
+ * This routine is similar to fuse_get_dlm_lock(), but it
  * does not cache the DLM lock in the kernel.
  */
 static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t length)
