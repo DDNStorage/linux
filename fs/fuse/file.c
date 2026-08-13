@@ -947,7 +947,19 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
 	res = fuse_simple_request(fm, &ia.ap.args);
 	if (res < 0) {
-		if (res == -EAGAIN)
+		/*
+		 * The DLM subsystem refuses a READ whose grant would deadlock
+		 * against a conflicting lock this node already holds.  Ask the
+		 * caller to drop the page and retry so the conflicting holder
+		 * can drain first.
+		 *
+		 * -EDEADLK is the self-describing code the server reports;
+		 * -EAGAIN is the legacy spelling, still accepted so an older
+		 * daemon keeps working.  Only a DLM connection may make that
+		 * claim -- elsewhere -EAGAIN is a plain error from the server
+		 * and must be passed through.
+		 */
+		if ((res == -EDEADLK || res == -EAGAIN) && fm->fc->dlm)
 			res = AOP_TRUNCATED_PAGE;
 		return res;
 	}
