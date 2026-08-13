@@ -369,8 +369,12 @@ out:
  * @start: Start page offset
  * @end: End page offset
  *
- * Release locks on the specified range of pages.
- * Note that if start and end are set to zero the cache is destroyed.
+ * Release locks on the specified range of pages.  An inverted range is
+ * rejected rather than silently removing nothing: the callers revoke
+ * coverage, and a revoke that quietly keeps the grant alive would let
+ * the re-validating IO paths trust a lock the server has taken away.
+ * To drop every grant use fuse_dlm_cache_release_locks() (there is no
+ * in-band sentinel range for it).
  *
  * Return: 0 on success, negative error code on failure
  */
@@ -381,13 +385,8 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 	struct fuse_dlm_range *range, *next;
 	int ret = 0;
 
-	if (!cache)
+	if (!cache || start > end)
 		return -EINVAL;
-
-	if (start == 0 && end == 0) {
-		fuse_dlm_cache_release_locks(inode);
-		return 0;
-	}
 
 	down_write(&cache->lock);
 
