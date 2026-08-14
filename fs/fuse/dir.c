@@ -2110,6 +2110,12 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
 		inarg.valid |= FATTR_FH;
 		inarg.fh = ff->fh;
 	}
+	/*
+	 * This is ->write_inode() flushing times the kernel owns locally, not
+	 * a userspace utimes(); let the server tell the two apart.
+	 */
+	if (fm->fc->setattr_writeback)
+		inarg.valid |= FATTR_WRITEBACK;
 	fuse_setattr_fill(fm->fc, &args, inode, &inarg, &outarg);
 
 	return fuse_simple_request(fm, &args);

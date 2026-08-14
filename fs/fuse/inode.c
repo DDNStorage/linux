@@ -1738,6 +1738,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->inval_inode_entries = 1;
 			if (flags & FUSE_EXPIRE_INODE_ENTRY)
 				fc->expire_inode_entries = 1;
+			if (flags & FUSE_SETATTR_WRITEBACK)
+				fc->setattr_writeback = 1;
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -1792,7 +1794,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_NO_EXPORT_SUPPORT | FUSE_INVAL_INODE_ENTRY |
 		FUSE_EXPIRE_INODE_ENTRY | FUSE_URING_REDUCED_Q |
 		FUSE_EXPIRE_INODE_ENTRY |
-		FUSE_REQUEST_TIMEOUT;
+		FUSE_REQUEST_TIMEOUT | FUSE_SETATTR_WRITEBACK;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;
