@@ -366,6 +366,68 @@ u32 fuse_get_cache_mask(struct inode *inode)
 	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
 }
 
+/*
+ * Which cached attributes survive a server reply.
+ *
+ * Without DLM this is fuse_get_cache_mask(): with the writeback cache on,
+ * writes update mtime and ctime and may extend i_size locally, the server
+ * knows about none of it, so the cached values win.
+ *
+ * With DLM the server is the authority (fuse_get_cache_mask() returns 0),
+ * because another node may have changed the file behind us and only the
+ * server can say so.  That holds for the parts of the file we do not own.  A
+ * write grant means no other node can touch the range until we are revoked,
+ * so anything the server reports about it is at best as new as what we have,
+ * and older if we still have unwritten data there.  Keep the cached values
+ * for exactly what the grant covers:
+ *
+ *  - size, when the server reports less than i_size and the tail it does not
+ *    know about, [srv_size, i_size), is entirely under a write grant.  Taking
+ *    the server's answer would shrink i_size and have truncate_pagecache()
+ *    throw the unwritten tail away.
+ *  - mtime and ctime, while a write grant covers unwritten data: our writes
+ *    have stamped them locally and the server's stamps predate them.  Only
+ *    while the cache is actually dirty, not for as long as the grant lives:
+ *    a grant is held until it is revoked or the inode is evicted, and past
+ *    the writeback the server's stamps are the newer ones.  Keeping ours
+ *    beyond that would hide a remote chown or chmod indefinitely.
+ *
+ * A remote truncate cannot slip through.  It has to revoke the grant first,
+ * and the revoke launders the tail and drops the grant, so by the time the
+ * smaller size is reported neither check holds and the server's answer is
+ * applied as usual.  A grant the server made but that could not be recorded
+ * (FUSE_DLM_GRANT_UNRECORDED) is invisible to the lock tree and falls back to
+ * trusting the server, as before.
+ *
+ * Must be called without fi->lock: the lock tree query sleeps.
+ */
+static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
+				bool have_size)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	u32 cache_mask = fuse_get_cache_mask(inode);
+	loff_t size = i_size_read(inode);
+
+	if (cache_mask || !fc->dlm || !fc->writeback_cache ||
+	    !S_ISREG(inode->i_mode))
+		return cache_mask;
+
+	if (!fuse_dlm_write_grant_exists(fi))
+		return cache_mask;
+
+	if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+	    mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
+		cache_mask |= STATX_MTIME | STATX_CTIME;
+
+	if (have_size && size > (loff_t) attr->size &&
+	    fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
+				  FUSE_PAGE_LOCK_WRITE))
+		cache_mask |= STATX_SIZE;
+
+	return cache_mask;
+}
+
 static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr,
 				     struct fuse_statx *sx, u64 attr_valid,
 				     u64 attr_version, u64 evict_ctr)
@@ -378,15 +440,11 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	bool have_size = !sx || (sx->mask & STATX_SIZE);
 	u64 srv_size;
 
+	cache_mask = fuse_attr_cache_mask(inode, attr, have_size);
+
 	spin_lock(&fi->lock);
 	srv_size = attr->size;
 
-	/*
-	 * In case of writeback_cache enabled, writes update mtime, ctime and
-	 * may update i_size.  In these cases trust the cached value in the
-	 * inode.
-	 */
-	cache_mask = fuse_get_cache_mask(inode);
 	if (cache_mask & STATX_SIZE)
 		attr->size = i_size_read(inode);
 
@@ -432,7 +490,17 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 		i_size_write(inode, attr->size);
 	spin_unlock(&fi->lock);
 
-	if (!cache_mask && S_ISREG(inode->i_mode)) {
+	/*
+	 * Only do page cache invalidation when the size was not served from
+	 * the cache (writeback_cache disabled, or no grant covering the tail)
+	 * AND the relevant attributes (SIZE/MTIME) were actually returned by
+	 * the server.  This has to key off STATX_SIZE alone: i_size_write()
+	 * above took the server's size for any mask without that bit, and the
+	 * cache has to be truncated to match it.  The mtime branch neutralises
+	 * itself when STATX_MTIME is set, since attr->mtime then holds the
+	 * value old_mtime was read from.
+	 */
+	if (!(cache_mask & STATX_SIZE) && S_ISREG(inode->i_mode)) {
 		bool inval = false;
 
 		if (oldsize != attr->size) {
