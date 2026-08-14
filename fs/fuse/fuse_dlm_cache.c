@@ -563,6 +563,37 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 }
 
 /**
+ * fuse_dlm_write_grant_exists - does the inode hold an exclusive grant anywhere
+ * @fi: the fuse inode
+ *
+ * Unlike fuse_dlm_range_is_locked(), which asks whether one range is fully
+ * covered, this asks whether any part of the file is held exclusively.  A
+ * client that holds a write grant may be sitting on dirty page cache the
+ * server has not seen, so its mtime and ctime run ahead of anything the
+ * server can report.
+ *
+ * Return: true if at least one recorded range is held for write
+ */
+bool fuse_dlm_write_grant_exists(struct fuse_inode *fi)
+{
+	struct fuse_dlm_cache *cache = &fi->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+	bool held = false;
+
+	down_read(&cache->lock);
+	for (range = fuse_dlm_find_overlapping(cache, 0, U64_MAX); range;
+	     range = fuse_page_it_iter_next(range, 0, U64_MAX)) {
+		if (range->mode == FUSE_PCACHE_LK_WRITE) {
+			held = true;
+			break;
+		}
+	}
+	up_read(&cache->lock);
+
+	return held;
+}
+
+/**
  * fuse_dlm_lock_is_held - check that a byte range is covered by a granted lock
  * @fi:     the fuse inode
  * @offset: byte offset into the file (need not be page-aligned)
