@@ -1760,6 +1760,34 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				goto wb_out;
 		}
 
+		written = generic_write_checks(iocb, from);
+		if (written <= 0)
+			goto wb_out;
+
+		/*
+		 * Kill suid/sgid and stamp the timestamps here, before the
+		 * gate, instead of leaving them to
+		 * __generic_file_write_iter().  file_remove_privs() is the one
+		 * that reaches the server: without handle_killpriv[_v2]
+		 * fuse_setattr() kills the bits by asking it (a FUSE_GETATTR to
+		 * refresh the mode, then a FUSE_SETATTR, which for a writeback
+		 * inode first flushes and freezes writepages), and
+		 * security_inode_killpriv() can drop the capability xattr with
+		 * another round trip.  A server may have to invalidate this
+		 * inode from inside such a handler; its NOTIFY_INVAL_INODE then
+		 * blocks in percpu_down_write() draining a gate reader that is
+		 * itself waiting for the reply.  Nothing held under the gate may
+		 * wait for the server.  file_update_time() only marks the inode
+		 * dirty, but stays next to it to keep the VFS order.
+		 */
+		err = file_remove_privs(file);
+		if (!err)
+			err = file_update_time(file);
+		if (err) {
+			written = err;
+			goto wb_out;
+		}
+
 		if (wb_sem) {
 			wb_guard = true;
 retry:
@@ -1786,9 +1814,15 @@ retry:
 				goto retry;
 			}
 		}
-		written = generic_write_checks(iocb, from);
-		if (written > 0)
-			written = __generic_file_write_iter(iocb, from);
+		if (iocb->ki_flags & IOCB_DIRECT) {
+			written = generic_file_direct_write(iocb, from);
+			if (written < 0 || !iov_iter_count(from))
+				goto wb_out;
+			written = direct_write_fallback(iocb, from, written,
+					generic_perform_write(iocb, from));
+		} else {
+			written = generic_perform_write(iocb, from);
+		}
 wb_out:
 		if (wb_guard)
 			percpu_up_read(wb_sem);
@@ -1801,13 +1835,33 @@ wb_out:
 writethrough:
 	inode_lock(inode);
 
+	err = count = generic_write_checks(iocb, from);
+	if (err <= 0)
+		goto out;
+
+	/*
+	 * Kill suid/sgid and stamp the timestamps before entering the gate,
+	 * for the reason given in the writeback branch: file_remove_privs()
+	 * can issue a request, and a request must never be waited for under
+	 * the gate.  They run before the forced-DIO re-route below, so a
+	 * re-routed write repeats them; neither has anything left to do the
+	 * second time.
+	 */
+	err = file_remove_privs(file);
+	if (err)
+		goto out;
+
+	err = file_update_time(file);
+	if (err)
+		goto out;
+
 	/*
 	 * The killpriv fallback lands here with the writeback cache still on,
 	 * so it populates the page cache too and needs the same guard as the
 	 * writeback branch above: hold the coherency gate for read across the
 	 * page-cache population and re-check the latch under it, so a
 	 * concurrent NOTIFY_INVAL_INODE cannot have the cache repopulated
-	 * behind the invalidate it just did.  Taken before
+	 * behind the invalidate it just did.  Still taken before
 	 * task_io_account_write() so a re-route is not double-counted.
 	 * wb_sem is NULL on mounts where the gate is inactive, and such a
 	 * connection never latches either.
@@ -1822,19 +1876,7 @@ writethrough:
 		}
 	}
 
-	err = count = generic_write_checks(iocb, from);
-	if (err <= 0)
-		goto out;
-
 	task_io_account_write(count);
-
-	err = file_remove_privs(file);
-	if (err)
-		goto out;
-
-	err = file_update_time(file);
-	if (err)
-		goto out;
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		written = generic_file_direct_write(iocb, from);
