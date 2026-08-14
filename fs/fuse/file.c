@@ -2019,6 +2019,30 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			goto out;
 	}
 
+	err = count = generic_write_checks(iocb, from);
+	if (err <= 0)
+		goto out;
+
+	/*
+	 * Kill suid/sgid and stamp the timestamps here, before the gate,
+	 * instead of leaving them next to the write itself.  kiocb_modified()
+	 * -> file_remove_privs() is the one that reaches the server: without
+	 * handle_killpriv[_v2] fuse_setattr() kills the bits by asking it (a
+	 * FUSE_GETATTR to refresh the mode, then a FUSE_SETATTR, which for a
+	 * writeback inode first flushes and freezes writepages), and
+	 * security_inode_killpriv() can drop the capability xattr with another
+	 * round trip.  A server may have to invalidate this inode from inside
+	 * such a handler; its NOTIFY_INVAL_INODE then blocks in
+	 * percpu_down_write() draining a gate reader that is itself waiting for
+	 * the reply.  Nothing held under the gate may wait for the server.
+	 *
+	 * This also runs before the forced-DIO re-route below, so a re-routed
+	 * write repeats it; there is nothing left to do the second time.
+	 */
+	err = kiocb_modified(iocb);
+	if (err)
+		goto out;
+
 	wb_guard = !!wb_sem;
 	if (wb_guard) {
 retry:
@@ -2044,15 +2068,7 @@ retry:
 		}
 	}
 
-	err = count = generic_write_checks(iocb, from);
-	if (err <= 0)
-		goto out;
-
 	task_io_account_write(count);
-
-	err = kiocb_modified(iocb);
-	if (err)
-		goto out;
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
 		written = generic_file_direct_write(iocb, from);
