@@ -71,6 +71,9 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 			   size_t length, enum fuse_page_lock_mode mode);
 
+/* Is any part of the file held for write? */
+bool fuse_dlm_write_grant_exists(struct fuse_inode *inode);
+
 /* This is the interface to the filesystem */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		      size_t length, enum fuse_page_lock_mode mode);
