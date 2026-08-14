@@ -1954,7 +1954,31 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (err)
 			return err;
 
-		if (!fc->handle_killpriv_v2 ||
+		/*
+		 * A write that drops suid/sgid stays off the writeback path,
+		 * so it holds i_rwsem exclusive.
+		 *
+		 * With handle_killpriv_v2 that is because the server does the
+		 * killing from the WRITE itself.  Without it, fuse_setattr()
+		 * has to ask the server, and fuse_do_setattr() freezes
+		 * writepages around that SETATTR: fuse_set_nowrite() asserts
+		 * BUG_ON(fi->writectr < 0), which assumes an exclusive
+		 * i_rwsem, and the DLM-relaxed buffered write path below holds
+		 * it only shared.  Two writers can both see the bits set
+		 * before either has cleared them, and the second one would
+		 * then oops inside spin_lock(&fi->lock).
+		 *
+		 * Only the DLM path needs the detour: everywhere else the
+		 * buffered write already holds i_rwsem exclusive, so the two
+		 * writers cannot overlap in the first place.
+		 *
+		 * The bits are read without the inode lock here, so a server
+		 * attribute update can still set them between this test and
+		 * file_remove_privs().  That leaves the same race, but only
+		 * for writers whose mode changed underneath them, rather than
+		 * for every write to a suid file.
+		 */
+		if (!(fc->handle_killpriv_v2 || fc->dlm) ||
 		    !setattr_should_drop_suidgid(idmap, file_inode(file)))
 			writeback = true;
 	}
