@@ -391,16 +391,19 @@ static int fuse_dlm_punch_hole(struct fuse_dlm_cache *cache, uint64_t start,
 		goto out;
 	}
 
-	/* Copy properties from original range */
+	/* Copy properties from original range, keeping the original end */
 	*new_range = *range;
 	INIT_LIST_HEAD(&new_range->list);
-
-	/* Adjust ranges */
 	new_range->start = end + 1;
-	range->end = start - 1;
 
-	/* Update interval tree */
+	/*
+	 * Shorten the original end only while it is unlinked.  range->end is
+	 * used in calulating the interval tree's __subtree_end, so changes
+	 * made while the node is still in the tree leaves every ancestor
+	 * stale.  Update range->end after fuse_page_it_remove()
+	 */
 	fuse_page_it_remove(range, &cache->ranges);
+	range->end = start - 1;
 	fuse_page_it_insert(range, &cache->ranges);
 	fuse_page_it_insert(new_range, &cache->ranges);
 
