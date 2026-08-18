@@ -1975,9 +1975,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		/*
 		 * An append write lands at the current EOF no matter what
 		 * ki_pos holds: generic_write_checks() rewrites ki_pos to
-		 * i_size for IOCB_APPEND, and i_size is stable here because
-		 * append writes hold the inode lock exclusive.  Lock where
-		 * the data will land.
+		 * i_size for IOCB_APPEND.  Lock where the data will land.
 		 */
 		dlm_pos = i_size_read(inode);
 		dlm_len = iov_iter_count(from);
@@ -1991,6 +1989,24 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	err = count = generic_write_checks(iocb, from);
 	if (err <= 0)
 		goto out;
+
+	/*
+	 * The exclusive inode lock does not pin i_size for the append:
+	 * attribute replies move it under fi->lock alone, so
+	 * generic_write_checks() may have put ki_pos past the granted
+	 * range.  Re-lock where the write really lands; dlm_pos tracks it
+	 * so the in-gate re-validation below guards the same range.
+	 */
+	if (writeback && fc->dlm && (iocb->ki_flags & IOCB_APPEND) &&
+	    iocb->ki_pos != dlm_pos) {
+		dlm_pos = iocb->ki_pos;
+		dlm_len = count;
+
+		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
+					     &dlm_unrecorded);
+		if (err)
+			goto out;
+	}
 
 	/*
 	 * Kill suid/sgid and stamp the timestamps here, before the gate,
