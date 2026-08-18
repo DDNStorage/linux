@@ -367,12 +367,6 @@ greater than max_request_timeout, the system will use max_request_timeout as the
 timeout. 0 indicates no max request timeout. The maximum value that can be set
 is 65535.
 
-If the server did not specify a timeout at mount and both of the above are set
-to 0, the timeout is derived from ``/proc/sys/kernel/hung_task_timeout_secs``
-instead, so that a server that stops answering aborts the connection rather than
-leaving the waiters around for the hung task detector to report on. Setting
-hung_task_timeout_secs to 0 disables this fallback as well.
-
 For timeouts, if the server does not respond to the request by the time
 the set timeout elapses, then the connection to the fuse server will be aborted.
 Please note that the timeouts are not 100% precise (eg you may set 60 seconds but

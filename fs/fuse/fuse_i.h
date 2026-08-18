@@ -53,12 +53,6 @@
 /* Frequency (in seconds) of request timeout checks, if opted into */
 #define FUSE_TIMEOUT_TIMER_FREQ 15
 
-/*
- * Upper bound (in seconds) for request timeouts.  fuse_init_out request
- * timeouts are u16, and this goes up to ~18 hours, which is plenty.
- */
-#define FUSE_REQ_TIMEOUT_LIMIT 65535
-
 /** Frequency (in jiffies) of request timeout checks, if opted into */
 extern const unsigned long fuse_timeout_timer_freq;
 

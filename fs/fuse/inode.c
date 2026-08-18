@@ -24,7 +24,6 @@
 #include <linux/statfs.h>
 #include <linux/random.h>
 #include <linux/sched.h>
-#include <linux/sched/sysctl.h>
 #include <linux/exportfs.h>
 #include <linux/posix_acl.h>
 #include <linux/pid_namespace.h>
@@ -1804,31 +1803,11 @@ static void set_request_timeout(struct fuse_conn *fc, unsigned int timeout)
 			   fuse_timeout_timer_freq);
 }
 
-/*
- * Timeout to use when neither the server nor the admin asked for one: keep it
- * in sync with the hung task detector, which is the system wide notion of "this
- * has been stuck for too long".  Returns 0 if the detector is disabled.
- */
-static unsigned int hung_task_req_timeout(void)
-{
-	unsigned long timeout = sysctl_hung_task_timeout_secs;
-
-	if (!timeout)
-		return 0;
-
-	/*
-	 * Requests are only checked every FUSE_TIMEOUT_TIMER_FREQ seconds, so
-	 * aim one period below the hung task timeout in order to abort the
-	 * connection before the detector reports on the waiters.
-	 */
-	if (timeout > FUSE_TIMEOUT_TIMER_FREQ)
-		timeout -= FUSE_TIMEOUT_TIMER_FREQ;
-
-	return min_t(unsigned long, timeout, FUSE_REQ_TIMEOUT_LIMIT);
-}
-
 static void init_server_timeout(struct fuse_conn *fc, unsigned int timeout)
 {
+	if (!timeout && !fuse_max_req_timeout && !fuse_default_req_timeout)
+		return;
+
 	if (!timeout)
 		timeout = fuse_default_req_timeout;
 
@@ -1838,12 +1817,6 @@ static void init_server_timeout(struct fuse_conn *fc, unsigned int timeout)
 		else
 			timeout = fuse_max_req_timeout;
 	}
-
-	if (!timeout)
-		timeout = hung_task_req_timeout();
-
-	if (!timeout)
-		return;
 
 	timeout = max(FUSE_TIMEOUT_TIMER_FREQ, timeout);
 
