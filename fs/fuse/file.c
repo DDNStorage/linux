@@ -1848,6 +1848,7 @@ retry:
 					/* The gate is already dropped; funnel
 					 * the failure through the one audited
 					 * exit. */
+					written = err;
 					wb_guard = false;
 					goto wb_out;
 				}
