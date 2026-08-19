@@ -333,7 +333,6 @@ static void fuse_truncate_update_attr(struct inode *inode, struct file *file)
 
 	spin_lock(&fi->lock);
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
-	fi->server_size = 0;
 	i_size_write(inode, 0);
 	spin_unlock(&fi->lock);
 	file_update_time(file);
@@ -1315,15 +1314,6 @@ bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written)
 
 	spin_lock(&fi->lock);
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
-	if (written > 0 && S_ISREG(inode->i_mode)) {
-		/*
-		 * The server acknowledged data up to @pos, keep the
-		 * server-materialized bound in sync for the expansion
-		 * zero-fill in fuse_write_begin().
-		 */
-		if (pos > fi->server_size)
-			fi->server_size = pos;
-	}
 	if (written > 0 && pos > inode->i_size) {
 		i_size_write(inode, pos);
 		ret = true;
@@ -2429,20 +2419,6 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	if (!fc->writeback_cache)
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
 	spin_lock(&fi->lock);
-	if (!error) {
-		struct fuse_write_in *inarg = &wpa->ia.write.in;
-
-		/*
-		 * The server acknowledged this writeback, so data up to the
-		 * end of the request is materialized on the server.  Advance
-		 * the bound before the pages end writeback below, i.e. before
-		 * they can go clean and be reclaimed, so that
-		 * fuse_write_begin() can never zero-fill a reclaimed range
-		 * the server holds data in.
-		 */
-		if ((loff_t) (inarg->offset + inarg->size) > fi->server_size)
-			fi->server_size = inarg->offset + inarg->size;
-	}
 	fi->writectr--;
 	fuse_writepage_finish(wpa);
 	spin_unlock(&fi->lock);
@@ -2796,42 +2772,6 @@ retry:
 		if (off)
 			folio_zero_segment(folio, 0, off);
 		goto success;
-	}
-
-	/*
-	 * The folio is inside i_size but may still sit in a range the server
-	 * holds no data for: a shared-lock writer extends i_size past regions
-	 * it has not written yet (see fuse_write_end()), and every such folio
-	 * would otherwise be read back from the server although it cannot
-	 * contain data.  Zero-fill locally instead when the server is known to
-	 * hold nothing in the range and we hold the DLM write lock covering
-	 * it:
-	 *
-	 *  - fi->server_size bounds the data materialized on the server
-	 *    (writeback and direct write acknowledgements, server
-	 *    attributes),
-	 *  - local data not yet acknowledged sits in uptodate folios, which
-	 *    are already handled above,
-	 *  - the page-granular DLM write lock excludes data written by other
-	 *    nodes, re-checked against the live lock tree so a revoked lock
-	 *    falls back to reading.
-	 */
-	if (fc->dlm) {
-		struct fuse_inode *fi = get_fuse_inode(mapping->host);
-		loff_t fpos = folio_pos(folio);
-		size_t fsz = folio_size(folio);
-		bool hole;
-
-		spin_lock(&fi->lock);
-		hole = fpos >= fi->server_size;
-		spin_unlock(&fi->lock);
-
-		if (hole && fuse_dlm_range_is_locked(fi, fpos, fpos + fsz - 1,
-						     FUSE_PAGE_LOCK_WRITE)) {
-			folio_zero_range(folio, 0, fsz);
-			folio_mark_uptodate(folio);
-			goto success;
-		}
 	}
 
 	err = fuse_do_readfolio(file, folio);
@@ -3908,7 +3848,6 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fuse_dlm_cache_init(fi);
 	fi->writectr = 0;
 	fi->iocachectr = 0;
-	fi->server_size = 0;
 	init_waitqueue_head(&fi->page_waitq);
 	init_waitqueue_head(&fi->direct_io_waitq);
 	/*

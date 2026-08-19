@@ -190,19 +190,6 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Server-materialized size: an upper bound for how far
-			 * the server holds file data.  Seeded from
-			 * server-reported attributes, advanced when the server
-			 * acknowledges data (writeback completion,
-			 * fuse_write_update_attr()), lowered again on
-			 * truncate.  A read-modify-write of a folio starting
-			 * at or past this bound needs no READ request under a
-			 * held DLM write lock: the server has no data there
-			 * (see fuse_write_begin()).  Protected by fi->lock.
-			 */
-			loff_t server_size;
-
-			/*
 			 * Per-inode read/write coherency gate for the
 			 * forced-direct-IO feature.  Cache-serving buffered reads
 			 * and buffered writes hold it for read; being a
