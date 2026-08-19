@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
+#include "fuse_gds.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -669,6 +670,23 @@ out:
 	return err;
 }
 
+static void fuse_readwrite_args_fill_gds_ext(struct fuse_io_args *ia)
+{
+	struct fuse_args *args = &ia->ap.args;
+	struct fuse_ext_header *ext_header = (struct fuse_ext_header *)ia->readwrite_in_gds_ext;
+
+	/*
+	 * The RDMA information data is already filled by the fuse_gds_get_gpu_sglist_rdma_info
+	 * function. Fill the extension header here.
+	 */
+	ext_header->type = FUSE_EXT_READ_WRITE_GDS;
+	ext_header->size = FUSE_EXT_READ_WRITE_GDS_SIZE;
+
+	args->is_ext = 1;
+	args->ext_idx = args->in_numargs++;
+	args->in_args[args->ext_idx].size = ext_header->size;
+	args->in_args[args->ext_idx].value = ext_header;
+}
 void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 			 size_t count, int opcode)
 {
@@ -687,6 +705,9 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 	args->out_argvar = true;
 	args->out_numargs = 1;
 	args->out_args[0].size = count;
+
+	if (ia->ap.args.use_gds)
+		fuse_readwrite_args_fill_gds_ext(ia);
 }
 
 static void fuse_release_user_pages(struct fuse_args_pages *ap,
@@ -1126,16 +1147,25 @@ static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
 	ia->write.in.size = count;
 	args->opcode = FUSE_WRITE;
 	args->nodeid = ff->nodeid;
-	args->in_numargs = 2;
+	args->in_numargs = 0;
 	if (ff->fm->fc->minor < 9)
 		args->in_args[0].size = FUSE_COMPAT_WRITE_IN_SIZE;
 	else
 		args->in_args[0].size = sizeof(ia->write.in);
 	args->in_args[0].value = &ia->write.in;
-	args->in_args[1].size = count;
+	args->in_numargs++;
+
+	if (ia->ap.args.use_gds)
+		fuse_readwrite_args_fill_gds_ext(ia);
+
+	/* inpage argument must be the last one */
+	args->in_args[args->in_numargs++].size = count;
+
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(ia->write.out);
 	args->out_args[0].value = &ia->write.out;
+
+
 }
 
 static unsigned int fuse_write_flags(struct kiocb *iocb)
@@ -1662,6 +1692,14 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 					  max_pages);
 		if (err && !nbytes)
 			break;
+
+		if (fc->gds_support && fuse_is_gds_buffer(&ia->ap)) {
+			err = fuse_gds_get_gpu_sglist_rdma_info(fc, write, ia);
+			if (err) {
+				fuse_release_user_pages(&ia->ap, io->should_dirty);
+				break;
+			}
+		}
 
 		if (write) {
 			if (!capable(CAP_FSETID))

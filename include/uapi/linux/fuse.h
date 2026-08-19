@@ -482,6 +482,7 @@ struct fuse_file_lock {
 #define FUSE_URING_REDUCED_Q	(1ULL << 59)
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
 #define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)
+#define FUSE_GDS_SUPPORT  (1ULL << 62)
 
 /**
  * CUSE INIT request/reply flags
@@ -604,6 +605,7 @@ enum fuse_ext_type {
 	/* Types 0..31 are reserved for fuse_secctx_header */
 	FUSE_MAX_NR_SECCTX	= 31,
 	FUSE_EXT_GROUPS		= 32,
+	FUSE_EXT_READ_WRITE_GDS	= 100,
 };
 
 enum fuse_opcode {
@@ -846,6 +848,10 @@ struct fuse_read_in {
 	uint64_t	lock_owner;
 	uint32_t	flags;
 	uint32_t	padding;
+};
+
+struct fuse_gds_read_out {
+	uint64_t    size;
 };
 
 #define FUSE_COMPAT_WRITE_IN_SIZE 24
