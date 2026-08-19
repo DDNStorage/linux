@@ -203,20 +203,6 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Server-materialized size: an upper bound for how far
-			 * the server holds file data.  Seeded from
-			 * server-reported attributes, advanced when the server
-			 * acknowledges data (writeback completion,
-			 * fuse_write_update_attr()), lowered again on
-			 * truncate.  A read-modify-write of a block starting
-			 * at or past this bound needs no READ request under a
-			 * held DLM write lock: the server has no data there
-			 * (see fuse_iomap_read_folio_range()).  Protected by
-			 * fi->lock.
-			 */
-			loff_t server_size;
-
-			/*
 			 * Serializes buffered-write page-cache dirtying against
 			 * the forced-direct-IO latch transition driven by
 			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which

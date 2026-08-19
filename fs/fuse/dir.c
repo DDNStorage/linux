@@ -2129,7 +2129,6 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_cache_release_locks(fi);
 			spin_lock(&fi->lock);
-			fi->server_size = 0;
 			i_size_write(inode, 0);
 			spin_unlock(&fi->lock);
 			truncate_pagecache(inode, 0);
@@ -2225,13 +2224,6 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	/* see the comment in fuse_change_attributes() */
 	if (!is_wb || is_truncate)
 		i_size_write(inode, outarg.attr.size);
-	/*
-	 * A truncate settles the size on the server; only shrink the
-	 * server-materialized bound: growing just exposes zeros, which the
-	 * bound need not cover (see fuse_iomap_read_folio_range()).
-	 */
-	if (is_truncate && (loff_t) outarg.attr.size < fi->server_size)
-		fi->server_size = outarg.attr.size;
 
 	if (is_truncate) {
 		/* NOTE: this may release/reacquire fi->lock */
