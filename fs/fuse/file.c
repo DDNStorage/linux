@@ -1462,7 +1462,8 @@ static inline unsigned int fuse_wr_pages(loff_t pos, size_t len,
 		     max_pages);
 }
 
-static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
+static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
+				  bool cache)
 {
 	struct address_space *mapping = iocb->ki_filp->f_mapping;
 	struct inode *inode = mapping->host;
@@ -1492,6 +1493,14 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 		if (count <= 0) {
 			err = count;
 		} else {
+			/*
+			 * On behalf of a buffered write whose bytes bypass
+			 * the page cache (DLM unaligned edges): the server
+			 * must classify them like the writeback they
+			 * replace.
+			 */
+			if (cache)
+				ia.write.in.write_flags |= FUSE_WRITE_CACHE;
 			err = fuse_send_write_pages(&ia, iocb, inode,
 						    pos, count);
 			if (!err) {
@@ -1675,7 +1684,7 @@ static ssize_t fuse_dlm_write_chunk(struct kiocb *iocb, struct iov_iter *from,
 	/* Cap the iterator to this chunk, keeping the tail for later chunks. */
 	hidden = iov_iter_count(from) - len;
 	iov_iter_truncate(from, len);
-	res = through ? fuse_perform_write(iocb, from)
+	res = through ? fuse_perform_write(iocb, from, true)
 		      : generic_perform_write(iocb, from);
 	/* Restore from the iterator's own residue, so short writes/errors
 	 * (which leave it partly advanced) reexpand to the exact remainder. */
@@ -1693,8 +1702,9 @@ static ssize_t fuse_dlm_write_chunk(struct kiocb *iocb, struct iov_iter *from,
  * route the unaligned head and tail straight through to the server.  The
  * writethrough path writes just those bytes and leaves the folio
  * non-uptodate, doing no read, and each edge lands as an independent
- * FUSE_WRITE, so writers sharing a boundary folio accumulate their bytes
- * on the server.  Aligned writes take the interior path whole; a
+ * FUSE_WRITE carrying FUSE_WRITE_CACHE like the writeback it replaces,
+ * so writers sharing a boundary folio accumulate their bytes on the
+ * server.  Aligned writes take the interior path whole; a
  * sub-page write with no aligned interior goes fully through.
  */
 static ssize_t fuse_dlm_buffered_write(struct kiocb *iocb,
@@ -1708,7 +1718,7 @@ static ssize_t fuse_dlm_buffered_write(struct kiocb *iocb,
 
 	/* No whole folio inside the write: nothing cacheable, all through. */
 	if (mid_end <= mid_start)
-		return fuse_perform_write(iocb, from);
+		return fuse_perform_write(iocb, from, true);
 
 	/* Unaligned head [pos, mid_start): through. */
 	res = fuse_dlm_write_chunk(iocb, from, mid_start - pos, true);
@@ -2024,9 +2034,9 @@ writethrough:
 		if (written < 0 || !iov_iter_count(from))
 			goto out;
 		written = direct_write_fallback(iocb, from, written,
-				fuse_perform_write(iocb, from));
+				fuse_perform_write(iocb, from, false));
 	} else {
-		written = fuse_perform_write(iocb, from);
+		written = fuse_perform_write(iocb, from, false);
 	}
 out:
 	if (wb_guard)
