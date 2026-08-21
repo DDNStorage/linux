@@ -1154,6 +1154,34 @@ static void fuse_readahead(struct readahead_control *rac)
 	if (fuse_is_bad(inode))
 		return;
 
+	/*
+	 * Readahead fills the page cache past the range the reader locked,
+	 * so take a DLM read grant over the whole window here too.  Folios
+	 * the server handed out no lock for are folios it will not revoke
+	 * when a remote node writes them, and a later read would be served
+	 * from stale cache.  Take the grant before any folio is pulled off
+	 * @rac, so the window is either fully covered or not populated.
+	 *
+	 * Speculative pages are not worth serving uncovered: on a failed
+	 * request drop the window and let read_pages() clean up the folios
+	 * left in @rac.  A server without DLM support answers -ENOSYS and
+	 * clears fc->dlm, which is not a failure.
+	 *
+	 * This can run inside the coherency gate, which
+	 * fuse_cache_read_iter() holds across generic_file_read_iter(), so
+	 * the round trip leans on the same server contract that lets a
+	 * cache-miss FUSE_READ block there: replies are serviced on threads
+	 * other than the one delivering a NOTIFY invalidate.
+	 */
+	if (fc->writeback_cache && fc->dlm) {
+		int err = fuse_get_dlm_lock(rac->file, readahead_pos(rac),
+					    readahead_length(rac),
+					    FUSE_PAGE_LOCK_READ);
+
+		if (err < 0 && err != -ENOSYS)
+			return;
+	}
+
 	max_pages = min_t(unsigned int, fc->max_pages,
 			fc->max_read / PAGE_SIZE);
 
