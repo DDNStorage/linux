@@ -2209,10 +2209,21 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 * fenced out.  i_rwsem is held exclusive here as well.
 		 */
 		if (fc->dlm && fc->writeback_cache)
-			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK, -1);
+			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK,
+					      U64_MAX);
 
 		truncate_pagecache(inode, outarg.attr.size);
 		invalidate_inode_pages2(mapping);
+
+		/*
+		 * The cache above the new size is gone, so the ranges
+		 * describing it have nothing left to say.  From the first
+		 * whole page above it: the page holding the new end of the
+		 * file survives the truncate, and so does its record.
+		 */
+		if (fc->dlm && fc->writeback_cache)
+			fuse_dlm_ranges_dropped(fi, PAGE_ALIGN(outarg.attr.size),
+						U64_MAX);
 	}
 
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
