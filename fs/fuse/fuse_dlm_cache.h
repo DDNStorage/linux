@@ -13,6 +13,7 @@
 
 
 struct fuse_inode;
+struct fuse_dlm_range;
 
 /* Lock modes for page ranges */
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
@@ -26,19 +27,25 @@ enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
  */
 #define FUSE_DLM_GRANT_UNRECORDED 1
 
-/* Page cache lock manager */
+/*
+ * Page cache lock manager.
+ *
+ * @ranges holds the grants the client has been given and not had taken
+ * back.  A request still on the wire covers nothing and lives on
+ * @pending instead, so tree walkers never filter on state.  See enum
+ * fuse_dlm_range_state in fuse_dlm_cache.c.
+ */
 struct fuse_dlm_cache {
-	/* Lock protecting the tree */
+	/* Lock protecting the tree and the pending list */
 	struct rw_semaphore lock;
-	/* Interval tree of locked ranges */
+	/* Interval tree of granted ranges (FUSE_DLM_RANGE_GRANTED) */
 	struct rb_root_cached ranges;
 	/*
-	 * Bumped under @lock by every revocation
-	 * (fuse_dlm_unlock_range(), fuse_dlm_cache_release_locks());
-	 * lets fuse_get_dlm_lock() order recording a reply's grant
-	 * against revokes processed while the reply was in flight.
+	 * FUSE_DLM_WB_LOCK requests in flight (REQUESTED, or REVOKED once
+	 * a revoke has overlapped one).  Owned by the queueing thread; the
+	 * revoke paths mark them only.
 	 */
-	uint64_t revoke_gen;
+	struct list_head pending;
 };
 
 /* Initialize a page cache lock manager */
@@ -51,13 +58,28 @@ void fuse_dlm_cache_release_locks(struct fuse_inode *inode);
 int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 			uint64_t end, enum fuse_page_lock_mode mode);
 
-/* As above, but refuse (-EAGAIN) if a revoke ran since @gen was sampled */
-int fuse_dlm_lock_range_gen(struct fuse_inode *inode, uint64_t start,
-			    uint64_t end, enum fuse_page_lock_mode mode,
-			    uint64_t gen);
+/*
+ * Publish a FUSE_DLM_WB_LOCK for [start, end] before it is sent, so a
+ * revoke processed while the reply is on the wire can mark it.  @req is
+ * caller-owned storage, live until the matching commit or abort.
+ */
+void fuse_dlm_request_begin(struct fuse_inode *inode,
+			    struct fuse_dlm_range *req, uint64_t start,
+			    uint64_t end, enum fuse_page_lock_mode mode);
 
-/* Sample the revocation generation (see fuse_dlm_lock_range_gen()) */
-uint64_t fuse_dlm_revoke_gen(struct fuse_inode *inode);
+/*
+ * Retire @req and record the grant [start, end] as one step under the
+ * cache lock.  -EAGAIN means a revoke overlapped @req in flight and
+ * nothing was recorded; the caller must request again.  @req is retired
+ * either way.
+ */
+int fuse_dlm_request_commit(struct fuse_inode *inode,
+			    struct fuse_dlm_range *req, uint64_t start,
+			    uint64_t end, enum fuse_page_lock_mode mode);
+
+/* Retire @req without recording anything */
+void fuse_dlm_request_abort(struct fuse_inode *inode,
+			    struct fuse_dlm_range *req);
 
 /* Unlock a range of pages */
 int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
