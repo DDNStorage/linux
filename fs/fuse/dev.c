@@ -433,9 +433,10 @@ static void flush_bg_queue(struct fuse_conn *fc)
  * This function is called when a request is finished.  Either a reply
  * has arrived or it was aborted (and not yet sent) or some error
  * occurred during communication with userspace, or the device file
- * was closed.  The requester thread is woken up (if still waiting),
- * the 'end' callback is called if given, else the reference to the
- * request is released
+ * was closed.  The 'complete' callback, if given, is called first, on
+ * this thread; only then is the requester thread woken up (if still
+ * waiting), the 'end' callback called if given, else the reference to
+ * the request is released.
  */
 void fuse_request_end(struct fuse_req *req)
 {
@@ -459,6 +460,10 @@ void fuse_request_end(struct fuse_req *req)
 	}
 	WARN_ON(test_bit(FR_PENDING, &req->flags));
 	WARN_ON(test_bit(FR_SENT, &req->flags));
+
+	if (req->args->complete)
+		req->args->complete(fm, req->args, req->out.h.error);
+
 	if (test_bit(FR_BACKGROUND, &req->flags)) {
 		spin_lock(&fc->bg_lock);
 		clear_bit(FR_BACKGROUND, &req->flags);

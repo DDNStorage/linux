@@ -33,6 +33,7 @@
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
 #include "fuse_dlm_cache.h"
+#include "fuse_range_lock.h"
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
@@ -203,21 +204,6 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Serializes buffered-write page-cache dirtying against
-			 * the forced-direct-IO latch transition driven by
-			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
-			 * may be delivered by the same server thread that still
-			 * owes a reply to an in-flight write holding the inode
-			 * lock.  The buffered writer holds this for read around
-			 * the dirtying and re-checks the latch under it; the
-			 * NOTIFY latch site takes it for write (trylock, never
-			 * blocking) around its page-cache invalidate + latch set.
-			 * Only regular files initialise it -- it shares storage
-			 * with the readdir-cache union arm.
-			 */
-			struct percpu_rw_semaphore *wb_inval_rwsem;
-
-			/*
 			 * Rate of FUSE_NOTIFY_INVAL_INODE data invalidations
 			 * for this whole file: notify_stamp is the jiffies of
 			 * the last one, notify_interval_ewma the EWMA of the
@@ -229,6 +215,15 @@ struct fuse_inode {
 			 */
 			unsigned long notify_stamp;
 			unsigned int notify_interval_ewma;
+
+			/*
+			 * Local byte-range lock tree, used to serialize
+			 * concurrent cached reads/writes that overlap, and to
+			 * let range-scoped invalidation (BRL/attr invalidation
+			 * notifications) block only on IO overlapping the
+			 * range being invalidated.
+			 */
+			struct fuse_range_lock_tree io_range_lock;
 		};
 
 		/* readdir cache (directory only) */
@@ -412,6 +407,22 @@ struct fuse_args {
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
+	/*
+	 * Called from fuse_request_end(), synchronously, on the thread
+	 * processing the reply -- before that thread wakes a requester
+	 * blocked in request_wait_answer(), runs any FR_BACKGROUND
+	 * completion, or invokes 'end' above. Unlike 'end' (gated on
+	 * FR_ASYNC, and which for background requests runs after the
+	 * request has already been fully torn down), 'complete' runs for
+	 * every request that reaches fuse_request_end(), synchronous or
+	 * not, letting a caller do work that must be visible before the
+	 * requester resumes or the reply-processing thread moves on to the
+	 * next message -- e.g. moving a range lock from INIT to READY as
+	 * part of processing a grant reply, instead of leaving that race
+	 * window open until the (possibly much later, descheduled)
+	 * requester thread gets to run.
+	 */
+	void (*complete)(struct fuse_mount *fm, struct fuse_args *args, int error);
 	/* Used for kvec iter backed by vmalloc address */
 	void *vmap_base;
 };
