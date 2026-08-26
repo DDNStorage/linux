@@ -124,6 +124,8 @@ INTERVAL_TREE_DEFINE(struct fuse_dlm_range, rb, uint64_t, __subtree_end,
 		    		fuse_dlm_range_start, fuse_dlm_range_last, static,
 		    		fuse_page_it);
 
+static void fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off);
+
 /**
  * fuse_dlm_kill_pending - mark in-flight requests overlapping [start, end]
  * @cache: The page cache
@@ -313,6 +315,19 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 
 	/* The state this grant records */
 	want = fuse_dlm_granted_state(mode);
+
+	/*
+	 * Ranges are upgraded whole below, so split at the grant bounds
+	 * first: a range extending past the grant would otherwise have its
+	 * uncovered part upgraded with it, recording coverage the server
+	 * never gave.  A read range half-covered by a write grant would
+	 * report the other half held for write, and a revoked range
+	 * half-regranted would report its still-revoked bytes as held, so
+	 * writeback would send them without taking the range again.
+	 */
+	fuse_dlm_split_at(cache, start);
+	if (end < U64_MAX)
+		fuse_dlm_split_at(cache, end + 1);
 
 	/* Find all ranges that overlap with [start, end] */
 	range = fuse_page_it_iter_first(&cache->ranges, start, end);
