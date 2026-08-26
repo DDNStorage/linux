@@ -646,6 +646,27 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 
 		if (inval)
 			invalidate_inode_pages2(inode->i_mapping);
+
+		/*
+		 * The DLM record has to follow the cache out, as on every
+		 * other path that drops it.  A revoked range exists only to
+		 * make writeback take the grant again before sending the
+		 * folios under it, so once they are gone it describes
+		 * nothing and would sit in the tree unfreed.  The pages above
+		 * the new size are gone unconditionally; the rest only when
+		 * the invalidate really emptied the mapping, so a folio that
+		 * survived (or was faulted back) keeps its record.
+		 */
+		if (fc->dlm && fc->writeback_cache) {
+			if (have_size && oldsize != attr->size)
+				fuse_dlm_ranges_dropped(fi,
+							PAGE_ALIGN(attr->size),
+							U64_MAX);
+			if (inval &&
+			    !filemap_range_has_page(inode->i_mapping, 0,
+						    LLONG_MAX))
+				fuse_dlm_ranges_dropped(fi, 0, U64_MAX);
+		}
 	}
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
