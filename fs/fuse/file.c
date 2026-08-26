@@ -3870,9 +3870,24 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 	if (err)
 		goto out;
 
-	truncate_inode_pages_range(inode_out->i_mapping,
-				   ALIGN_DOWN(pos_out, PAGE_SIZE),
-				   ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1);
+	{
+		loff_t lstart = ALIGN_DOWN(pos_out, PAGE_SIZE);
+		loff_t lend = ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1;
+
+		truncate_inode_pages_range(inode_out->i_mapping, lstart, lend);
+
+		/*
+		 * The record over the dropped span has nothing left to
+		 * describe, and left DIRTY it would make the next partial
+		 * write there keep and flush folio bytes nobody wrote.
+		 * Only when the drop really emptied it: a folio a
+		 * concurrent fault put back keeps its record.
+		 */
+		if (fc->dlm && fc->writeback_cache &&
+		    !filemap_range_has_page(inode_out->i_mapping, lstart,
+					    lend))
+			fuse_dlm_ranges_dropped(fi_out, lstart, lend);
+	}
 
 	file_update_time(file_out);
 	fuse_write_update_attr(inode_out, pos_out + outarg.size, outarg.size);
