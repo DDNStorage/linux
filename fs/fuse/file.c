@@ -1805,18 +1805,25 @@ static ssize_t fuse_dlm_write_chunk(struct kiocb *iocb, struct iov_iter *from,
 }
 
 /*
- * Buffered write under DLM.  A partial page dirtied for writeback would
- * have to be completed by reading the untouched remainder back from the
- * server, and for a write past the server EOF that READ can only return
- * zero bytes: a wasted round trip per unaligned edge.  So cache only the
- * page-aligned interior, whole pages need no read-modify-write, and
- * route the unaligned head and tail straight through to the server.  The
- * writethrough path writes just those bytes and leaves the page
- * non-uptodate, doing no read, and each edge lands as an independent
- * FUSE_WRITE carrying FUSE_WRITE_CACHE like the writeback it replaces,
- * so writers sharing a boundary page accumulate their bytes on the
- * server.  Aligned writes take the interior path whole; a
- * sub-page write with no aligned interior goes fully through.
+ * Buffered write under DLM.  A partly written page dirtied for
+ * writeback would have to be completed by reading the untouched
+ * remainder back from the server, and for a write past the server EOF
+ * that READ can only return zero bytes: a wasted round trip per
+ * unaligned edge.  So cache only the page-aligned interior, whole pages
+ * need no read-modify-write, and route the unaligned head and tail
+ * straight through to the server.  The writethrough path writes just
+ * those bytes and leaves the page non-uptodate, doing no read, and each
+ * edge lands as an independent FUSE_WRITE carrying FUSE_WRITE_CACHE
+ * like the writeback it replaces, so writers sharing a boundary page
+ * accumulate their bytes on the server.  Aligned writes take the
+ * interior path whole; a sub-page write with no aligned interior goes
+ * fully through.
+ *
+ * The page is the block here: iomap tracks a folio a block at a time
+ * and __iomap_write_begin() skips the fill only for a block the write
+ * covers whole, so the cut has to land on block bounds.  A writeback
+ * connection is refused unless the two are the same size; see
+ * process_init_reply().
  */
 static ssize_t fuse_dlm_buffered_write(struct kiocb *iocb,
 				       struct iov_iter *from,
