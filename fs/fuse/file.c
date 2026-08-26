@@ -3744,8 +3744,28 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 			file_update_time(file);
 	}
 
-	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
+	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) {
 		truncate_pagecache_range(inode, offset, offset + length - 1);
+
+		/*
+		 * The whole pages inside the hole are gone, so a revoked
+		 * range over them has nothing left to make writeback take
+		 * the grant again for, and would sit in the tree unfreed.
+		 * The pages straddling the ends survive with their punched
+		 * part zeroed, so their record still names real (now zero)
+		 * bytes and stays.  Only when the drop really emptied the
+		 * span: a busy folio that survived keeps its record.
+		 */
+		if (fm->fc->dlm && fm->fc->writeback_cache) {
+			uint64_t first = PAGE_ALIGN(offset);
+			uint64_t last = (uint64_t)(offset + length) & PAGE_MASK;
+
+			if (first < last &&
+			    !filemap_range_has_page(inode->i_mapping, first,
+						    last - 1))
+				fuse_dlm_ranges_dropped(fi, first, last - 1);
+		}
+	}
 
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 
