@@ -529,16 +529,36 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 	    !S_ISREG(inode->i_mode))
 		return cache_mask;
 
-	if (!fuse_dlm_write_grant_exists(fi))
+	/*
+	 * A dirty mapping keeps the local attributes authoritative even
+	 * when no grant is recorded: a fault dirties pages under a
+	 * page-mkwrite lock that is never recorded, and a truncate revokes
+	 * the tail grants itself while cached writes above the new size
+	 * are still waiting for writeback.
+	 */
+	if (!fuse_dlm_write_grant_exists(fi) &&
+	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) &&
+	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
 		return cache_mask;
 
 	if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
 	    mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
 		cache_mask |= STATX_MTIME | STATX_CTIME;
 
+	/*
+	 * The local size stays authoritative while the extension is
+	 * covered by a write grant, and also while anything in
+	 * [attr->size, size) is dirty or under writeback: those bytes
+	 * exist only here, and taking the server's smaller size would
+	 * truncate them away before they are ever sent.  The grant check
+	 * alone misses them, because a page-mkwrite grant is never
+	 * recorded and a local truncate revokes its own tail grants.
+	 */
 	if (have_size && size > (loff_t) attr->size &&
-	    fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
-				  FUSE_PAGE_LOCK_WRITE))
+	    (fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
+				   FUSE_PAGE_LOCK_WRITE) ||
+	     filemap_range_needs_writeback(inode->i_mapping, attr->size,
+					   size - 1)))
 		cache_mask |= STATX_SIZE;
 
 	return cache_mask;
