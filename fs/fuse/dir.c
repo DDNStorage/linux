@@ -723,6 +723,10 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outentry, 0, sizeof(outentry));
 	inarg.flags = flags;
+
+	/* The kernel owns append positioning; see fuse_send_open() */
+	if (fm->fc->writeback_cache)
+		inarg.flags &= ~O_APPEND;
 	inarg.mode = mode;
 	inarg.umask = current_umask();
 

@@ -70,6 +70,17 @@ static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
 	if (!fm->fc->atomic_o_trunc)
 		inarg.flags &= ~O_TRUNC;
 
+	/*
+	 * With the writeback cache the kernel owns append positioning:
+	 * writeback sends FUSE_WRITE with explicit offsets, and a server
+	 * that opens its backing file O_APPEND has pwrite(2) ignore them
+	 * (Linux appends regardless of offset).  Any re-sent or reordered
+	 * run is then placed at EOF: duplicated data and a growing file.
+	 * Do not hand the flag to the server at all.
+	 */
+	if (fm->fc->writeback_cache)
+		inarg.flags &= ~O_APPEND;
+
 	if (fm->fc->handle_killpriv_v2 &&
 	    (inarg.flags & O_TRUNC) && !capable(CAP_FSETID)) {
 		inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
@@ -172,6 +183,10 @@ static int fuse_compound_open_getattr(struct fuse_mount *fm, u64 nodeid,
 	open_in.flags = flags & ~(O_CREAT | O_EXCL | O_NOCTTY);
 	if (!fm->fc->atomic_o_trunc)
 		open_in.flags &= ~O_TRUNC;
+
+	/* The kernel owns append positioning; see fuse_send_open() */
+	if (fm->fc->writeback_cache)
+		open_in.flags &= ~O_APPEND;
 
 	if (fm->fc->handle_killpriv_v2 &&
 	    (open_in.flags & O_TRUNC) && !capable(CAP_FSETID))
