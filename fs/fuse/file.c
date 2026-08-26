@@ -383,10 +383,32 @@ static int fuse_open(struct inode *inode, struct file *file)
 	if (is_wb_truncate || dax_truncate)
 		fuse_release_nowrite(inode);
 	if (!err) {
-		if (is_truncate)
+		if (is_truncate) {
+			/*
+			 * Every grant goes with the cache, as on the
+			 * fuse_do_setattr() O_TRUNC path: a record left
+			 * behind would keep naming bytes the folios no
+			 * longer hold.  i_rwsem is held exclusive
+			 * (is_wb_truncate), so no cached write is mid-record.
+			 */
+			if (fc->dlm && fc->writeback_cache)
+				fuse_dlm_cache_release_locks(fi);
 			truncate_pagecache(inode, 0);
-		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE)) {
 			invalidate_inode_pages2(inode->i_mapping);
+			/*
+			 * Only when the drop really emptied the mapping; a
+			 * folio that survived still needs its record.  This
+			 * open holds no lock against concurrent IO, but
+			 * neither does the invalidate above -- anything
+			 * populated or dirtied after it keeps its page, and
+			 * the check sees that page.
+			 */
+			if (fc->dlm && fc->writeback_cache &&
+			    !filemap_range_has_page(inode->i_mapping, 0,
+						    LLONG_MAX))
+				fuse_dlm_ranges_dropped(fi, 0, U64_MAX);
+		}
 	}
 	if (dax_truncate)
 		filemap_invalidate_unlock(inode->i_mapping);

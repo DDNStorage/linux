@@ -785,9 +785,17 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 		fi = get_fuse_inode(inode);
 		fuse_sync_release(fi, ff, flags);
 	} else {
-		if (fm->fc->atomic_o_trunc && trunc)
+		if (fm->fc->atomic_o_trunc && trunc) {
+			/*
+			 * Every grant goes with the cache, as on the
+			 * fuse_open() O_TRUNC path: a record left behind
+			 * would keep naming bytes the folios no longer hold.
+			 */
+			if (fm->fc->dlm && fm->fc->writeback_cache)
+				fuse_dlm_cache_release_locks(
+						get_fuse_inode(inode));
 			truncate_pagecache(inode, 0);
-		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
 			invalidate_inode_pages2(inode->i_mapping);
 	}
 	return err;
