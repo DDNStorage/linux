@@ -2000,6 +2000,16 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 		else
 			fm->sb->s_bdi->ra_pages =
 				min(fm->sb->s_bdi->ra_pages, ra_pages);
+		/*
+		 * ra_pages caps speculative readahead; io_pages is what the
+		 * device can carry in one go, and mm uses it to let a read
+		 * larger than the readahead window through at the size it
+		 * was actually asked for instead of clamping it to ra_pages.
+		 * For fuse that size is a request, so say so -- otherwise a
+		 * large explicit read or a FADV_WILLNEED gets chopped up by a
+		 * window that was only ever meant to bound guessing.
+		 */
+		fm->sb->s_bdi->io_pages = fc->max_pages;
 		fc->minor = arg->minor;
 		fc->max_write = arg->minor < 5 ? 4096 : arg->max_write;
 		fc->max_write = max_t(unsigned, 4096, fc->max_write);
