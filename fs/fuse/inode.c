@@ -929,6 +929,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	struct percpu_rw_semaphore *wb_sem = NULL;
 	struct fuse_inode *fi;
 	struct inode *inode;
+	uint64_t pg_first;
+	uint64_t pg_last;
 	loff_t end_byte;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
@@ -964,8 +966,17 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		else
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
 
-		/* Byte bounds of the same region, for the page cache queries */
+		/*
+		 * Byte bounds of the same region, and the page aligned form
+		 * the DLM record is told about.  A grant is recorded page
+		 * aligned, so the range handed to it has to cover whole
+		 * pages or the record would keep a range the page cache no
+		 * longer backs.
+		 */
 		end_byte = len <= 0 ? LLONG_MAX : offset + len - 1;
+		pg_first = (uint64_t)offset & PAGE_MASK;
+		pg_last = len <= 0 ? U64_MAX :
+			  (((uint64_t)offset + len - 1) | (PAGE_SIZE - 1));
 
 		/*
 		 * A data invalidation means another (remote) entity is modifying
@@ -1084,6 +1095,18 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				fuse_notify_invalidate_range(inode, pg_start,
 							     pg_end,
 							     may_be_dirty);
+
+			/*
+			 * A revoked range exists to describe page cache
+			 * dirtied before the grant went; with that cache gone
+			 * it has nothing left to say.  Only when it really
+			 * went: an invalidate can leave a busy folio behind,
+			 * and that folio still needs its record.
+			 */
+			if (has_pages &&
+			    !filemap_range_has_page(inode->i_mapping, offset,
+						    end_byte))
+				fuse_dlm_ranges_dropped(fi, pg_first, pg_last);
 
 			percpu_up_write(wb_sem);
 
