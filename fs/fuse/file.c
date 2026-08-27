@@ -1160,6 +1160,8 @@ static void fuse_readahead(struct readahead_control *rac)
 	struct inode *inode = rac->mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	unsigned int i, max_pages, nr_pages = 0;
+	pgoff_t target_end;
+	bool expanded = false;
 
 	if (fuse_is_bad(inode))
 		return;
@@ -1168,7 +1170,8 @@ static void fuse_readahead(struct readahead_control *rac)
 			  fc->max_read / PAGE_SIZE);
 
 	/*
-	 * Round the window up to whole requests before anything is fetched.
+	 * Decide how wide this window is meant to be, rounded up to whole
+	 * requests.  Nothing is allocated here, only the end offset.
 	 *
 	 * mm sizes it from per-fd offset arithmetic, so several threads
 	 * walking one file at a stride each see their own hits as isolated,
@@ -1189,14 +1192,14 @@ static void fuse_readahead(struct readahead_control *rac)
 	 * negotiated large requests does not get to prefetch beyond the
 	 * window the admin allowed.
 	 */
+	target_end = readahead_index(rac) + readahead_count(rac);
 	if (rac->ra) {
 		unsigned int unit = min_t(unsigned int, max_pages,
 					  rac->ra->ra_pages);
 		unsigned int nr = readahead_count(rac);
 
 		if (unit > 1 && nr % unit)
-			readahead_expand(rac, readahead_pos(rac),
-					 (size_t)roundup(nr, unit) << PAGE_SHIFT);
+			target_end = readahead_index(rac) + roundup(nr, unit);
 	}
 
 	/*
@@ -1204,9 +1207,17 @@ static void fuse_readahead(struct readahead_control *rac)
 	 * so take a DLM read grant over the whole window here too.  Folios
 	 * the server handed out no lock for are folios it will not revoke
 	 * when a remote node writes them, and a later read would be served
-	 * from stale cache.  Take the grant after the expansion above and
-	 * before any folio is pulled off @rac, so the window that gets
-	 * populated is the window that is covered.
+	 * from stale cache.  Take the grant before any folio is pulled off
+	 * @rac, so the window that gets populated is the window that is
+	 * covered.
+	 *
+	 * The grant covers the window this call intends rather than the one
+	 * it ends up with, since the folios past what mm built are not
+	 * allocated yet.  readahead_expand() stops at the first folio already
+	 * cached, so a short realisation leaves the tail covered but not
+	 * populated.  That is the harmless direction: coverage without cached
+	 * data serves nothing stale, and a folio already cached is one an
+	 * earlier grant already covers.
 	 *
 	 * Speculative pages are not worth serving uncovered: on a failed
 	 * request drop the window and let read_pages() clean up the folios
@@ -1218,8 +1229,9 @@ static void fuse_readahead(struct readahead_control *rac)
 	 * nothing else.
 	 */
 	if (fc->writeback_cache && fc->dlm) {
-		int err = fuse_get_dlm_lock(rac->file, readahead_pos(rac),
-					    readahead_length(rac),
+		size_t len = (size_t)(target_end - readahead_index(rac))
+				<< PAGE_SHIFT;
+		int err = fuse_get_dlm_lock(rac->file, readahead_pos(rac), len,
 					    FUSE_PAGE_LOCK_READ);
 
 		if (err < 0 && err != -ENOSYS)
@@ -1229,6 +1241,7 @@ static void fuse_readahead(struct readahead_control *rac)
 	for (;;) {
 		struct fuse_io_args *ia;
 		struct fuse_args_pages *ap;
+		unsigned int avail;
 
 		if (fc->num_background >= fc->congestion_threshold &&
 		    rac->ra->async_size >= readahead_count(rac))
@@ -1238,19 +1251,55 @@ static void fuse_readahead(struct readahead_control *rac)
 			 */
 			break;
 
-		nr_pages = readahead_count(rac) - nr_pages;
-		if (nr_pages > max_pages)
-			nr_pages = max_pages;
-		if (nr_pages == 0)
-			break;
+		/*
+		 * @_nr_pages still counts the batch handed out last round,
+		 * which __readahead_batch() retires on its next call, so
+		 * subtracting it gives what is built but not yet sent.
+		 */
+		avail = readahead_count(rac) - nr_pages;
+		if (!avail) {
+			/*
+			 * Everything built is in flight.  Grow the window now
+			 * rather than before the first send.
+			 *
+			 * readahead_expand() allocates, inserts and locks one
+			 * folio per page, and every reader wanting this range
+			 * blocks on the first of them until the request that
+			 * fills it completes.  Building the whole window up
+			 * front puts that walk, hundreds of folios on a mount
+			 * with large requests, ahead of the first byte anyone
+			 * asked for, with nothing in flight to cover it and
+			 * every other reader fenced behind it.  Sending what
+			 * mm built first turns the walk into work done while
+			 * the server is already answering.
+			 *
+			 * _index and _nr_pages are both stale by the
+			 * outstanding batch, so their sum is still the window
+			 * end and the growth lands where it should.
+			 */
+			if (expanded ||
+			    readahead_index(rac) + readahead_count(rac) >=
+				    target_end)
+				break;
+			expanded = true;
+			readahead_expand(rac, readahead_pos(rac),
+					 (size_t)(target_end -
+						  readahead_index(rac))
+						 << PAGE_SHIFT);
+			avail = readahead_count(rac) - nr_pages;
+			if (!avail)
+				break;
+		}
+
+		nr_pages = min(avail, max_pages);
 		ia = fuse_io_alloc(NULL, nr_pages);
 		if (!ia)
 			return;
 		ap = &ia->ap;
 		nr_pages = __readahead_batch(rac, ap->pages, nr_pages);
 		for (i = 0; i < nr_pages; i++) {
-			fuse_wait_on_page_writeback(inode,
-						    readahead_index(rac) + i);
+			/* The batch holds a reference, so no lookup needed. */
+			wait_on_page_writeback(ap->pages[i]);
 			ap->descs[i].length = PAGE_SIZE;
 		}
 		ap->num_pages = nr_pages;
