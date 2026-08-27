@@ -13,9 +13,13 @@
  *  - REQUESTED, on cache->pending, while its FUSE_DLM_WB_LOCK is in
  *    flight.
  *
- *  - REVOKED, still on cache->pending, once a revoke has overlapped it.
- *    fuse_dlm_request_commit() drops such a grant instead of recording
- *    it.
+ *  - REVOKED, in either place.  On cache->pending it is a request a
+ *    revoke overlapped while it was in flight, and
+ *    fuse_dlm_request_commit() drops that grant instead of recording it.
+ *    In cache->ranges it is a grant that was recorded and has since been
+ *    taken away, kept because the page cache under it is still
+ *    described.  It covers nothing either way, so the IO paths ask
+ *    again.
  *
  *  - READ or WRITE, in cache->ranges.  The only states
  *    fuse_dlm_range_is_locked() reports as covered; the mode is not a
@@ -24,11 +28,16 @@
  *
  * In-flight requests are kept off the tree so the state is consulted
  * only where a request is retired, not by every tree walker.
+ *
+ * The record says nothing about the page cache under a range.  What is
+ * cached there, and whether the server has seen it, is what the page
+ * cache itself answers.
  */
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
 
 #include <linux/list.h>
+#include <linux/pagemap.h>
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/interval_tree_generic.h>
@@ -38,7 +47,11 @@
 enum fuse_dlm_range_state {
 	/* FUSE_DLM_WB_LOCK in flight, on cache->pending */
 	FUSE_DLM_RANGE_REQUESTED,
-	/* Revoked while in flight; the grant must not be recorded */
+	/*
+	 * On cache->pending, revoked in flight and the grant must not be
+	 * recorded.  In cache->ranges, granted once and taken away, kept to
+	 * describe the page cache under it.  Covers nothing either way.
+	 */
 	FUSE_DLM_RANGE_REVOKED,
 	/* Granted shared, in cache->ranges */
 	FUSE_DLM_RANGE_READ,
@@ -50,9 +63,12 @@ enum fuse_dlm_range_state {
 struct fuse_dlm_range {
 	/* Interval tree node; only linked once granted */
 	struct rb_node rb;
-	/* Start page offset (inclusive) */
+	/*
+	 * The range, as byte offsets, both inclusive.  Grants arrive page
+	 * aligned, and a range is split only at the bounds of another, so
+	 * these are page aligned too.
+	 */
 	uint64_t start;
-	/* End page offset (inclusive) */
 	uint64_t end;
 	/* Subtree end value for interval tree */
 	uint64_t __subtree_end;
@@ -104,8 +120,8 @@ INTERVAL_TREE_DEFINE(struct fuse_dlm_range, rb, uint64_t, __subtree_end,
 /**
  * fuse_dlm_kill_pending - mark in-flight requests overlapping [start, end]
  * @cache: The page cache
- * @start: Start page offset of the revoked region
- * @end: End page offset of the revoked region
+ * @start: Start byte offset of the revoked region
+ * @end: End byte offset of the revoked region
  *
  * A revoke overlapping a request still on the wire has nothing to remove
  * from the tree, since that grant is not recorded yet.  Marking it makes
@@ -181,8 +197,8 @@ void fuse_dlm_cache_release_locks(struct fuse_inode *inode)
 /**
  * fuse_dlm_find_overlapping - Find a range that overlaps with [start, end]
  * @cache: The page cache
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  *
  * Return: Pointer to the first overlapping range, or NULL if none found
  */
@@ -196,8 +212,8 @@ fuse_dlm_find_overlapping(struct fuse_dlm_cache *cache, uint64_t start,
 /**
  * fuse_page_try_merge - Try to merge ranges within a specific region
  * @cache: The page cache
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  *
  * Attempt to merge ranges within and adjacent to the specified region
  * that have the same lock mode.
@@ -232,7 +248,7 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 					struct fuse_dlm_range, rb);
 		}
 
-		/* Try to merge with next range if adjacent and same state */
+		/* Merge neighbours the server has given us on the same terms */
 		if (next && range->state == next->state &&
 		    range->end + 1 == next->start) {
 			/* Merge ranges: re-insert so __subtree_end is updated */
@@ -254,8 +270,8 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 /**
  * fuse_dlm_lock_range_locked - Record a granted range of pages
  * @inode: The fuse inode
- * @start: Start page offset
- * @end: End page offset
+ * @start: Start byte offset
+ * @end: End byte offset
  * @mode: Lock mode (read or write)
  *
  * Add a locked range on the specified range of pages.
@@ -297,17 +313,19 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 		/* Get next overlapping range before we potentially modify the tree */
 		next = fuse_page_it_iter_next(range, start, end);
 
-		/* Check lock compatibility */
-		if (want == FUSE_DLM_RANGE_WRITE &&
-		    range->state != FUSE_DLM_RANGE_WRITE) {
-			/* we own the lock but have to update it. */
+		/*
+		 * A revoked range is covered again by this grant, and a read
+		 * range needs upgrading when a write is granted.
+		 */
+		if (range->state == FUSE_DLM_RANGE_REVOKED ||
+		    (want == FUSE_DLM_RANGE_WRITE &&
+		     range->state != FUSE_DLM_RANGE_WRITE))
 			list_add_tail(&range->list, &to_upgrade);
-		}
 		/* If WRITE lock already exists - nothing to do */
 
 		/* If there's a gap before this range, we need to add the missing range */
 		if (current_start < range->start) {
-			new_range = kmalloc(sizeof(*new_range), GFP_KERNEL);
+			new_range = kmalloc(sizeof(*new_range), GFP_NOFS);
 			if (!new_range) {
 				ret = -ENOMEM;
 				goto out_free;
@@ -333,7 +351,7 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 
 	/* If there's a gap after the last range to the end, extend the range */
 	if (!covered_to_end && current_start <= end) {
-		new_range = kmalloc(sizeof(*new_range), GFP_KERNEL);
+		new_range = kmalloc(sizeof(*new_range), GFP_NOFS);
 		if (!new_range) {
 			ret = -ENOMEM;
 			goto out_free;
@@ -347,11 +365,9 @@ static int fuse_dlm_lock_range_locked(struct fuse_inode *inode, uint64_t start,
 		list_add_tail(&new_range->list, &to_lock);
 	}
 
-	/* update locks, if any lock is in this list it has the wrong mode */
-	list_for_each_entry(range, &to_upgrade, list) {
-		/* Update the lock mode */
+	/* Everything on this list is now covered in @want */
+	list_for_each_entry(range, &to_upgrade, list)
 		range->state = want;
-	}
 
 	/* Add all new ranges to the tree */
 	list_for_each_entry(new_range, &to_lock, list) {
@@ -373,14 +389,10 @@ out_free:
 		kfree(new_range);
 	}
 
-	/* Restore original lock modes for any partially upgraded locks */
-	list_for_each_entry(range, &to_upgrade, list) {
-		if (want == FUSE_DLM_RANGE_WRITE) {
-			/* We upgraded this lock but failed later, downgrade it back */
-			range->state = FUSE_DLM_RANGE_READ;
-		}
-	}
-
+	/*
+	 * Nothing to undo on @to_upgrade: every goto here is taken before
+	 * the loop above runs, so no state has been changed yet.
+	 */
 	return ret;
 }
 
@@ -401,8 +413,8 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
  * fuse_dlm_request_begin - publish a lock request before it is sent
  * @inode: the fuse inode
  * @req: caller-owned storage for the request, live until commit or abort
- * @start: start page offset being requested (inclusive)
- * @end: end page offset being requested (inclusive)
+ * @start: start byte offset being requested (inclusive)
+ * @end: end byte offset being requested (inclusive)
  *
  * The mode is not recorded here: until the server answers the range is
  * held in neither, and the mode that reaches the tree is the one passed
@@ -430,6 +442,7 @@ void fuse_dlm_request_begin(struct fuse_inode *inode,
 	req->start = start;
 	req->end = end;
 	req->state = FUSE_DLM_RANGE_REQUESTED;
+	/* Nothing reads this while the request is pending; publish it set */
 
 	down_write(&cache->lock);
 	list_add_tail(&req->list, &cache->pending);
@@ -440,8 +453,8 @@ void fuse_dlm_request_begin(struct fuse_inode *inode,
  * fuse_dlm_request_commit - retire a request and record its grant
  * @inode: the fuse inode
  * @req: the request published by fuse_dlm_request_begin()
- * @start: start page offset the server granted (inclusive)
- * @end: end page offset the server granted (inclusive)
+ * @start: start byte offset the server granted (inclusive)
+ * @end: end byte offset the server granted (inclusive)
  * @mode: the mode that was requested
  *
  * Unlinking @req and recording the grant are one step under the cache
@@ -489,83 +502,116 @@ void fuse_dlm_request_abort(struct fuse_inode *inode,
 }
 
 /**
- * fuse_dlm_punch_hole - Punch a hole in a locked range
+ * fuse_dlm_split_at - make @off start a range
  * @cache: The page cache
- * @start: Start page offset of the hole
- * @end: End page offset of the hole
+ * @off: byte offset to split at
  *
- * Create a hole in a locked range by splitting it into two ranges.
+ * Splits the range containing @off in two, both halves keeping the state
+ * of the original, so a revoke can apply to one side only.  A no-op when
+ * @off already starts a range or falls in a gap.
  *
- * Return: 0 on success, negative error code on failure
+ * Caller holds @cache->lock for write.
+ *
+ * Cannot fail: the split decides which bytes a caller goes on to name,
+ * and both naming more than was written and lowering more than was sent
+ * lose data.  iomap allocates the state it keeps per folio the same way.
  */
-static int fuse_dlm_punch_hole(struct fuse_dlm_cache *cache, uint64_t start,
-			       uint64_t end)
+static void fuse_dlm_split_at(struct fuse_dlm_cache *cache, uint64_t off)
 {
-	struct fuse_dlm_range *range, *new_range;
-	int ret = 0;
+	struct fuse_dlm_range *range, *tail;
 
-	if (!cache || start > end)
-		return -EINVAL;
+	if (!off)
+		return;
 
-	/* Find a range that contains [start, end] */
-	range = fuse_dlm_find_overlapping(cache, start, end);
-	if (!range) {
-		ret = -EINVAL;
-		goto out;
-	}
+	range = fuse_page_it_iter_first(&cache->ranges, off, off);
+	if (!range || range->start == off)
+		return;
 
-	/* If the hole is at the beginning of the range */
-	if (start == range->start) {
-		fuse_page_it_remove(range, &cache->ranges);
-		range->start = end + 1;
-		fuse_page_it_insert(range, &cache->ranges);
-		goto out;
-	}
+	tail = kmalloc(sizeof(*tail), GFP_NOFS | __GFP_NOFAIL);
 
-	/* If the hole is at the end of the range */
-	if (end == range->end) {
-		fuse_page_it_remove(range, &cache->ranges);
-		range->end = start - 1;
-		fuse_page_it_insert(range, &cache->ranges);
-		goto out;
-	}
+	*tail = *range;
+	INIT_LIST_HEAD(&tail->list);
+	tail->start = off;
 
-	/* The hole is in the middle, need to split */
-	new_range = kmalloc(sizeof(*new_range), GFP_KERNEL);
-	if (!new_range) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	/* Copy properties from original range */
-	*new_range = *range;
-	INIT_LIST_HEAD(&new_range->list);
-
-	/* Adjust ranges */
-	new_range->start = end + 1;
-	range->end = start - 1;
-
-	/* Update interval tree */
+	/*
+	 * Bounds are never edited in place: the interval tree caches a
+	 * subtree end that only insertion recomputes.
+	 */
 	fuse_page_it_remove(range, &cache->ranges);
+	range->end = off - 1;
 	fuse_page_it_insert(range, &cache->ranges);
-	fuse_page_it_insert(new_range, &cache->ranges);
-
-out:
-	return ret;
+	fuse_page_it_insert(tail, &cache->ranges);
 }
 
 /**
- * fuse_dlm_unlock_range - Unlock a range of pages
- * @cache: The page cache
- * @start: Start page offset
- * @end: End page offset
+ * fuse_dlm_ranges_dropped - the page cache under [start, end] is gone
+ * @inode: the fuse inode
+ * @start: start byte offset (inclusive)
+ * @end: end byte offset (inclusive)
  *
- * Release locks on the specified range of pages.  An inverted range is
- * rejected rather than silently removing nothing: the callers revoke
- * coverage, and a revoke that quietly keeps the grant alive would let
- * the re-validating IO paths trust a lock the server has taken away.
- * To drop every grant use fuse_dlm_cache_release_locks() (there is no
- * in-band sentinel range for it).
+ * A revoked range exists only to describe page cache dirtied before the
+ * grant was taken away.  Once that cache is gone the range has nothing
+ * left to say and is freed; a range still held goes back to describing
+ * nothing.
+ *
+ * The caller must have established that the range really is empty, not
+ * merely asked for it to be dropped: a folio that survived an
+ * invalidate is still there, and claiming otherwise would let writeback
+ * send it with no record of where it came from.
+ */
+void fuse_dlm_ranges_dropped(struct fuse_inode *inode, uint64_t start,
+			     uint64_t end)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range, *next;
+
+	if (start > end)
+		return;
+
+	down_write(&cache->lock);
+
+	fuse_dlm_split_at(cache, start);
+	if (end < U64_MAX)
+		fuse_dlm_split_at(cache, end + 1);
+
+	range = fuse_page_it_iter_first(&cache->ranges, start, end);
+	while (range) {
+		next = fuse_page_it_iter_next(range, start, end);
+
+		if (range->state == FUSE_DLM_RANGE_REVOKED) {
+			fuse_page_it_remove(range, &cache->ranges);
+			kfree(range);
+		}
+
+		range = next;
+	}
+
+	fuse_dlm_try_merge(cache, start, end);
+
+	up_write(&cache->lock);
+}
+
+/**
+ * fuse_dlm_unlock_range - Revoke the grants over a range of pages
+ * @inode: The fuse inode
+ * @start: Start byte offset
+ * @end: End byte offset
+ *
+ * The server has taken [start, end] back.  A range that has nothing
+ * cached under it is removed; one that has is kept and marked
+ * FUSE_DLM_RANGE_REVOKED, so the page cache it covers stays described.
+ * Removing it instead would leave a gap, and a gap reads as "no record",
+ * which is what an untracked range looks like: writeback would then send
+ * folios dirtied under the grant that was just taken away.
+ *
+ * A revoked range covers nothing, so fuse_dlm_range_is_locked() reports
+ * it uncovered and the IO paths request again.
+ *
+ * An inverted range is rejected rather than silently revoking nothing:
+ * the callers revoke coverage, and a revoke that quietly keeps the grant
+ * alive would let the re-validating IO paths trust a lock the server has
+ * taken away.  To drop every grant use fuse_dlm_cache_release_locks()
+ * (there is no in-band sentinel range for it).
  *
  * Return: 0 on success, negative error code on failure
  */
@@ -574,7 +620,6 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range, *next;
-	int ret = 0;
 
 	if (!cache || start > end)
 		return -EINVAL;
@@ -588,32 +633,31 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 	 */
 	fuse_dlm_kill_pending(cache, start, end);
 
-	/* Find all ranges that overlap with [start, end] */
+	/* Split so the revoked region has its own ranges */
+	fuse_dlm_split_at(cache, start);
+	if (end < U64_MAX)
+		fuse_dlm_split_at(cache, end + 1);
+
 	range = fuse_page_it_iter_first(&cache->ranges, start, end);
 	while (range) {
-		/* Get next overlapping range before we potentially modify the tree */
+		/* Get next overlapping range before we modify the tree */
 		next = fuse_page_it_iter_next(range, start, end);
 
-		/* Check if we need to punch a hole */
-		if (start > range->start && end < range->end) {
-			/* Punch a hole in the middle */
-			ret = fuse_dlm_punch_hole(cache, start, end);
-			if (ret)
-				goto out;
-			/* After punching a hole, we're done */
-			break;
-		} else if (start > range->start) {
-			/* Adjust the end of the range */
-			fuse_page_it_remove(range, &cache->ranges);
-			range->end = start - 1;
-			fuse_page_it_insert(range, &cache->ranges);
-		} else if (end < range->end) {
-			/* Adjust the start of the range */
-			fuse_page_it_remove(range, &cache->ranges);
-			range->start = end + 1;
-			fuse_page_it_insert(range, &cache->ranges);
+		/*
+		 * A revoked range is kept only to say that the page cache
+		 * under it was dirtied under a grant that has gone, so that
+		 * writeback takes the range again before sending it.  With
+		 * nothing cached there it has nothing to say.
+		 *
+		 * A grant with no end is recorded to U64_MAX; the page cache
+		 * is indexed by a signed offset, so ask it about as much of
+		 * that as it can name.
+		 */
+		if (filemap_range_has_page(inode->inode.i_mapping, range->start,
+					   min_t(uint64_t, range->end,
+						 LLONG_MAX))) {
+			range->state = FUSE_DLM_RANGE_REVOKED;
 		} else {
-			/* Complete overlap, remove the range */
 			fuse_page_it_remove(range, &cache->ranges);
 			kfree(range);
 		}
@@ -621,20 +665,18 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 		range = next;
 	}
 
-out:
+	fuse_dlm_try_merge(cache, start, end);
+
 	up_write(&cache->lock);
-	return ret;
+	return 0;
 }
 
 /**
- * fuse_dlm_range_is_locked - Check if a page range is already locked
- * @cache: The page cache
- * @start: Start page offset
- * @end: End page offset
- * @mode: Lock mode to check for (or NULL to check for any lock)
- *
- * Check if the specified range of pages is already locked.
- * The entire range must be locked for this to return true.
+ * fuse_dlm_range_is_locked - Check if a byte range is already locked
+ * @inode: The fuse inode
+ * @start: Start byte offset
+ * @end: End byte offset
+ * @mode: Lock mode to check for
  *
  * Return: true if the entire range is locked, false otherwise
  */
@@ -714,6 +756,11 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
  * server has not seen, so its mtime and ctime run ahead of anything the
  * server can report.
  *
+ * A revoked range is not counted.  The state does not keep the mode the
+ * range was granted in, so a revoked one cannot be told from a read that
+ * was taken away, and the dirty page cache such a range describes is
+ * what the caller checks the mapping for instead.
+ *
  * Return: true if at least one recorded range is held for write
  */
 bool fuse_dlm_write_grant_exists(struct fuse_inode *fi)
@@ -776,11 +823,10 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
  * re-validating the grant must not re-request on a nonzero return or
  * they would spin.
  */
-int fuse_get_dlm_lock(struct file *file, loff_t offset,
-		      size_t length, enum fuse_page_lock_mode mode)
+static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
+			       loff_t offset, size_t length,
+			       enum fuse_page_lock_mode mode)
 {
-	struct fuse_file *ff = file->private_data;
-	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_mount *fm = ff->fm;
@@ -789,11 +835,20 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
 	struct fuse_dlm_range req;
+	uint64_t pg_start, pg_end;
 	int err;
 
 	/* An empty range needs no lock. */
 	if (!length)
 		return 0;
+
+	/*
+	 * note that the offset and length don't have to be page aligned
+	 * here but since we only get here on writeback caching we will
+	 * send out page aligned requests
+	 */
+	pg_start = (uint64_t)offset & PAGE_MASK;
+	pg_end = ((uint64_t)offset + length - 1) | (PAGE_SIZE - 1);
 
 restart:
 	/* note that this can be run from different processes
@@ -803,17 +858,19 @@ restart:
 	 * The early exit uses the same helper the callers re-validate
 	 * with, so this check and a later fuse_dlm_lock_is_held() can
 	 * never disagree about what counts as covered. */
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
-		return 0; /* we already have this area locked */
+	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
+		/*
+		 * Already covered, and the record says nothing beyond that,
+		 * so this is one shared acquisition end to end.
+		 */
+		return 0;
+	}
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
 
-	/* note that the offset and length don't have to be page aligned
-	 * here but since we only get here on writeback caching we will
-	 * send out page aligned requests */
-	inarg.start = offset & PAGE_MASK;
-	inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
+	inarg.start = pg_start;
+	inarg.end = pg_end;
 	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
 		FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
 
@@ -883,4 +940,33 @@ restart:
 		return FUSE_DLM_GRANT_UNRECORDED;
 
 	return 0;
+}
+
+int fuse_get_dlm_lock(struct file *file, loff_t offset,
+		      size_t length, enum fuse_page_lock_mode mode)
+{
+	return __fuse_get_dlm_lock(file->private_data, file_inode(file),
+				   offset, length, mode);
+}
+
+/**
+ * fuse_dlm_regrant_range - hold [start, end] again for writeback
+ * @ff: a fuse file open for writing on @inode
+ * @inode: the inode
+ * @start: start byte offset (inclusive)
+ * @end: end byte offset (inclusive)
+ *
+ * Writeback holds the range again before sending a folio, since a revoke
+ * may have arrived between the write and the send.  Whatever the other
+ * holder wrote in between is overwritten, which for two writers that
+ * never synchronised is a legitimate order.
+ *
+ * A range still held is the ordinary case: the grant is found recorded
+ * and nothing is sent to the server.
+ */
+int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,
+			   uint64_t start, uint64_t end)
+{
+	return __fuse_get_dlm_lock(ff, inode, start, end - start + 1,
+				   FUSE_PAGE_LOCK_WRITE);
 }

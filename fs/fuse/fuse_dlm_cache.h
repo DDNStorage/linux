@@ -14,6 +14,7 @@
 
 struct fuse_inode;
 struct fuse_dlm_range;
+struct fuse_file;
 
 /* Lock modes for page ranges */
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
@@ -30,15 +31,16 @@ enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
 /*
  * Page cache lock manager.
  *
- * @ranges holds the grants the client has been given and not had taken
- * back.  A request still on the wire covers nothing and lives on
- * @pending instead, so tree walkers never filter on state.  See enum
- * fuse_dlm_range_state in fuse_dlm_cache.c.
+ * @ranges holds the grants the client has been given, and the ones it
+ * has had taken back that still describe page cache
+ * (FUSE_DLM_RANGE_REVOKED).  A request still on the wire covers nothing
+ * and lives on @pending instead, so tree walkers never filter on state.
+ * See enum fuse_dlm_range_state in fuse_dlm_cache.c.
  */
 struct fuse_dlm_cache {
 	/* Lock protecting the tree and the pending list */
 	struct rw_semaphore lock;
-	/* Interval tree of granted ranges (FUSE_DLM_RANGE_READ/_WRITE) */
+	/* Interval tree of recorded ranges, granted or revoked */
 	struct rb_root_cached ranges;
 	/*
 	 * FUSE_DLM_WB_LOCK requests in flight (REQUESTED, or REVOKED once
@@ -96,6 +98,17 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 
 /* Is any part of the file held for write? */
 bool fuse_dlm_write_grant_exists(struct fuse_inode *inode);
+
+/*
+ * The page cache under [start, end] is gone: free the revoked ranges over
+ * it.  The caller must have established the range really is empty.
+ */
+void fuse_dlm_ranges_dropped(struct fuse_inode *inode, uint64_t start,
+			     uint64_t end);
+
+/* Hold [start, end] again so writeback can send what it found revoked */
+int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,
+			   uint64_t start, uint64_t end);
 
 /* This is the interface to the filesystem */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
