@@ -1062,6 +1062,30 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			may_be_dirty = filemap_range_needs_writeback(
 					inode->i_mapping, offset, end_byte);
 
+			/*
+			 * Put unwritten data on the server while the grant
+			 * still covers it, rather than leaving it to the drop
+			 * below.  After the revoke writeback would have to
+			 * take the range again to send those bytes: a DLM
+			 * round trip from inside the handler the server is
+			 * waiting on.  do_writepages() runs in this context,
+			 * so the grant is asked for before the revoke.
+			 *
+			 * Waited out here rather than left to the drop, which
+			 * launders when the range may be dirty and so waits
+			 * for these same replies.  One explicit wait, before
+			 * the revoke, and the drop then finds nothing under
+			 * writeback to block on.  Either way a server that
+			 * revokes from a thread it also needs to answer
+			 * FUSE_WRITE on deadlocks here, the same contract
+			 * fuse_notify_invalidate_range() states for a frozen
+			 * inode.  The error is left to the mapping, where
+			 * fsync collects it.
+			 */
+			if (has_pages && may_be_dirty)
+				filemap_write_and_wait_range(inode->i_mapping,
+							     offset, end_byte);
+
 			fuse_dlm_revoke_inval_range(fi, offset, len);
 
 			if (enable_notify_dio && hot && has_writer &&
