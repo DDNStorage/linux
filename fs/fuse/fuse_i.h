@@ -1237,6 +1237,9 @@ struct fuse_file *fuse_file_alloc(struct fuse_mount *fm, bool release);
 void fuse_file_free(struct fuse_file *ff);
 int fuse_finish_open(struct inode *inode, struct file *file);
 
+/* Drop the page cache an open must not keep; true if it came out empty */
+bool fuse_open_drop_cache(struct inode *inode);
+
 void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
 		       unsigned int flags);
 

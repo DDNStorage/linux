@@ -799,8 +799,17 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 				fuse_dlm_cache_release_locks(
 						get_fuse_inode(inode));
 			truncate_pagecache(inode, 0);
-		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
-			invalidate_inode_pages2(inode->i_mapping);
+		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE)) {
+			/*
+			 * Only when the drop really emptied the mapping, as
+			 * in fuse_open(): a folio that survived still needs
+			 * its record.
+			 */
+			if (fuse_open_drop_cache(inode) &&
+			    fm->fc->dlm && fm->fc->writeback_cache)
+				fuse_dlm_ranges_dropped(get_fuse_inode(inode),
+							0, U64_MAX);
+		}
 	}
 	return err;
 
