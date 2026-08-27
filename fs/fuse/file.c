@@ -2628,6 +2628,7 @@ static int fuse_writepage_locked(struct folio *folio)
 	struct address_space *mapping = folio->mapping;
 	struct inode *inode = mapping->host;
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_writepage_args *wpa;
 	struct fuse_args_pages *ap;
 	struct fuse_file *ff;
@@ -2636,6 +2637,22 @@ static int fuse_writepage_locked(struct folio *folio)
 	ff = fuse_write_file_get(fi);
 	if (!ff)
 		goto err;
+
+	/*
+	 * Hold the range again before sending it; see fuse_writepages_fill().
+	 * fuse_launder_folio() cleared the folio, so put it back on failure
+	 * rather than lose the bytes; the invalidate that laundered it then
+	 * reports the folio busy, as it does for any folio it cannot free.
+	 */
+	if (fc->dlm && fc->writeback_cache) {
+		error = fuse_dlm_regrant_range(ff, inode, folio_pos(folio),
+					       folio_pos(folio) +
+					       folio_size(folio) - 1);
+		if (error < 0 && error != -ENOSYS) {
+			filemap_dirty_folio(mapping, folio);
+			goto err_writepage_args;
+		}
+	}
 
 	wpa = fuse_writepage_args_setup(folio, ff);
 	error = -ENOMEM;
@@ -2761,6 +2778,33 @@ static int fuse_writepages_fill(struct folio *folio,
 		data->ff = fuse_write_file_get(fi);
 		if (!data->ff)
 			goto out_unlock;
+	}
+
+	/*
+	 * Everything dirty here was written whole by this client: the
+	 * unaligned edges of a cached write go to the server directly and
+	 * the interior covers whole pages, so nothing partly written is
+	 * ever dirtied.  There is nothing to classify, only the grant to
+	 * make sure of: a revoke may have arrived since the write, and
+	 * these bytes must not go out from under one.
+	 *
+	 * fuse_dlm_regrant_range() takes the range back when it has gone,
+	 * and walks the record once under the lock held for read when it
+	 * has not.  On failure the folio goes back on the dirty list, so
+	 * the next writeback tries again: write_cache_pages() cleared it
+	 * before calling here and does not put it back itself, and these
+	 * bytes are not on the server.  A server with no DLM answers
+	 * -ENOSYS, which is not a failure.
+	 */
+	if (fc->dlm && fc->writeback_cache) {
+		err = fuse_dlm_regrant_range(data->ff, inode, folio_pos(folio),
+					     folio_pos(folio) +
+					     folio_size(folio) - 1);
+		if (err < 0 && err != -ENOSYS) {
+			folio_redirty_for_writepage(wbc, folio);
+			goto out_unlock;
+		}
+		err = 0;
 	}
 
 	if (wpa && fuse_writepage_need_send(fc, &folio->page, ap, data, wbc)) {
