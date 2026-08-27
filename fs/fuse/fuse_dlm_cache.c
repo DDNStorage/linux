@@ -38,10 +38,17 @@
 
 #include <linux/list.h>
 #include <linux/pagemap.h>
+#include <linux/sched/signal.h>
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/interval_tree_generic.h>
 
+
+/*
+ * How often to ask again for a grant a revoke killed while it was in
+ * flight, before giving up on the range.  Each pass is a round trip.
+ */
+#define FUSE_DLM_GRANT_RETRIES 16
 
 /* Lifecycle of a range; see the file comment above */
 enum fuse_dlm_range_state {
@@ -836,6 +843,7 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 	struct fuse_dlm_lock_out outarg;
 	struct fuse_dlm_range req;
 	uint64_t pg_start, pg_end;
+	int tries = FUSE_DLM_GRANT_RETRIES;
 	int err;
 
 	/* An empty range needs no lock. */
@@ -921,10 +929,18 @@ restart:
 		 * A revoke overlapping this range was processed while the
 		 * request was in flight, so the grant is dead.  Retry
 		 * rather than fail: no one else holds the range, and the
-		 * write path turns an error into a failed write.  Each
-		 * pass is a fresh round trip, so a revoke storm throttles
-		 * the loop.
+		 * write path turns an error into a failed write.
+		 *
+		 * Not forever, though.  Every pass is a whole round trip,
+		 * which throttles the loop but does not end it, and
+		 * writeback asks for a grant with a folio locked, so a node
+		 * revoking as fast as the grants arrive would hold that
+		 * folio and this task for as long as it kept going.
 		 */
+		if (fatal_signal_pending(current))
+			return -EINTR;
+		if (!tries--)
+			return -EIO;
 		goto restart;
 	}
 
