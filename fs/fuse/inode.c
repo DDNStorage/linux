@@ -890,22 +890,25 @@ static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
  * Drop a page-cache range on behalf of a NOTIFY invalidate.
  *
  * invalidate_inode_pages2_range() waits out folios under writeback and
- * launders dirty ones, both of which need a FUSE_WRITE reply.  While
- * writepages are frozen (fuse_set_nowrite(): truncate, O_TRUNC open, fsync,
- * pre-SETATTR flush) no reply can arrive, because fuse_flush_writepages()
- * parks the request on fi->queued_writes until fuse_release_nowrite().  A
- * server that revokes from inside the handler it is revoking for then
- * deadlocks against its own reply.  fuse_do_setattr() states the same rule
- * for its own invalidate.
+ * launders dirty ones, both of which need a FUSE_WRITE reply.  It is only
+ * needed when the range can hold data the server has not seen.
  *
- * So while frozen use invalidate_mapping_pages(), which skips dirty and
- * under-writeback folios and never blocks.  The stale clean folios still
- * go, and the freezes that span a request drop the cache themselves once
- * they complete: fuse_do_setattr() invalidates the mapping after releasing
- * the freeze, the O_TRUNC open path calls truncate_pagecache().
+ * @may_be_dirty false says it cannot.  invalidate_mapping_pages() then
+ * drops the same folios without ever waiting for the server.
+ *
+ * The same substitution is forced while writepages are frozen
+ * (fuse_set_nowrite(): truncate, O_TRUNC open, fsync, pre-SETATTR flush),
+ * where no reply can arrive because fuse_flush_writepages() parks the
+ * request on fi->queued_writes until fuse_release_nowrite().  A server that
+ * revokes from inside the handler it is revoking for would otherwise
+ * deadlock against its own reply.  fuse_do_setattr() states the same rule
+ * for its own invalidate.  There the dirty folios are left behind, and the
+ * freezes that span a request drop the cache themselves once they complete:
+ * fuse_do_setattr() invalidates the mapping after releasing the freeze, the
+ * O_TRUNC open path calls truncate_pagecache().
  */
 static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
-					 pgoff_t end)
+					 pgoff_t end, bool may_be_dirty)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	bool frozen;
@@ -914,7 +917,7 @@ static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
 	frozen = fi->writectr < 0;
 	spin_unlock(&fi->lock);
 
-	if (frozen)
+	if (frozen || !may_be_dirty)
 		invalidate_mapping_pages(inode->i_mapping, start, end);
 	else
 		invalidate_inode_pages2_range(inode->i_mapping, start, end);
@@ -926,6 +929,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	struct percpu_rw_semaphore *wb_sem = NULL;
 	struct fuse_inode *fi;
 	struct inode *inode;
+	loff_t end_byte;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
 
@@ -959,6 +963,9 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			pg_end = -1;
 		else
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
+
+		/* Byte bounds of the same region, for the page cache queries */
+		end_byte = len <= 0 ? LLONG_MAX : offset + len - 1;
 
 		/*
 		 * A data invalidation means another (remote) entity is modifying
@@ -1011,6 +1018,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 		if (wb_sem) {
 			bool hot, has_writer, latched = false;
+			bool may_be_dirty, has_pages;
 
 			spin_lock(&fi->lock);
 			hot = fuse_notify_inval_hot(fi);
@@ -1035,6 +1043,22 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
 
+			/*
+			 * Ask what is left to do, under the gate so no
+			 * reader can populate and no writer can dirty
+			 * between the answer and the drop below.
+			 *
+			 * Nothing cached in the range means the drop is a
+			 * no-op; the revoke above was the whole job.
+			 * Otherwise the page cache says whether the drop has
+			 * to launder, which is what makes it wait for a
+			 * FUSE_WRITE reply.
+			 */
+			has_pages = filemap_range_has_page(inode->i_mapping,
+							   offset, end_byte);
+			may_be_dirty = filemap_range_needs_writeback(
+					inode->i_mapping, offset, end_byte);
+
 			if (enable_notify_dio && hot && has_writer &&
 			    !mapping_mapped(inode->i_mapping) &&
 			    !fuse_inode_force_dio(inode)) {
@@ -1049,14 +1073,17 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			/*
 			 * Latched: drop the whole mapping (dirty folios
 			 * outside the notified range would be invisible to
-			 * the forced direct reads).  Otherwise just the
-			 * notified range.
+			 * the forced direct reads), and nothing was asked
+			 * about the rest of the file, so launder.  Otherwise
+			 * just the notified range, and only if anything is
+			 * cached there.
 			 */
 			if (fuse_inode_force_dio(inode))
-				fuse_notify_invalidate_range(inode, 0, -1);
-			else
+				fuse_notify_invalidate_range(inode, 0, -1, true);
+			else if (has_pages)
 				fuse_notify_invalidate_range(inode, pg_start,
-							     pg_end);
+							     pg_end,
+							     may_be_dirty);
 
 			percpu_up_write(wb_sem);
 
@@ -1064,12 +1091,17 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
 						    nodeid);
 		} else {
-			/* No gate on this inode (DAX, backing, non-regular,
+			/*
+			 * No gate on this inode (DAX, backing, non-regular,
 			 * or the gate allocation failed): drop the lock
-			 * range unserialized (best-effort), as before. */
+			 * range unserialized (best-effort), as before.  The
+			 * answers above were not taken either, so assume the
+			 * range can hold unwritten data.
+			 */
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
-			fuse_notify_invalidate_range(inode, pg_start, pg_end);
+			fuse_notify_invalidate_range(inode, pg_start, pg_end,
+						     true);
 		}
 	}
 	iput(inode);
