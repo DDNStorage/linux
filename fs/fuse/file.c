@@ -1155,13 +1155,133 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	fuse_readpages_end(fm, &ap->args, err);
 }
 
+/*
+ * Populate and send one request past the window mm asked for.
+ *
+ * mm keeps readahead state per open file, so several threads reading one
+ * shared file through their own descriptors each carry a separate idea of
+ * the stream.  Only the first of them to reach a hole allocates anything;
+ * the rest find the folios present and return having issued nothing.  The
+ * PG_readahead trigger that should start the next window is cleared by
+ * whichever thread reaches it first, and that thread's state usually
+ * describes a window some other thread built, so page_cache_async_ra()
+ * takes its interleaved path, finds no hole within read_ahead_kb and
+ * issues nothing at all.  The chain dies there and every window after it
+ * costs a synchronous miss with all the readers waiting on it.
+ *
+ * The inode is what those readers actually share, so keep the lookahead
+ * there instead: one of them claims the range past the window and fills
+ * it while the others skip it.  One request deep is enough to leave a
+ * fetch outstanding for the window just sent to be consumed against.
+ *
+ * Called from inside read_pages(), so the invalidate lock is held shared
+ * by the readahead that got us here.  That is what makes adding folios
+ * safe against a concurrent invalidate.
+ */
+static void fuse_readahead_lookahead(struct file *file, struct inode *inode,
+				     pgoff_t start, unsigned int nr)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct address_space *mapping = inode->i_mapping;
+	gfp_t gfp = readahead_gfp_mask(mapping);
+	struct fuse_io_args *ia;
+	struct fuse_args_pages *ap;
+	loff_t size = i_size_read(inode);
+	unsigned int i, added = 0;
+	pgoff_t last;
+	bool claimed;
+
+	if (!nr || !size)
+		return;
+
+	/* Speculative work is not worth queueing behind a backlog. */
+	if (fc->num_background >= fc->congestion_threshold)
+		return;
+
+	/* Nothing past the end of the file. */
+	last = (size - 1) >> PAGE_SHIFT;
+	if (start > last)
+		return;
+	if (start + nr - 1 > last)
+		nr = last - start + 1;
+
+	/*
+	 * One claimant per range.  A reader that finds the range already
+	 * claimed has nothing to add, and one that jumped elsewhere claims
+	 * afresh, so a re-read from the start is not locked out.
+	 */
+	spin_lock(&fi->lock);
+	claimed = fi->ra_lookahead != start;
+	if (claimed)
+		fi->ra_lookahead = start;
+	spin_unlock(&fi->lock);
+	if (!claimed)
+		return;
+
+	/*
+	 * Same grant the window itself takes: folios the server handed out
+	 * no lock for are folios it will not revoke when a remote node
+	 * writes them.
+	 */
+	if (fc->writeback_cache && fc->dlm) {
+		int err = fuse_get_dlm_lock(file, (loff_t)start << PAGE_SHIFT,
+					    (size_t)nr << PAGE_SHIFT,
+					    FUSE_PAGE_LOCK_READ);
+
+		if (err < 0 && err != -ENOSYS)
+			return;
+	}
+
+	ia = fuse_io_alloc(NULL, nr);
+	if (!ia)
+		return;
+	ap = &ia->ap;
+
+	for (i = 0; i < nr; i++) {
+		struct folio *folio = filemap_alloc_folio(gfp, 0);
+
+		if (!folio)
+			break;
+		/*
+		 * Stop at the first folio already cached, so the request
+		 * stays contiguous and nothing already held is refetched.
+		 */
+		if (filemap_add_folio(mapping, folio, start + i, gfp) < 0) {
+			folio_put(folio);
+			break;
+		}
+		/*
+		 * Hand mm a trigger it can still use.  The reader crossing
+		 * into this range calls page_cache_async_ra(), which looks
+		 * for the first hole ahead and finds the one this request
+		 * stops at, so the next window starts while this one is
+		 * still being consumed.
+		 */
+		if (!added)
+			folio_set_readahead(folio);
+		/* Freshly allocated, so there is no writeback to wait out. */
+		ap->pages[added] = &folio->page;
+		ap->descs[added].length = PAGE_SIZE;
+		added++;
+	}
+
+	if (!added) {
+		fuse_io_free(ia);
+		return;
+	}
+
+	ap->num_pages = added;
+	fuse_send_readpages(ia, file);
+}
+
 static void fuse_readahead(struct readahead_control *rac)
 {
 	struct inode *inode = rac->mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	unsigned int i, max_pages, nr_pages = 0;
+	unsigned int i, max_pages, nr_pages = 0, unit;
 	pgoff_t target_end;
-	bool expanded = false;
+	bool expanded = false, complete = false;
 
 	if (fuse_is_bad(inode))
 		return;
@@ -1192,12 +1312,12 @@ static void fuse_readahead(struct readahead_control *rac)
 	 * negotiated large requests does not get to prefetch beyond the
 	 * window the admin allowed.
 	 */
+	unit = max_pages;
 	target_end = readahead_index(rac) + readahead_count(rac);
 	if (rac->ra) {
-		unsigned int unit = min_t(unsigned int, max_pages,
-					  rac->ra->ra_pages);
 		unsigned int nr = readahead_count(rac);
 
+		unit = min_t(unsigned int, max_pages, rac->ra->ra_pages);
 		if (unit > 1 && nr % unit)
 			target_end = readahead_index(rac) + roundup(nr, unit);
 	}
@@ -1279,16 +1399,20 @@ static void fuse_readahead(struct readahead_control *rac)
 			 */
 			if (expanded ||
 			    readahead_index(rac) + readahead_count(rac) >=
-				    target_end)
+				    target_end) {
+				complete = true;
 				break;
+			}
 			expanded = true;
 			readahead_expand(rac, readahead_pos(rac),
 					 (size_t)(target_end -
 						  readahead_index(rac))
 						 << PAGE_SHIFT);
 			avail = readahead_count(rac) - nr_pages;
-			if (!avail)
+			if (!avail) {
+				complete = true;
 				break;
+			}
 		}
 
 		nr_pages = min(avail, max_pages);
@@ -1305,6 +1429,14 @@ static void fuse_readahead(struct readahead_control *rac)
 		ap->num_pages = nr_pages;
 		fuse_send_readpages(ia, rac->file);
 	}
+
+	/*
+	 * The whole window is in flight, so prime the next one before the
+	 * readers get there.  Skipped on a congestion or allocation exit,
+	 * where there is already more queued than the connection wants.
+	 */
+	if (complete)
+		fuse_readahead_lookahead(rac->file, inode, target_end, unit);
 }
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to);
@@ -4103,6 +4235,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->iocachectr = 0;
 	init_waitqueue_head(&fi->page_waitq);
 	init_waitqueue_head(&fi->direct_io_waitq);
+	fi->ra_lookahead = 0;
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
 

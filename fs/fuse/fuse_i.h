@@ -201,6 +201,15 @@ struct fuse_inode {
 			 */
 			unsigned long notify_stamp;
 			unsigned int notify_interval_ewma;
+
+			/*
+			 * Index most recently claimed by the inode wide read
+			 * lookahead, so several readers walking one file do
+			 * not each populate the same range.  Protected by
+			 * fi->lock; regular files only (shares the
+			 * readdir-cache union arm).
+			 */
+			pgoff_t ra_lookahead;
 		};
 
 		/* readdir cache (directory only) */
