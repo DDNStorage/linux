@@ -190,31 +190,6 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Per-inode read/write coherency gate for the
-			 * forced-direct-IO feature.  Cache-serving buffered reads
-			 * and buffered writes hold it for read; being a
-			 * percpu_rw_semaphore the read side is per-CPU cheap and
-			 * scales on a shared file.  The NOTIFY invalidate
-			 * (fuse_reverse_inval_inode()) holds it for write, which
-			 * BLOCKS so the coherency notify has priority: it fences
-			 * cache-serving reads (and buffered writes) out for the
-			 * whole invalidate, so no folio a remote modify has
-			 * superseded is ever handed back.
-			 *
-			 * The write side may run on the server thread delivering
-			 * the notify, so a blocking writer is safe only under a
-			 * server that services request replies on threads other
-			 * than the one delivering the notify (see the NOTIFY site).
-			 *
-			 * Allocated out of line only for writeback+dlm regular
-			 * files (it shares storage with the readdir-cache union
-			 * arm); NULL on other mounts and on allocation failure,
-			 * where the gate is inactive and the invalidate falls back
-			 * to best-effort.
-			 */
-			struct percpu_rw_semaphore *wb_inval_rwsem;
-
-			/*
 			 * Rate of FUSE_NOTIFY_INVAL_INODE data invalidations
 			 * for this whole file: notify_stamp is the jiffies of
 			 * the last one, notify_interval_ewma the EWMA of the

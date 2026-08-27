@@ -208,23 +208,6 @@ static void fuse_evict_inode(struct inode *inode)
 		WARN_ON(!list_empty(&fi->queued_writes));
 		fuse_dlm_cache_release_locks(fi);
 	}
-
-	/*
-	 * Free the coherency gate here rather than in ->free_inode: that runs
-	 * from an RCU callback, where percpu_free_rwsem() may sleep in
-	 * rcu_sync_dtor() if the write side has not fully quiesced.  No user
-	 * can remain by eviction time: gate readers hold a file reference and
-	 * a concurrent notify holds an inode reference.  wb_inval_rwsem lives
-	 * in the regular-file union arm and is only ever allocated for regular
-	 * files, so gate on S_ISREG (but not fuse_is_bad() -- bad-marked
-	 * regular files still own a gate); a directory's overlapping
-	 * readdir-cache fields must not be misread.
-	 */
-	if (S_ISREG(inode->i_mode) && fi->wb_inval_rwsem) {
-		percpu_free_rwsem(fi->wb_inval_rwsem);
-		kfree(fi->wb_inval_rwsem);
-		fi->wb_inval_rwsem = NULL;
-	}
 }
 
 static int fuse_reconfigure(struct fs_context *fsc)
@@ -926,7 +909,6 @@ static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len)
 {
-	struct percpu_rw_semaphore *wb_sem = NULL;
 	struct fuse_inode *fi;
 	struct inode *inode;
 	uint64_t pg_first;
@@ -934,6 +916,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	loff_t end_byte;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
+	bool tracked;
 
 	inode = fuse_ilookup(fc, nodeid, NULL);
 	if (!inode)
@@ -983,19 +966,13 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * the file.  Two things happen here:
 		 *
 		 * 1. Coherency.  Drop the affected page-cache range so no local
-		 *    read returns a folio the remote modify has superseded.  This
-		 *    runs under the write side of the per-inode coherency gate
-		 *    (wb_inval_rwsem), which fences cache-serving buffered reads
-		 *    and buffered writes out for the whole invalidate.  Unlike the
-		 *    old best-effort trylock this BLOCKS -- the notify has
-		 *    priority: percpu_down_write() parks new gate readers, drains
-		 *    in-flight ones, then invalidates.  A blocking writer here is
-		 *    safe only under a server that services request replies on
-		 *    threads other than the one delivering this notify: the write
-		 *    side waits for gate readers to drain, and a cache-miss read
-		 *    holds the read side across its FUSE_READ round-trip.  redfs'
-		 *    dlm server provides that contract; a server that cannot must
-		 *    not enable writeback+dlm.
+		 *    read returns a folio the remote modify has superseded.
+		 *    Nothing is fenced out for it.  A read racing the drop
+		 *    either misses and refetches or returns data that was
+		 *    current when it was copied.  A write racing it is caught
+		 *    on the way out instead: this revoke marks the range rather
+		 *    than forgetting it, and writeback holds the range again
+		 *    before sending anything it finds marked that way.
 		 *
 		 * 2. Latch.  Keep a moving average (fuse_notify_inval_hot(), under
 		 *    fi->lock, updated for every data invalidation) of how fast
@@ -1013,21 +990,17 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 *    already-latched inodes run out on the usual exits (last
 		 *    writer closes, or mmap).
 		 *
-		 * The gate (and the average) exist only for writeback+dlm regular
-		 * files; elsewhere wb_sem is NULL and the invalidate runs
-		 * unserialized (best-effort), as before.  An mmapped inode
-		 * keeps the gate -- fuse_cache_read_iter() and
-		 * fuse_cache_write_iter() enter it unconditionally and rely
-		 * on the revoke staying fenced -- but is never latched:
-		 * a mapping needs the page cache, and fuse_file_mmap()
-		 * reverts any latch it races with.
+		 * The average and the latch exist only for writeback+dlm
+		 * regular files; elsewhere there is no record to consult and
+		 * the range is dropped as it always was.  An mmapped inode is
+		 * never latched: a mapping needs the page cache, and
+		 * fuse_file_mmap() reverts any latch it races with.
 		 */
-		if (S_ISREG(inode->i_mode) && fc->writeback_cache &&
-		    fc->dlm && !FUSE_IS_DAX(inode) &&
-		    !fuse_inode_backing(fi))
-			wb_sem = fi->wb_inval_rwsem;
+		tracked = S_ISREG(inode->i_mode) && fc->writeback_cache &&
+			  fc->dlm && !FUSE_IS_DAX(inode) &&
+			  !fuse_inode_backing(fi);
 
-		if (wb_sem) {
+		if (tracked) {
 			bool hot, has_writer, latched = false;
 			bool may_be_dirty, has_pages;
 
@@ -1037,38 +1010,18 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			spin_unlock(&fi->lock);
 
 			/*
-			 * Priority write side: park new gate readers,
-			 * drain in-flight ones, then invalidate.  Blocks
-			 * (unlike the old trylock) -- see the contract in
-			 * the comment above.
-			 */
-			percpu_down_write(wb_sem);
-
-			/*
-			 * Revoke the DLM lock range under the gate write
-			 * side, atomically with the page drop: gate readers
-			 * re-validate their grant right after entering, and
-			 * a grant that passed that check must stay visible
-			 * for their whole gate hold.
-			 */
-			if (fc->dlm && fc->writeback_cache)
-				fuse_dlm_revoke_inval_range(fi, offset, len);
-
-			/*
-			 * Ask what is left to do, under the gate so no
-			 * reader can populate and no writer can dirty
-			 * between the answer and the drop below.
-			 *
-			 * Nothing cached in the range means the drop is a
-			 * no-op; the revoke above was the whole job.
-			 * Otherwise the page cache says whether the drop has
-			 * to launder, which is what makes it wait for a
-			 * FUSE_WRITE reply.
+			 * What this notify has to do.  Nothing cached in the
+			 * range means the drop is a no-op and the revoke is
+			 * the whole job.  Otherwise the page cache says
+			 * whether the drop has to launder, which is what
+			 * makes it wait for a FUSE_WRITE reply.
 			 */
 			has_pages = filemap_range_has_page(inode->i_mapping,
 							   offset, end_byte);
 			may_be_dirty = filemap_range_needs_writeback(
 					inode->i_mapping, offset, end_byte);
+
+			fuse_dlm_revoke_inval_range(fi, offset, len);
 
 			if (enable_notify_dio && hot && has_writer &&
 			    !mapping_mapped(inode->i_mapping) &&
@@ -1108,18 +1061,14 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 						    end_byte))
 				fuse_dlm_ranges_dropped(fi, pg_first, pg_last);
 
-			percpu_up_write(wb_sem);
-
 			if (latched)
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
 						    nodeid);
 		} else {
 			/*
-			 * No gate on this inode (DAX, backing, non-regular,
-			 * or the gate allocation failed): drop the lock
-			 * range unserialized (best-effort), as before.  The
-			 * answers above were not taken either, so assume the
-			 * range can hold unwritten data.
+			 * No record on this inode (DAX, backing, non-regular,
+			 * or no DLM), so assume the range can hold unwritten
+			 * data and drop it as before.
 			 */
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
