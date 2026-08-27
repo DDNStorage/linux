@@ -1196,8 +1196,22 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * fence: unlike a write, a read leaves nothing behind that could
 	 * reach the server under a grant it no longer holds.
 	 */
-	if (fuse_inode_force_dio(inode))
+	if (fuse_inode_force_dio(inode)) {
+		size_t count = iov_iter_count(to);
+
+		/*
+		 * A write that passed this same check just before the latch
+		 * took hold dirtied the page cache after the notify dropped
+		 * it, and a direct read does not look there.  Send it first.
+		 */
+		if (count) {
+			res = filemap_write_and_wait_range(inode->i_mapping,
+					iocb->ki_pos, iocb->ki_pos + count - 1);
+			if (res)
+				return res;
+		}
 		return fuse_direct_read_iter(iocb, to);
+	}
 
 	res = generic_file_read_iter(iocb, to);
 
@@ -1866,7 +1880,22 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 
 		if (fuse_inode_force_dio(inode)) {
+			/*
+			 * As on the read side, only worse: the direct write
+			 * would land under whatever a write racing the latch
+			 * left dirty, and the invalidate
+			 * fuse_direct_write_iter() does after it launders
+			 * rather than drops, putting that folio on the server
+			 * on top.  Send it first and the order is ordinary.
+			 */
+			count = iov_iter_count(from);
+			if (count)
+				err = filemap_write_and_wait_range(
+						inode->i_mapping, iocb->ki_pos,
+						iocb->ki_pos + count - 1);
 			fuse_cache_wr_unlock(inode, exclusive);
+			if (err)
+				return err;
 			return fuse_direct_write_iter(iocb, from);
 		}
 
@@ -1934,7 +1963,13 @@ writethrough:
 	 * re-route is not double-counted.
 	 */
 	if (fuse_inode_force_dio(inode)) {
+		/* Flush before re-routing; see the writeback branch above. */
+		if (count)
+			err = filemap_write_and_wait_range(inode->i_mapping,
+					iocb->ki_pos, iocb->ki_pos + count - 1);
 		inode_unlock(inode);
+		if (err)
+			return err;
 		return fuse_direct_write_iter(iocb, from);
 	}
 
