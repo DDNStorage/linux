@@ -3050,6 +3050,31 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc,
 	return false;
 }
 
+/*
+ * Put a folio writeback could not send back on the dirty list.
+ *
+ * iomap takes the dirty flag off a folio before it offers it to
+ * ->writeback_range and clears its dirty ranges whatever that returns, so
+ * a run reporting an error has thrown its bytes away.  There are no dirty
+ * ranges to restore: a writeback connection is refused unless the block is
+ * a page, so a folio holds one block and carries no iomap_folio_state.
+ *
+ * Only while there is a connection left to take them.  After an abort
+ * every send fails, and a folio redirtied for a retry that can no longer
+ * happen would keep sync() going forever.
+ */
+static void fuse_writeback_redirty(struct fuse_conn *fc,
+				   struct writeback_control *wbc,
+				   struct folio *folio)
+{
+	if (!READ_ONCE(fc->connected))
+		return;
+
+	folio_mark_dirty(folio);
+	if (wbc)
+		wbc->pages_skipped += folio_nr_pages(folio);
+}
+
 static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 					  struct folio *folio, u64 pos,
 					  unsigned len, u64 end_pos)
@@ -3090,15 +3115,17 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	 *
 	 * fuse_dlm_regrant_range() takes the range back when it has gone,
 	 * and walks the record once under the lock held for read when it
-	 * has not.  A failure leaves the folio dirty, so the next writeback
-	 * tries again; only a hard error stops it.
+	 * has not.  A failure redirties the folio, so the next writeback
+	 * tries again.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
 		int err = fuse_dlm_regrant_range(data->ff, inode, pos,
 						 pos + len - 1);
 
-		if (err < 0 && err != -ENOSYS)
+		if (err < 0 && err != -ENOSYS) {
+			fuse_writeback_redirty(fc, wpc->wbc, folio);
 			return err;
+		}
 	}
 
 	offset = offset_in_folio(folio, pos);
@@ -3111,8 +3138,10 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 
 	if (data->wpa == NULL) {
 		wpa = fuse_writepage_args_setup(folio, offset, data->ff);
-		if (!wpa)
+		if (!wpa) {
+			fuse_writeback_redirty(fc, wpc->wbc, folio);
 			return -ENOMEM;
+		}
 		fuse_file_get(wpa->ia.ff);
 		data->max_folios = 1;
 		ap = &wpa->ia.ap;
