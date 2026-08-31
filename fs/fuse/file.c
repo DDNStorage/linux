@@ -1307,9 +1307,23 @@ static void fuse_readahead(struct readahead_control *rac)
 	 * left in @rac.  A server without DLM support answers -ENOSYS and
 	 * clears fc->dlm, which is not a failure.
 	 *
-	 * The round trip is taken before any folio of the window is locked
-	 * and with nothing fenced out, so it holds up this reader and
-	 * nothing else.
+	 * ->readahead is entered with every folio of the window already
+	 * locked, and pulling one off @rac is what unlocks it, so the round
+	 * trip is taken under those locks.  See the readahead line of
+	 * Documentation/filesystems/locking.rst.
+	 *
+	 * What keeps that from closing a cycle is the direction a revoke
+	 * travels.  This asks for a read grant on a range it holds nothing
+	 * on, so the lock in the way is another node's, and the revoke that
+	 * frees it is sent there.  Nothing here has to run for this request
+	 * to be answered, so the folios stay locked only for as long as the
+	 * round trip.
+	 *
+	 * A window this already holds part of is the open edge: the query
+	 * fails for the whole of it, so the request goes out while that part
+	 * is still held, and a revoke for that part is sent here.  Whether
+	 * the server can answer while a revoke of its own is outstanding is
+	 * not something this side can know.
 	 */
 	if (fc->writeback_cache && fc->dlm) {
 		int err = fuse_get_dlm_lock(rac->file, readahead_pos(rac),
