@@ -12,6 +12,7 @@
 #include <linux/mm.h>
 #include <linux/rwsem.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
 #include <linux/xarray.h>
 
 
@@ -21,6 +22,21 @@ struct fuse_file;
 
 /* Lock modes for page ranges */
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
+
+/*
+ * A range held on one of the two lists in struct fuse_dlm_cache: a
+ * writer between confirming a grant and dirtying under it (@owner set),
+ * or a revoke taking grants away (@owner NULL).  Caller-owned storage,
+ * live until the matching unpin or revoke end.
+ */
+struct fuse_dlm_span {
+	/* Page-aligned byte offsets, both inclusive */
+	uint64_t		start;
+	uint64_t		end;
+	/* The pinning task, NULL for a revoke */
+	struct task_struct	*owner;
+	struct list_head	list;
+};
 
 /*
  * fuse_get_dlm_lock() result: the server granted the lock but recording
@@ -98,6 +114,22 @@ struct fuse_dlm_shard {
  *   @pending_lock the pending list.  Innermost, and the only lock
  *                fuse_dlm_request_begin() and fuse_dlm_request_abort()
  *                take at all.
+ *   @pin_lock    the pin and fence lists.  Innermost, taken alone, and
+ *                never held across a sleep.
+ *
+ * @lock says what is covered now, which is not enough for a writer: it
+ * confirms a grant, then copies and dirties, and a revoke landing in
+ * between sends those bytes out after the server has handed the lock on.
+ * The pin closes that: a revoke waits for the pins over the range it is
+ * taking away before it removes anything, so a grant confirmed under a
+ * pin is still held when the bytes become visible to writeback.
+ *
+ * Both sides are ranges rather than a count, so a revoke fences only the
+ * writers it overlaps and a write outside it runs on.  Refusal and wait
+ * test the same overlap, which is what makes the wait converge: once a
+ * fence is published no pin that would prolong it is admitted.  The
+ * nodes are caller storage, so nothing is allocated to take a pin and
+ * the writeback path can take one with a folio held.
  */
 struct fuse_dlm_cache {
 	/* See the locking comment above */
@@ -114,6 +146,17 @@ struct fuse_dlm_cache {
 	 * thread; the revoke paths only mark them killed.
 	 */
 	struct list_head pending;
+	/* Protects @pins and @fences */
+	spinlock_t pin_lock;
+	/*
+	 * Writers between confirming a grant and dirtying under it, each
+	 * over the range it is about to write.  See the pin comment above.
+	 */
+	struct list_head pins;
+	/* Revokes in progress, each over the range it takes away */
+	struct list_head fences;
+	/* Both directions: pins draining, and the fences they wait on */
+	wait_queue_head_t pin_wq;
 };
 
 /* Initialize a page cache lock manager */
@@ -149,6 +192,35 @@ void fuse_dlm_request_abort(struct fuse_inode *inode,
 /* Unlock a range of pages */
 int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
 			  uint64_t end);
+
+/*
+ * Hold the grants over [@offset, @offset + @length) against revocation
+ * until fuse_dlm_unpin(), which drops the pin this task last took.  @pin
+ * is caller-owned storage, live until then.  fuse_dlm_pin() waits out a
+ * revoke overlapping that range and must not be called with a folio
+ * held; fuse_dlm_trypin() never sleeps and fails instead.  Neither may
+ * be held across a DLM request: that request is answered by the server
+ * the revoke came from.
+ */
+void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		  loff_t offset, size_t length);
+bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		     loff_t offset, size_t length);
+void fuse_dlm_unpin(struct fuse_inode *inode);
+
+/*
+ * Fence the writers that hold a grant over [@offset, @offset + @len) but
+ * have not dirtied under it yet, for the duration of a revoke.  @len <= 0
+ * means to EOF, as in fuse_notify_inval_inode().  @fence is caller-owned
+ * storage, live until the matching end.  Between these the caller may
+ * drop coverage over that range knowing nothing will be dirtied under
+ * what it drops, and a write outside it is left alone.
+ */
+void fuse_dlm_revoke_begin(struct fuse_inode *inode,
+			   struct fuse_dlm_span *fence, loff_t offset,
+			   loff_t len);
+void fuse_dlm_revoke_end(struct fuse_inode *inode,
+			 struct fuse_dlm_span *fence);
 
 /* Re-validate a fuse_get_dlm_lock() grant against the live lock tree */
 bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,

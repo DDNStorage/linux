@@ -167,6 +167,223 @@ void fuse_dlm_cache_init(struct fuse_inode *inode)
 	xa_init(&cache->shards);
 	spin_lock_init(&cache->pending_lock);
 	INIT_LIST_HEAD(&cache->pending);
+	spin_lock_init(&cache->pin_lock);
+	INIT_LIST_HEAD(&cache->pins);
+	INIT_LIST_HEAD(&cache->fences);
+	init_waitqueue_head(&cache->pin_wq);
+}
+
+/*
+ * Set up @span over the page-aligned range [@offset, @offset + @length),
+ * the same range a fuse_dlm_lock_is_held() with these arguments asks
+ * about, so a fence over a page cannot miss a pin on that page.
+ */
+static void fuse_dlm_span_set(struct fuse_dlm_span *span, loff_t offset,
+			      size_t length)
+{
+	span->start = (uint64_t)offset & PAGE_MASK;
+	span->end = ((uint64_t)offset + length - 1) | (PAGE_SIZE - 1);
+	span->owner = current;
+}
+
+/*
+ * Does anything on @head share a byte with [@start, @end]?  Caller holds
+ * fuse_dlm_cache.pin_lock.
+ */
+static bool fuse_dlm_overlaps_locked(struct list_head *head, uint64_t start,
+				     uint64_t end)
+{
+	struct fuse_dlm_span *span;
+
+	list_for_each_entry(span, head, list)
+		if (span->start <= end && start <= span->end)
+			return true;
+
+	return false;
+}
+
+/* fuse_dlm_overlaps_locked() taking the lock itself */
+static bool fuse_dlm_overlaps(struct fuse_dlm_cache *cache,
+			      struct list_head *head, uint64_t start,
+			      uint64_t end)
+{
+	bool overlap;
+
+	spin_lock(&cache->pin_lock);
+	overlap = fuse_dlm_overlaps_locked(head, start, end);
+	spin_unlock(&cache->pin_lock);
+
+	return overlap;
+}
+
+/**
+ * fuse_dlm_pin - hold the grants over a range until fuse_dlm_unpin()
+ * @inode: the fuse inode
+ * @pin: caller-owned storage, live until the unpin
+ * @offset: byte offset the caller is about to write
+ * @length: length of the region in bytes
+ *
+ * Waits out a revoke overlapping that range, so it must not be called
+ * with a folio held: the revoke drops that same page cache once it has
+ * drained.  A revoke elsewhere in the file is not waited for.  The caller
+ * confirms its grant after this returns, never before; a confirmation
+ * from before the pin says nothing.
+ */
+void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		  loff_t offset, size_t length)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+
+	/*
+	 * A revoke handler driving this inode's page cache: the lock over
+	 * the range is still this client's until the handler returns, and
+	 * the fence this would wait on is the handler's own.  Both ends
+	 * test the same task, so nothing is left on the list.
+	 */
+	if (fuse_in_notify_ctx())
+		return;
+
+	fuse_dlm_span_set(pin, offset, length);
+
+	spin_lock(&cache->pin_lock);
+	while (fuse_dlm_overlaps_locked(&cache->fences, pin->start, pin->end)) {
+		spin_unlock(&cache->pin_lock);
+		wait_event(cache->pin_wq,
+			   !fuse_dlm_overlaps(cache, &cache->fences,
+					      pin->start, pin->end));
+		spin_lock(&cache->pin_lock);
+	}
+	/*
+	 * At the head, so fuse_dlm_unpin() drops the innermost pin of a
+	 * task that holds more than one.
+	 */
+	list_add(&pin->list, &cache->pins);
+	spin_unlock(&cache->pin_lock);
+}
+
+/**
+ * fuse_dlm_trypin - fuse_dlm_pin() for a caller that cannot sleep
+ * @inode: the fuse inode
+ * @pin: caller-owned storage, live until the unpin
+ * @offset: byte offset the caller is about to write
+ * @length: length of the region in bytes
+ *
+ * For the writeback path, which holds a folio locked and under writeback
+ * and has nothing to wait with.  A refusal means a revoke of this range
+ * is draining; the caller redirties and the pass that follows sends the
+ * folio.
+ *
+ * Return: true if the range is pinned, false if it is not.
+ */
+bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		     loff_t offset, size_t length)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	bool fenced;
+
+	/* See fuse_dlm_pin() */
+	if (fuse_in_notify_ctx())
+		return true;
+
+	fuse_dlm_span_set(pin, offset, length);
+
+	spin_lock(&cache->pin_lock);
+	fenced = fuse_dlm_overlaps_locked(&cache->fences, pin->start,
+					  pin->end);
+	if (!fenced)
+		list_add(&pin->list, &cache->pins);
+	spin_unlock(&cache->pin_lock);
+
+	return !fenced;
+}
+
+/**
+ * fuse_dlm_unpin - release the pin this task last took on @inode
+ * @inode: the fuse inode
+ *
+ * Found by owner rather than by node: iomap hands ->put_folio the inode
+ * and nothing of the iteration, and a task holds one pin at a time.
+ */
+void fuse_dlm_unpin(struct fuse_inode *inode)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_span *pin;
+	bool waiters;
+
+	/* See fuse_dlm_pin() */
+	if (fuse_in_notify_ctx())
+		return;
+
+	spin_lock(&cache->pin_lock);
+	list_for_each_entry(pin, &cache->pins, list) {
+		if (pin->owner == current) {
+			list_del(&pin->list);
+			break;
+		}
+	}
+	waiters = !list_empty(&cache->fences);
+	spin_unlock(&cache->pin_lock);
+
+	if (waiters)
+		wake_up_all(&cache->pin_wq);
+}
+
+/**
+ * fuse_dlm_revoke_begin - fence the writers over a range that have not
+ *			   dirtied yet
+ * @inode: the fuse inode
+ * @fence: caller-owned storage, live until fuse_dlm_revoke_end()
+ * @offset: start byte offset being revoked
+ * @len: length in bytes, or <= 0 for everything from @offset on
+ *
+ * Publishes the range, then waits for the pins over it taken before it.
+ * On return no thread is between confirming a grant on that range and
+ * dirtying under it, and none can start, so what the caller flushes is
+ * everything the grants it is about to drop can have produced.  A writer
+ * elsewhere in the file is neither waited for nor held up.
+ *
+ * Publishing before waiting is what makes the wait converge: a pin is
+ * refused on the same overlap this waits on, so nothing admitted after
+ * this can prolong it.
+ *
+ * Revokes on one inode fence independently, each over its own range.
+ */
+void fuse_dlm_revoke_begin(struct fuse_inode *inode,
+			   struct fuse_dlm_span *fence, loff_t offset,
+			   loff_t len)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+
+	/* The range fuse_dlm_unlock_range() will be asked to drop */
+	fence->start = (uint64_t)offset & PAGE_MASK;
+	fence->end = len <= 0 ? U64_MAX :
+		     (((uint64_t)offset + len - 1) | (PAGE_SIZE - 1));
+	fence->owner = NULL;
+
+	spin_lock(&cache->pin_lock);
+	list_add(&fence->list, &cache->fences);
+	spin_unlock(&cache->pin_lock);
+
+	wait_event(cache->pin_wq,
+		   !fuse_dlm_overlaps(cache, &cache->pins, fence->start,
+				      fence->end));
+}
+
+/**
+ * fuse_dlm_revoke_end - drop the fence fuse_dlm_revoke_begin() published
+ * @inode: the fuse inode
+ * @fence: the fence published there
+ */
+void fuse_dlm_revoke_end(struct fuse_inode *inode,
+			 struct fuse_dlm_span *fence)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+
+	spin_lock(&cache->pin_lock);
+	list_del(&fence->list);
+	spin_unlock(&cache->pin_lock);
+
+	wake_up_all(&cache->pin_wq);
 }
 
 /**

@@ -46,11 +46,29 @@
  */
 extern const char fuse_notify_ctx_key[];
 
-static inline void *fuse_notify_ctx_enter(void)
+/*
+ * What a task driving page cache work for a NOTIFY invalidate carries.
+ *
+ * @key tells it apart from anything else parked in journal_info.  The range
+ * is the one being revoked: the lock over it is still this client's until
+ * the handler returns, so writeback of it need not ask for a grant, while
+ * anything outside it must.
+ */
+struct fuse_notify_ctx {
+	const char	*key;
+	loff_t		start;
+	loff_t		end;		/* inclusive; LLONG_MAX to EOF */
+};
+
+static inline void *fuse_notify_ctx_enter(struct fuse_notify_ctx *ctx,
+					  loff_t start, loff_t end)
 {
 	void *old = current->journal_info;
 
-	current->journal_info = (void *)fuse_notify_ctx_key;
+	ctx->key = fuse_notify_ctx_key;
+	ctx->start = start;
+	ctx->end = end;
+	current->journal_info = ctx;
 	return old;
 }
 
@@ -59,9 +77,24 @@ static inline void fuse_notify_ctx_leave(void *old)
 	current->journal_info = old;
 }
 
+static inline struct fuse_notify_ctx *fuse_notify_ctx(void)
+{
+	struct fuse_notify_ctx *ctx = current->journal_info;
+
+	return (ctx && ctx->key == fuse_notify_ctx_key) ? ctx : NULL;
+}
+
 static inline bool fuse_in_notify_ctx(void)
 {
-	return current->journal_info == (void *)fuse_notify_ctx_key;
+	return fuse_notify_ctx();
+}
+
+/* Is [@pos, @pos + @len) the range the revoke in progress is taking away? */
+static inline bool fuse_in_notify_range(loff_t pos, unsigned int len)
+{
+	struct fuse_notify_ctx *ctx = fuse_notify_ctx();
+
+	return ctx && pos >= ctx->start && pos + len - 1 <= ctx->end;
 }
 
 /** Default max number of pages that can be used in a single read request */

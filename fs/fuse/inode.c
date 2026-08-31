@@ -995,7 +995,10 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * here must not send a DLM request.  See
 		 * fuse_iomap_writeback_range().
 		 */
-		void *notify_ctx = fuse_notify_ctx_enter();
+		struct fuse_notify_ctx ctx;
+		struct fuse_dlm_span fence;
+		void *notify_ctx;
+		bool fenced;
 
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)
@@ -1005,6 +1008,37 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 		/* Byte bounds of the same region */
 		end_byte = len <= 0 ? LLONG_MAX : offset + len - 1;
+
+		notify_ctx = fuse_notify_ctx_enter(&ctx, offset, end_byte);
+
+		/*
+		 * Fence the writers that hold a grant over this range but
+		 * have not dirtied under it yet.  Their bytes are in no page
+		 * cache and on no wire, so nothing below can find them, and
+		 * once the grant is gone they would go out behind the
+		 * handover.  Published before the flush so what it drains is
+		 * flushed with everything else.
+		 *
+		 * Only the writers over this range: a write elsewhere in the
+		 * file holds a grant this handler does not touch, and neither
+		 * waits for the other.
+		 *
+		 * Entered after fuse_notify_ctx_enter(): the page cache work
+		 * below is this handler's own and must not fence itself.
+		 *
+		 * A fenced writer may be waiting for a FUSE_READ or a
+		 * FUSE_WRITE reply, so this waits on the server the same way
+		 * the flush below does.
+		 *
+		 * Regular files only: the record shares the readdir cache
+		 * union arm and exists nowhere else.  Latched into a local,
+		 * since fc->dlm can be cleared while this runs and the fence
+		 * has to come off the list either way.
+		 */
+		fenced = S_ISREG(inode->i_mode) && fc->dlm &&
+			 fc->writeback_cache;
+		if (fenced)
+			fuse_dlm_revoke_begin(fi, &fence, offset, len);
 
 		/*
 		 * A data invalidation means another (remote) entity is
@@ -1078,6 +1112,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * waiting on.  do_writepages() runs in this context,
 			 * so the grant is asked for before the revoke.
 			 *
+			 * One pass is enough: the fence above has drained the
+			 * writers that held a grant without having dirtied
+			 * under it, and refuses new ones, so nothing can turn
+			 * up dirty behind this.
+			 *
 			 * Waited out here rather than left to the drop, which
 			 * launders when the record says the range may be dirty
 			 * and so waits for these same replies.  One explicit
@@ -1135,6 +1174,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			fuse_notify_invalidate_range(inode, pg_start, pg_end,
 						     true);
 		}
+		if (fenced)
+			fuse_dlm_revoke_end(fi, &fence);
 		fuse_notify_ctx_leave(notify_ctx);
 	}
 	iput(inode);
