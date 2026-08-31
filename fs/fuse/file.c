@@ -2995,6 +2995,11 @@ struct fuse_fill_wb_data {
 	 */
 	u64 regrant_start;
 	u64 regrant_end;
+	/*
+	 * A folio whose run was skipped, held by a reference until it can be
+	 * put back on the dirty list; see fuse_writeback_redirty().
+	 */
+	struct folio *redirty;
 };
 
 static bool fuse_pages_realloc(struct fuse_fill_wb_data *data,
@@ -3078,7 +3083,7 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc,
 		unsigned int total_pages = (bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
 		pgoff_t page_index = pos >> PAGE_SHIFT;
 
-		if (!(page_index % fc->alignment_pages)) {
+		if (wbc && !(page_index % fc->alignment_pages)) {
 			pgoff_t end_page_index = (wbc->range_end + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
 			/* we are at a point where we would write aligned
@@ -3097,25 +3102,56 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc,
  * Put a folio writeback could not send back on the dirty list.
  *
  * iomap takes the dirty flag off a folio before it offers it to
- * ->writeback_range and clears its dirty ranges whatever that returns, so
- * a run reporting an error has thrown its bytes away.  There are no dirty
- * ranges to restore: a writeback connection is refused unless the block is
- * a page, so a folio holds one block and carries no iomap_folio_state.
+ * ->writeback_range, and a run reporting an error, or reporting a hole
+ * because the grant has gone, has thrown its bytes away unless they are put
+ * back.
  *
- * Only while there is a connection left to take them.  After an abort
+ * Not from inside the callback, though.  iomap_writeback_folio() runs
+ * iomap_clear_range_dirty() over the whole folio once that has returned, so
+ * a range put back there is wiped again.  For a folio one block wide that
+ * call does nothing and it would not matter, but a large folio carries an
+ * iomap_folio_state, and the folio would then be left with the dirty flag
+ * and no dirty block under it: the next pass finds nothing to write and the
+ * folio goes clean with its bytes never sent.
+ *
+ * So hold the folio and dirty it once iomap has let go of it, which on the
+ * ->writepages path is the next call or the submit, and in
+ * fuse_launder_folio() is the submit it makes itself.
+ *
+ * Only while there is a connection left to take the bytes.  After an abort
  * every send fails, and a folio redirtied for a retry that can no longer
  * happen would keep sync() going forever.
  */
+static void fuse_writeback_redirty_done(struct fuse_conn *fc,
+					struct fuse_fill_wb_data *data,
+					struct writeback_control *wbc)
+{
+	struct folio *folio = data->redirty;
+
+	if (!folio)
+		return;
+	data->redirty = NULL;
+
+	if (READ_ONCE(fc->connected)) {
+		folio_mark_dirty(folio);
+		if (wbc)
+			wbc->pages_skipped += folio_nr_pages(folio);
+	}
+	folio_put(folio);
+}
+
+/* Remember @folio for fuse_writeback_redirty_done() */
 static void fuse_writeback_redirty(struct fuse_conn *fc,
+				   struct fuse_fill_wb_data *data,
 				   struct writeback_control *wbc,
 				   struct folio *folio)
 {
-	if (!READ_ONCE(fc->connected))
+	if (data->redirty == folio)
 		return;
 
-	folio_mark_dirty(folio);
-	if (wbc)
-		wbc->pages_skipped += folio_nr_pages(folio);
+	fuse_writeback_redirty_done(fc, data, wbc);
+	folio_get(folio);
+	data->redirty = folio;
 }
 
 static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
@@ -3146,6 +3182,11 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		fuse_wb_token_put(data->wb_token);
 		data->wb_token = NULL;
 		data->wb_folio = folio;
+		/*
+		 * iomap has unlocked whatever it offered before this, so a
+		 * folio held from then can go back on the dirty list now.
+		 */
+		fuse_writeback_redirty_done(fc, data, wpc->wbc);
 	}
 
 	/*
@@ -3191,7 +3232,7 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		 */
 		if (!fuse_dlm_lock_is_held(fi, pos, len,
 					   FUSE_PAGE_LOCK_WRITE)) {
-			fuse_writeback_redirty(fc, wpc->wbc, folio);
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
 			if (data->regrant_end <= data->regrant_start) {
 				data->regrant_start = pos;
 				data->regrant_end = pos + len;
@@ -3224,7 +3265,7 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		err = fuse_dlm_regrant_range(data->ff, inode, pos,
 					     pos + len - 1);
 		if (err < 0 && err != -ENOSYS) {
-			fuse_writeback_redirty(fc, wpc->wbc, folio);
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
 			return err;
 		}
 	}
@@ -3240,7 +3281,7 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	if (data->wpa == NULL) {
 		wpa = fuse_writepage_args_setup(folio, offset, data->ff);
 		if (!wpa) {
-			fuse_writeback_redirty(fc, wpc->wbc, folio);
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
 			return -ENOMEM;
 		}
 		fuse_file_get(wpa->ia.ff);
@@ -3278,6 +3319,7 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	fuse_wb_token_put(data->wb_token);
 	data->wb_token = NULL;
 	data->wb_folio = NULL;
+	fuse_writeback_redirty_done(get_fuse_conn(wpc->inode), data, wpc->wbc);
 
 	if (data->wpa) {
 		WARN_ON(!data->wpa->ia.ap.num_folios);
