@@ -3196,10 +3196,21 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 				data->regrant_start = pos;
 				data->regrant_end = pos + len;
 			} else {
-				data->regrant_start = min(data->regrant_start,
-							  pos);
-				data->regrant_end = max(data->regrant_end,
-							pos + len);
+				u64 s = min(data->regrant_start, pos);
+				u64 e = max(data->regrant_end, pos + len);
+
+				/*
+				 * One shard is as far as a single request is
+				 * worth taking back.  A pass sweeping a large
+				 * file skips runs a long way apart, and the
+				 * span between them says nothing about what
+				 * is wanted; the runs left out stay dirty and
+				 * a later pass asks for them.
+				 */
+				if (e - s <= FUSE_DLM_SHARD_SIZE) {
+					data->regrant_start = s;
+					data->regrant_end = e;
+				}
 			}
 			wpc->iomap.type = IOMAP_HOLE;
 			return len;
