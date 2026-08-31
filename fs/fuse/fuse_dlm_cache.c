@@ -33,7 +33,8 @@
 
 /*
  * How often to ask again for a grant a revoke killed while it was in
- * flight, before giving up on the range.  Each pass is a round trip.
+ * flight, or the server refused as contended, before giving up on the
+ * range.  Each pass is a round trip.
  */
 #define FUSE_DLM_GRANT_RETRIES 16
 
@@ -631,7 +632,17 @@ restart:
 		if (err == -ENOSYS) {
 			/* fuse server does not support dlm, save the info */
 			fc->dlm = 0;
+			return err;
 		}
+		/*
+		 * The range is contended, the same answer a READ gets and
+		 * fuse_do_readfolio() turns into AOP_TRUNCATED_PAGE for its
+		 * caller to retry.  There is no such convention here, and
+		 * the writeback caller loses the folio it is holding on an
+		 * error, so ask again instead of reporting it.
+		 */
+		if (err == -EDEADLK || err == -EAGAIN)
+			goto retry;
 		return err;
 	}
 
@@ -682,18 +693,8 @@ restart:
 		 * request was in flight, so the grant is dead.  Retry
 		 * rather than fail: no one else holds the range, and the
 		 * write path turns an error into a failed write.
-		 *
-		 * Not forever, though.  Every pass is a whole round trip,
-		 * which throttles the loop but does not end it, and
-		 * writeback asks for a grant with a folio locked, so a node
-		 * revoking as fast as the grants arrive would hold that
-		 * folio and this task for as long as it kept going.
 		 */
-		if (fatal_signal_pending(current))
-			return -EINTR;
-		if (!tries--)
-			return -EIO;
-		goto restart;
+		goto retry;
 	}
 
 	/*
@@ -708,6 +709,20 @@ restart:
 		return FUSE_DLM_GRANT_UNRECORDED;
 
 	return 0;
+
+retry:
+	/*
+	 * Ask again, but not forever.  Every pass is a whole round trip,
+	 * which throttles the loop but does not end it, and writeback asks
+	 * for a grant with a folio locked, so a node taking the range as
+	 * fast as this asks for it would hold that folio and this task for
+	 * as long as it kept going.
+	 */
+	if (fatal_signal_pending(current))
+		return -EINTR;
+	if (!tries--)
+		return -EIO;
+	goto restart;
 }
 
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
