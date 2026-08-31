@@ -2974,6 +2974,13 @@ struct fuse_fill_wb_data {
 	 * of U16_MAX).
 	 */
 	unsigned int nr_bytes;
+	/*
+	 * The runs this pass could not send because their grant had gone.
+	 * Taken back in fuse_iomap_writeback_submit(), where no folio is
+	 * held, for the pass that follows; see fuse_iomap_writeback_range().
+	 */
+	u64 regrant_start;
+	u64 regrant_end;
 };
 
 static bool fuse_pages_realloc(struct fuse_fill_wb_data *data,
@@ -3154,27 +3161,41 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 		wpc->iomap.type = IOMAP_MAPPED;
 
 		/*
-		 * Driven by a NOTIFY invalidate.  A grant this run does not
-		 * already hold would have to be asked for from inside the
-		 * handler the server is waiting on, for the range that
-		 * handler is revoking, with this folio locked and under
-		 * writeback.  The server cannot answer that until the revoke
-		 * completes, and the revoke cannot complete until this
-		 * returns.
+		 * The folio is locked and under writeback here, so a grant
+		 * this run does not already hold must not be asked for:
+		 * Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-
+		 * reason.txt states the rule the read path is built around,
+		 * that no cluster lock may be taken while a page lock is
+		 * held.  read_folio() has AOP_TRUNCATED_PAGE to unlock and
+		 * retry with; ->writeback_range has nothing of the sort.
 		 *
 		 * Report the run as a hole instead.  The folio goes back on
-		 * the dirty list and an ordinary writeback sends it with a
-		 * grant of its own; nothing is lost and no error is recorded
-		 * for a later fsync to report.
+		 * the dirty list, the range is remembered for
+		 * fuse_iomap_writeback_submit() to take back with no folio
+		 * held, and the pass that follows sends it.  Nothing is lost
+		 * and no error is recorded for a later fsync to report.
 		 */
-		if (fuse_in_notify_ctx() &&
-		    !fuse_dlm_lock_is_held(fi, pos, len,
+		if (!fuse_dlm_lock_is_held(fi, pos, len,
 					   FUSE_PAGE_LOCK_WRITE)) {
 			fuse_writeback_redirty(fc, wpc->wbc, folio);
+			if (data->regrant_end <= data->regrant_start) {
+				data->regrant_start = pos;
+				data->regrant_end = pos + len;
+			} else {
+				data->regrant_start = min(data->regrant_start,
+							  pos);
+				data->regrant_end = max(data->regrant_end,
+							pos + len);
+			}
 			wpc->iomap.type = IOMAP_HOLE;
 			return len;
 		}
 
+		/*
+		 * Held: this walks the record and sends nothing.  It stays a
+		 * call rather than the check above so a grant that arrives
+		 * between them is still used.
+		 */
 		err = fuse_dlm_regrant_range(data->ff, inode, pos,
 					     pos + len - 1);
 		if (err < 0 && err != -ENOSYS) {
@@ -3237,6 +3258,22 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 		WARN_ON(!data->wpa->ia.ap.num_folios);
 		fuse_writepages_send(wpc->inode, data);
 	}
+
+	/*
+	 * Take back what the runs above had to skip, so the pass that
+	 * follows finds the grant and sends the folios they left dirty.
+	 *
+	 * Only on the ->writepages path, which is what @wbc marks.
+	 * fuse_launder_folio() reaches here with the folio still locked by
+	 * folio_unmap_invalidate(), which is the ordering this is avoiding,
+	 * and a revoke handler would ask for the very range it is revoking.
+	 * In both the skip simply stands and writeback picks it up.
+	 */
+	if (wpc->wbc && data->ff && data->regrant_end > data->regrant_start &&
+	    !fuse_in_notify_ctx())
+		fuse_dlm_regrant_range(data->ff, wpc->inode,
+				       data->regrant_start,
+				       data->regrant_end - 1);
 
 	if (data->ff)
 		fuse_file_put(data->ff, false);
