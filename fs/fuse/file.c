@@ -1161,13 +1161,24 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 	return err;
 }
 
+/*
+ * What iomap_file_buffered_write() carries for fuse, reached from the
+ * read-back callback as iter->private.  @file is what that callback needs
+ * anyway, so the retry flag rides along and lives exactly as long as the
+ * call, with nothing to allocate or free.
+ */
+struct fuse_iomap_write_ctx {
+	struct file *file;
+	/* fuse_iomap_read_folio_range() hit AOP_TRUNCATED_PAGE */
+	bool retry_needed;
+};
+
 static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 				       struct folio *folio, loff_t pos,
 				       size_t len)
 {
-	struct file *file = iter->private;
-	struct inode *inode = file_inode(file);
-	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_iomap_write_ctx *ctx = iter->private;
+	struct file *file = ctx->file;
 	size_t off = offset_in_folio(folio, pos);
 	int ret;
 
@@ -1182,7 +1193,7 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 	 *
 	 * However, iomap doesn't understand AOP_TRUNCATED_PAGE.
 	 * We need to:
-	 * 1. Mark the retry flag (caller stored it in xarray)
+	 * 1. Mark the retry flag on the caller's write context
 	 * 2. Convert to -EAGAIN so iomap sees an error
 	 * 3. Let fuse_cache_write_iter() detect and retry
 	 *
@@ -1193,13 +1204,7 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE support.
 	 */
 	if (ret == AOP_TRUNCATED_PAGE) {
-		struct fuse_dlm_retry *retry;
-		unsigned long task_key = (unsigned long)current;
-
-		retry = xa_load(&fc->dlm_retry_tasks, task_key);
-		if (retry) {
-			retry->retry_needed = true;
-		}
+		ctx->retry_needed = true;
 
 		/* Convert to -EAGAIN for iomap */
 		ret = -EAGAIN;
@@ -1829,30 +1834,15 @@ static ssize_t fuse_writeback_write_iter(struct kiocb *iocb,
 					 struct iov_iter *from,
 					 struct file *file)
 {
-	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
-	ssize_t written, total_written = 0;
-
 	/*
 	 * TEMPORARY WORKAROUND for iomap write deadlock:
 	 *
-	 * Stack-allocate retry state and register it before calling
-	 * iomap. If fuse_iomap_read_folio_range() encounters
-	 * AOP_TRUNCATED_PAGE, it will mark retry_needed.
-	 *
-	 * Stack allocation ensures no memory leaks - the state is
-	 * valid for the duration of this function call and is
-	 * automatically cleaned up.
+	 * The context fuse_iomap_read_folio_range() marks when it hits
+	 * AOP_TRUNCATED_PAGE.  iomap hands it back through its private
+	 * pointer, which fuse needs for @file either way.
 	 */
-	struct fuse_dlm_retry retry_state = {
-		.retry_needed = false,
-	};
-	unsigned long task_key = (unsigned long)current;
-	int xa_ret;
-
-	xa_ret = xa_err(xa_store(&fc->dlm_retry_tasks, task_key,
-				 &retry_state, GFP_KERNEL));
-	if (xa_ret)
-		return xa_ret;
+	struct fuse_iomap_write_ctx ctx = { .file = file };
+	ssize_t written, total_written = 0;
 
 retry:
 	/*
@@ -1863,14 +1853,14 @@ retry:
 	 * the next iteration with iov_iter already drained, and iomap
 	 * would re-enter with len==0 and livelock on a 0-length mapping.
 	 */
-	retry_state.retry_needed = false;
+	ctx.retry_needed = false;
 
 	/*
 	 * Use iomap so that we can do granular uptodate reads
 	 * and granular dirty tracking for large folios.
 	 */
 	written = iomap_file_buffered_write(iocb, from, &fuse_iomap_ops,
-					    &fuse_iomap_write_ops, file);
+					    &fuse_iomap_write_ops, &ctx);
 
 	if (written > 0)
 		total_written += written;
@@ -1882,16 +1872,11 @@ retry:
 	 * The folio has been unlocked by fuse_do_readfolio(),
 	 * breaking the ABBA deadlock with page invalidation.
 	 *
-	 * Keep the entry in xarray and reuse it for the retry.
-	 *
 	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE
 	 * retry support.
 	 */
-	if (retry_state.retry_needed && iov_iter_count(from))
+	if (ctx.retry_needed && iov_iter_count(from))
 		goto retry;
-
-	/* Remove from xarray now that we're done */
-	xa_erase(&fc->dlm_retry_tasks, task_key);
 
 	return written < 0 ? written : total_written;
 }
