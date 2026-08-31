@@ -2216,6 +2216,27 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			spin_lock(&fi->lock);
 			orig_size = i_size_read(inode);
 			if (end > orig_size) {
+				/*
+				 * Retire the attribute replies already on the
+				 * wire.  fuse_attr_cache_mask() decides whether
+				 * the server's size wins from an i_size it read
+				 * before this claim and before it slept in the
+				 * lock tree query, so a GETATTR that left while
+				 * i_size still matched the server's is applied
+				 * afterwards and shrinks it back.  Moving
+				 * attr_version makes fuse_change_attributes_i()
+				 * drop those replies, which is what
+				 * fuse_write_update_attr() moves it for.
+				 */
+				fi->attr_version =
+					atomic64_inc_return(&fc->attr_version);
+				/*
+				 * And count the claim, for a reply that leaves
+				 * after it: until the bytes are dirtied,
+				 * [orig_size, end) is covered by nothing else
+				 * fuse_attr_cache_mask() can see.
+				 */
+				atomic_inc(&fi->size_extenders);
 				i_size_write(inode, end);
 				extended = true;
 			}
@@ -2260,6 +2281,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					i_size_write(inode, reached);
 				spin_unlock(&fi->lock);
 			}
+			atomic_dec(&fi->size_extenders);
 		}
 
 		if (written < 0) {
@@ -4224,6 +4246,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	init_waitqueue_head(&fi->direct_io_waitq);
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
+	atomic_set(&fi->size_extenders, 0);
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);

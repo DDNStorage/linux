@@ -569,9 +569,16 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 	 * truncate them away before they are ever sent.  The grant check
 	 * alone misses them, because a page-mkwrite grant is never
 	 * recorded and a local truncate revokes its own tail grants.
+	 *
+	 * Both miss a write that has claimed its extension and not yet
+	 * dirtied it: nothing is dirty there, and a NOTIFY can revoke the
+	 * grant in between.  With i_rwsem held shared several writers sit
+	 * in that window at once, which is why they are counted rather
+	 * than flagged.
 	 */
 	if (have_size && size > (loff_t) attr->size &&
-	    (fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
+	    (atomic_read(&fi->size_extenders) ||
+	     fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
 				   FUSE_PAGE_LOCK_WRITE) ||
 	     filemap_range_needs_writeback(inode->i_mapping, attr->size,
 					   size - 1)))
