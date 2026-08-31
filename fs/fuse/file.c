@@ -2979,6 +2979,13 @@ static struct fuse_writepage_args *fuse_writepage_args_setup(struct folio *folio
 	return wpa;
 }
 
+/*
+ * How many times a data integrity writeback goes round for runs it had to
+ * skip.  Each pass takes the grants the one before it deferred, so one more
+ * is normally enough; the cap is there because a revoke can take them again.
+ */
+#define FUSE_WB_DEFER_PASSES 4
+
 struct fuse_fill_wb_data {
 	struct fuse_writepage_args *wpa;
 	struct fuse_file *ff;
@@ -3002,6 +3009,8 @@ struct fuse_fill_wb_data {
 	 */
 	u64 regrant_start;
 	u64 regrant_end;
+	/* fuse_iomap_writeback_submit() took that range back */
+	bool regranted;
 	/*
 	 * A folio whose run was skipped, held by a reference until it can be
 	 * put back on the dirty list; see fuse_writeback_redirty().
@@ -3177,8 +3186,18 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 
 	if (!data->ff) {
 		data->ff = fuse_write_file_get(fi);
-		if (!data->ff)
+		if (!data->ff) {
+			/*
+			 * No file left open for writing, which
+			 * fuse_open()'s invalidate reaches through
+			 * fuse_launder_folio() once the last writer has
+			 * closed.  The bytes are still the newest there
+			 * are, so keep them: dropping them here loses a
+			 * write that fsync and close both reported done.
+			 */
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio);
 			return -EIO;
+		}
 	}
 
 	/*
@@ -3344,10 +3363,12 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 	 * In both the skip simply stands and writeback picks it up.
 	 */
 	if (wpc->wbc && data->ff && data->regrant_end > data->regrant_start &&
-	    !fuse_in_notify_ctx())
+	    !fuse_in_notify_ctx()) {
 		fuse_dlm_regrant_range(data->ff, wpc->inode,
 				       data->regrant_start,
 				       data->regrant_end - 1);
+		data->regranted = true;
+	}
 
 	if (data->ff)
 		fuse_file_put(data->ff, false);
@@ -3365,14 +3386,8 @@ static int fuse_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_fill_wb_data data = {};
-	struct iomap_writepage_ctx wpc = {
-		.inode = inode,
-		.iomap.type = IOMAP_MAPPED,
-		.wbc = wbc,
-		.ops = &fuse_writeback_ops,
-		.wb_ctx	= &data,
-	};
+	unsigned int tries = FUSE_WB_DEFER_PASSES;
+	int err;
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -3381,7 +3396,35 @@ static int fuse_writepages(struct address_space *mapping,
 	    fc->num_background >= fc->congestion_threshold)
 		return 0;
 
-	return iomap_writepages(&wpc);
+	/*
+	 * A run whose grant had gone is skipped and its range taken back in
+	 * fuse_iomap_writeback_submit(), which leaves the folio dirty for a
+	 * later pass.  For a data integrity writeback there is no later
+	 * pass: fsync() and close() would report the bytes written while
+	 * they are still only in the page cache.  Go round again, now that
+	 * the grant is held, until nothing is left deferred.
+	 */
+	do {
+		struct fuse_fill_wb_data data = {};
+		struct iomap_writepage_ctx wpc = {
+			.inode = inode,
+			.iomap.type = IOMAP_MAPPED,
+			.wbc = wbc,
+			.ops = &fuse_writeback_ops,
+			.wb_ctx	= &data,
+		};
+
+		err = iomap_writepages(&wpc);
+		/*
+		 * Only where the submit took the grant back.  A revoke
+		 * handler driving this is not allowed to, so the runs it
+		 * skipped would be skipped again by every pass.
+		 */
+		if (err || wbc->sync_mode != WB_SYNC_ALL || !data.regranted)
+			break;
+	} while (--tries);
+
+	return err;
 }
 
 static int fuse_launder_folio(struct folio *folio)
