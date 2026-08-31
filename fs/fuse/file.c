@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
+#include "fuse_gds.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -669,6 +670,26 @@ out:
 	return err;
 }
 
+static void fuse_readwrite_args_fill_gds_ext(struct fuse_io_args *ia)
+{
+	struct fuse_args *args = &ia->ap.args;
+	struct fuse_ext_header *ext_header = (struct fuse_ext_header *)ia->readwrite_in_gds_ext;
+
+	/*
+	 * The RDMA information data is already filled by the fuse_gds_get_gpu_sglist_rdma_info
+	 * function. Fill the extension header here.
+	 */
+	ext_header->type = FUSE_EXT_READ_WRITE_GDS;
+	ext_header->size = FUSE_EXT_READ_WRITE_GDS_SIZE;
+
+	args->has_new_ext = 1;
+	/* The data buffer is already in the GPU memory, no need to copy it */
+	args->in_pages = false;
+	args->out_pages = false;
+	args->ext_in_args[args->ext_numargs].size = ext_header->size;
+	args->ext_in_args[args->ext_numargs].value = ext_header;
+	args->ext_numargs++;
+}
 void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 			 size_t count, int opcode)
 {
@@ -686,7 +707,15 @@ void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 	args->in_args[0].value = &ia->read.in;
 	args->out_argvar = true;
 	args->out_numargs = 1;
-	args->out_args[0].size = count;
+	if (ia->ap.args.use_gds) {
+		/* File data is transferred through RDMA; out_args[0] returns the read size. */
+		fuse_readwrite_args_fill_gds_ext(ia);
+		args->out_args[0].size = sizeof(ia->read.out);
+		args->out_args[0].value = &ia->read.out;
+	}
+	else {
+		args->out_args[0].size = count;
+	}
 }
 
 static void fuse_release_user_pages(struct fuse_args_pages *ap,
@@ -873,6 +902,7 @@ static ssize_t fuse_send_read(struct fuse_io_args *ia, loff_t pos, size_t count,
 	struct file *file = ia->io->iocb->ki_filp;
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
+	ssize_t ret;
 
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	if (owner != NULL) {
@@ -883,7 +913,16 @@ static ssize_t fuse_send_read(struct fuse_io_args *ia, loff_t pos, size_t count,
 	if (ia->io->async)
 		return fuse_async_req_send(fm, ia, count);
 
-	return fuse_simple_request(fm, &ia->ap.args);
+	ret = fuse_simple_request(fm, &ia->ap.args);
+
+	/*
+	 * GDS reads return the fixed-size reply payload; regular reads return
+	 * their byte count. Normalize a successful GDS reply to its byte count.
+	 */
+	if (ia->ap.args.use_gds && ret == sizeof(ia->read.out)) {
+		ret = (ssize_t) ia->read.out.size;
+	}
+	return ret;
 }
 
 static void fuse_read_update_size(struct inode *inode, loff_t size,
@@ -1126,16 +1165,25 @@ static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
 	ia->write.in.size = count;
 	args->opcode = FUSE_WRITE;
 	args->nodeid = ff->nodeid;
-	args->in_numargs = 2;
 	if (ff->fm->fc->minor < 9)
 		args->in_args[0].size = FUSE_COMPAT_WRITE_IN_SIZE;
 	else
 		args->in_args[0].size = sizeof(ia->write.in);
 	args->in_args[0].value = &ia->write.in;
-	args->in_args[1].size = count;
+	if (ia->ap.args.use_gds) {
+		/* No need to copy the data buffer */
+		args->in_numargs = 1;
+		fuse_readwrite_args_fill_gds_ext(ia);
+	}
+	else {
+		args->in_numargs = 2;
+		args->in_args[1].size = count;
+	}
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(ia->write.out);
 	args->out_args[0].value = &ia->write.out;
+
+
 }
 
 static unsigned int fuse_write_flags(struct kiocb *iocb)
@@ -1662,6 +1710,14 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 					  max_pages);
 		if (err && !nbytes)
 			break;
+
+		if (fc->gds_support && fuse_is_gds_buffer(&ia->ap)) {
+			err = fuse_gds_get_gpu_sglist_rdma_info(fc, write, ia);
+			if (err) {
+				fuse_release_user_pages(&ia->ap, io->should_dirty);
+				break;
+			}
+		}
 
 		if (write) {
 			if (!capable(CAP_FSETID))

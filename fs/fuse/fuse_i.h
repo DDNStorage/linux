@@ -32,6 +32,7 @@
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
 #include "fuse_dlm_cache.h"
+#include "fuse_gds.h"
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
@@ -312,6 +313,7 @@ struct fuse_args {
 	uint8_t in_numargs;
 	uint8_t out_numargs;
 	uint8_t ext_idx;
+	uint8_t ext_numargs;	/* number of the new extensions */
 	bool force:1;
 	bool noreply:1;
 	bool nocreds:1;
@@ -324,8 +326,11 @@ struct fuse_args {
 	bool may_block:1;
 	bool is_ext:1;
 	bool is_pinned:1;
+	bool use_gds:1;
+	bool has_new_ext:1;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
+	struct fuse_in_arg ext_in_args[4];	/* new extensions */
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
 };
 
@@ -879,6 +884,9 @@ struct fuse_conn {
 	/* Is synchronous FUSE_INIT allowed? */
 	unsigned int sync_init:1;
 
+	/* Does the filesystem support GDS? */
+	unsigned int gds_support:1;
+
 	/* Use io_uring for communication */
 	unsigned int io_uring;
 
@@ -1115,10 +1123,15 @@ struct fuse_forget_link *fuse_alloc_forget(void);
 /*
  * Initialize READ or READDIR request
  */
+
+#define FUSE_EXT_READ_WRITE_GDS_SIZE \
+    FUSE_REC_ALIGN(sizeof(struct fuse_ext_header) + sizeof(struct nvfs_rdma_info))
+
 struct fuse_io_args {
 	union {
 		struct {
 			struct fuse_read_in in;
+			struct fuse_gds_read_out out;
 			u64 attr_ver;
 		} read;
 		struct {
@@ -1130,11 +1143,16 @@ struct fuse_io_args {
 	struct fuse_args_pages ap;
 	struct fuse_io_priv *io;
 	struct fuse_file *ff;
+	uint8_t readwrite_in_gds_ext[FUSE_EXT_READ_WRITE_GDS_SIZE];
 };
 
 void fuse_read_args_fill(struct fuse_io_args *ia, struct file *file, loff_t pos,
 			 size_t count, int opcode);
 
+static inline struct nvfs_rdma_info *fuse_get_readwrite_rdma_info(struct fuse_io_args *ia)
+{
+	return (struct nvfs_rdma_info *)(ia->readwrite_in_gds_ext + sizeof(struct fuse_ext_header));
+}
 /*
  * Helper functions to initialize fuse_args for common operations
  */
