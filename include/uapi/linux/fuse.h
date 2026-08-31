@@ -1041,7 +1041,9 @@ struct fuse_in_header {
 	uint32_t	gid;
 	uint32_t	pid;
 	uint16_t	total_extlen; /* length of extensions in 8byte units */
-	uint16_t	padding;
+	uint8_t		total_new_extlen; /* length of new extensions in 8byte units
+					     (fuse_uring_req_header::ext_in) */
+	uint8_t		padding;
 };
 
 struct fuse_out_header {
@@ -1299,6 +1301,7 @@ struct fuse_compound_out {
  */
 #define FUSE_URING_IN_OUT_HEADER_SZ 128
 #define FUSE_URING_OP_IN_OUT_SZ 128
+#define FUSE_URING_EXT_IN_SZ 512
 
 /* Used as part of the fuse_uring_req_header */
 struct fuse_uring_ent_in_out {
@@ -1328,6 +1331,9 @@ struct fuse_uring_req_header {
 	char op_in[FUSE_URING_OP_IN_OUT_SZ];
 
 	struct fuse_uring_ent_in_out ring_ent_in_out;
+
+	/* extention space */
+	char ext_in[FUSE_URING_EXT_IN_SZ];
 };
 
 /**

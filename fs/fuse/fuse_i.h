@@ -313,6 +313,7 @@ struct fuse_args {
 	uint8_t in_numargs;
 	uint8_t out_numargs;
 	uint8_t ext_idx;
+	uint8_t ext_numargs;	/* number of the new extensions */
 	bool force:1;
 	bool noreply:1;
 	bool nocreds:1;
@@ -326,8 +327,10 @@ struct fuse_args {
 	bool is_ext:1;
 	bool is_pinned:1;
 	bool use_gds:1;
+	bool has_new_ext:1;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
+	struct fuse_in_arg ext_in_args[4];	/* new extensions */
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
 };
 
@@ -1128,6 +1131,7 @@ struct fuse_io_args {
 	union {
 		struct {
 			struct fuse_read_in in;
+			struct fuse_gds_read_out out;
 			u64 attr_ver;
 		} read;
 		struct {
