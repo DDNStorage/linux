@@ -51,13 +51,25 @@
  */
 #define FUSE_DLM_MAX_EXTRA_GRANT (1ULL << 30)
 
-/* A FUSE_DLM_WB_LOCK request in flight, on cache->pending */
+/*
+ * A FUSE_DLM_WB_LOCK request in flight, on cache->pending.
+ *
+ * Two ranges, because the range asked for and the range that may end up
+ * recorded are not the same one: the server may grant more, up to
+ * FUSE_DLM_MAX_EXTRA_GRANT either side.  A revoke has to be tested against
+ * both, and means something different for each.
+ */
 struct fuse_dlm_range {
 	/* The range asked for, as byte offsets, both inclusive */
 	uint64_t start;
 	uint64_t end;
-	/* A revoke overlapped this request in flight */
+	/* The widest [start, end] fuse_dlm_request_commit() could record */
+	uint64_t wide_start;
+	uint64_t wide_end;
+	/* A revoke overlapped the range asked for: the grant is dead */
 	bool killed;
+	/* A revoke overlapped only the excess: record the asked for range */
+	bool clamp;
 	/* The cache->pending link */
 	struct list_head list;
 };
@@ -134,9 +146,12 @@ static void fuse_dlm_kill_pending(struct fuse_dlm_cache *cache,
 	struct fuse_dlm_range *req;
 
 	spin_lock(&cache->pending_lock);
-	list_for_each_entry(req, &cache->pending, list)
+	list_for_each_entry(req, &cache->pending, list) {
 		if (req->start <= end && start <= req->end)
 			req->killed = true;
+		else if (req->wide_start <= end && start <= req->wide_end)
+			req->clamp = true;
+	}
 	spin_unlock(&cache->pending_lock);
 }
 
@@ -301,7 +316,17 @@ void fuse_dlm_request_begin(struct fuse_inode *inode,
 
 	req->start = start;
 	req->end = end;
+	/*
+	 * The bounds __fuse_get_dlm_lock() caps the recorded grant to.  A
+	 * revoke between here and the commit must be seen by one of the two
+	 * tests in fuse_dlm_kill_pending(), or it would be recorded over.
+	 */
+	req->wide_start = start > FUSE_DLM_MAX_EXTRA_GRANT ?
+			  start - FUSE_DLM_MAX_EXTRA_GRANT : 0;
+	req->wide_end = U64_MAX - end < FUSE_DLM_MAX_EXTRA_GRANT ?
+			U64_MAX : end + FUSE_DLM_MAX_EXTRA_GRANT;
 	req->killed = false;
+	req->clamp = false;
 
 	spin_lock(&cache->pending_lock);
 	list_add_tail(&req->list, &cache->pending);
@@ -321,9 +346,20 @@ void fuse_dlm_request_begin(struct fuse_inode *inode,
  * lands either before it and is seen on @req, or after it and finds the
  * grant in the tree.
  *
+ * A revoke processed while @req was in flight lands in one of three
+ * places, and fuse_dlm_kill_pending() has already said which:
+ *
+ *  - over the range asked for.  The grant may predate it and there is no
+ *    way to tell, so nothing is recorded and the caller asks again.
+ *  - over the excess the server volunteered beyond it, and nothing else.
+ *    The range asked for is untouched by it and is recorded; the excess
+ *    is dropped, which only costs a re-request.
+ *  - outside both, which says nothing about this grant.  The whole of
+ *    [start, end] is recorded.
+ *
  * @req is retired in every case and may be reused.
  *
- * Return: -EAGAIN if a revoke overlapped @req while it was in flight,
+ * Return: -EAGAIN if a revoke overlapped the range @req asked for,
  * nothing recorded; otherwise the result of recording the grant.
  */
 int fuse_dlm_request_commit(struct fuse_inode *inode,
@@ -331,7 +367,7 @@ int fuse_dlm_request_commit(struct fuse_inode *inode,
 			    uint64_t end, enum fuse_page_lock_mode mode)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
-	bool revoked;
+	bool revoked, clamp;
 	int ret = 0;
 
 	/*
@@ -344,6 +380,11 @@ int fuse_dlm_request_commit(struct fuse_inode *inode,
 	spin_lock(&cache->pending_lock);
 	list_del(&req->list);
 	revoked = req->killed;
+	clamp = req->clamp;
+	if (clamp) {
+		start = req->start;
+		end = req->end;
+	}
 	spin_unlock(&cache->pending_lock);
 
 	if (!revoked)
