@@ -32,7 +32,37 @@
 #include <linux/pid_namespace.h>
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
+#include <linux/sched.h>
 #include "fuse_dlm_cache.h"
+
+/*
+ * Page cache work driven by a NOTIFY invalidate is marked on the task.
+ *
+ * Writeback reached from there must not ask the server for a grant: the
+ * range is the one the server is revoking, and the request would go out
+ * from inside the handler the server is waiting on, with the folio locked
+ * and under writeback.  See fuse_reverse_inval_inode() and
+ * fuse_iomap_writeback_range().
+ */
+extern const char fuse_notify_ctx_key[];
+
+static inline void *fuse_notify_ctx_enter(void)
+{
+	void *old = current->journal_info;
+
+	current->journal_info = (void *)fuse_notify_ctx_key;
+	return old;
+}
+
+static inline void fuse_notify_ctx_leave(void *old)
+{
+	current->journal_info = old;
+}
+
+static inline bool fuse_in_notify_ctx(void)
+{
+	return current->journal_info == (void *)fuse_notify_ctx_key;
+}
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32

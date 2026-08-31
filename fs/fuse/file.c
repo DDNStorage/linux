@@ -3138,12 +3138,45 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	 * fuse_dlm_regrant_range() takes the range back when it has gone,
 	 * and walks the record once under the lock held for read when it
 	 * has not.  A failure redirties the folio, so the next writeback
-	 * tries again.
+	 * tries again.  A revoke handler driving this skips the run
+	 * entirely rather than ask for the grant it is taking away.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
-		int err = fuse_dlm_regrant_range(data->ff, inode, pos,
-						 pos + len - 1);
+		int err;
 
+		/*
+		 * wpc->iomap.type carries over from the previous run and from
+		 * the previous folio, so anything that is queued has to say
+		 * so.  Left at a stale IOMAP_HOLE, iomap takes the folio for
+		 * one it never queued and ends its writeback while the write
+		 * is still in flight.
+		 */
+		wpc->iomap.type = IOMAP_MAPPED;
+
+		/*
+		 * Driven by a NOTIFY invalidate.  A grant this run does not
+		 * already hold would have to be asked for from inside the
+		 * handler the server is waiting on, for the range that
+		 * handler is revoking, with this folio locked and under
+		 * writeback.  The server cannot answer that until the revoke
+		 * completes, and the revoke cannot complete until this
+		 * returns.
+		 *
+		 * Report the run as a hole instead.  The folio goes back on
+		 * the dirty list and an ordinary writeback sends it with a
+		 * grant of its own; nothing is lost and no error is recorded
+		 * for a later fsync to report.
+		 */
+		if (fuse_in_notify_ctx() &&
+		    !fuse_dlm_lock_is_held(fi, pos, len,
+					   FUSE_PAGE_LOCK_WRITE)) {
+			fuse_writeback_redirty(fc, wpc->wbc, folio);
+			wpc->iomap.type = IOMAP_HOLE;
+			return len;
+		}
+
+		err = fuse_dlm_regrant_range(data->ff, inode, pos,
+					     pos + len - 1);
 		if (err < 0 && err != -ENOSYS) {
 			fuse_writeback_redirty(fc, wpc->wbc, folio);
 			return err;
