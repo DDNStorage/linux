@@ -203,21 +203,6 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Serializes buffered-write page-cache dirtying against
-			 * the forced-direct-IO latch transition driven by
-			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
-			 * may be delivered by the same server thread that still
-			 * owes a reply to an in-flight write holding the inode
-			 * lock.  The buffered writer holds this for read around
-			 * the dirtying and re-checks the latch under it; the
-			 * NOTIFY latch site takes it for write (trylock, never
-			 * blocking) around its page-cache invalidate + latch set.
-			 * Only regular files initialise it -- it shares storage
-			 * with the readdir-cache union arm.
-			 */
-			struct percpu_rw_semaphore *wb_inval_rwsem;
-
-			/*
 			 * Rate of FUSE_NOTIFY_INVAL_INODE data invalidations
 			 * for this whole file: notify_stamp is the jiffies of
 			 * the last one, notify_interval_ewma the EWMA of the

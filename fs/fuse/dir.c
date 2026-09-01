@@ -2106,34 +2106,24 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		WARN_ON(!(attr->ia_valid & ATTR_SIZE));
 		WARN_ON(attr->ia_size != 0);
 		if (fc->atomic_o_trunc) {
-			struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
-
 			/*
 			 * No need to send request to userspace, since actual
 			 * truncation has already been done by OPEN.  But still
 			 * need to truncate page cache.
 			 *
-			 * Revoke and drop under the coherency gate write side,
-			 * like the NOTIFY invalidate path: a gate reader that
-			 * already re-validated its grant must not have the
-			 * lock tree and the cache yanked mid-hold, or it
-			 * would repopulate the truncated range trusting a
-			 * grant that no longer exists.  Waiting for gate
-			 * readers here is safe: we hold i_rwsem exclusive, so
-			 * no gate holder can be waiting on it (the write path
-			 * takes i_rwsem before the gate, the read path never
-			 * takes it).
+			 * Dropping every grant here does not need a reader or
+			 * writer fenced out: truncate_pagecache() discards the
+			 * folios rather than writing them, and a write racing
+			 * this is a write racing an O_TRUNC open, which has no
+			 * order to preserve.  i_rwsem is held exclusive
+			 * anyway, so no cached write is in progress.
 			 */
-			if (wb_sem)
-				percpu_down_write(wb_sem);
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_cache_release_locks(fi);
 			spin_lock(&fi->lock);
 			i_size_write(inode, 0);
 			spin_unlock(&fi->lock);
 			truncate_pagecache(inode, 0);
-			if (wb_sem)
-				percpu_up_write(wb_sem);
 			goto out;
 		}
 		file = NULL;
@@ -2237,23 +2227,17 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 */
 	if ((is_truncate || !is_wb) &&
 	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
-		struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
-
 		/*
-		 * Revoke and drop under the coherency gate write side; see
-		 * the atomic-O_TRUNC branch above.  i_rwsem is held
-		 * exclusive here as well (setattr), so waiting out gate
-		 * readers cannot deadlock.
+		 * Revoke past the new size and drop what is beyond it; see
+		 * the atomic-O_TRUNC branch above for why this needs nothing
+		 * fenced out.  i_rwsem is held exclusive here as well.
 		 */
-		if (wb_sem)
-			percpu_down_write(wb_sem);
 		if (fc->dlm && fc->writeback_cache)
-			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK, -1);
+			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK,
+					      U64_MAX);
 
 		truncate_pagecache(inode, outarg.attr.size);
 		invalidate_inode_pages2(mapping);
-		if (wb_sem)
-			percpu_up_write(wb_sem);
 	}
 
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
