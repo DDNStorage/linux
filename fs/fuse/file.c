@@ -396,6 +396,12 @@ static int fuse_open(struct inode *inode, struct file *file)
 				fuse_dlm_cache_release_locks(fi);
 			truncate_pagecache(inode, 0);
 		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE)) {
+			/*
+			 * Write back first: the drop launders whatever it
+			 * finds dirty a folio at a time, a FUSE_WRITE per
+			 * page, where writeback batches the same bytes.
+			 */
+			filemap_write_and_wait(inode->i_mapping);
 			invalidate_inode_pages2(inode->i_mapping);
 		}
 	}
