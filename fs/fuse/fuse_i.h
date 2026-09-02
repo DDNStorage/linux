@@ -32,7 +32,70 @@
 #include <linux/pid_namespace.h>
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
+#include <linux/sched.h>
 #include "fuse_dlm_cache.h"
+
+/*
+ * Page cache work driven by a NOTIFY invalidate is marked on the task.
+ *
+ * Writeback reached from there must not ask the server for a grant: the
+ * range is the one the server is revoking, and the request would go out
+ * from inside the handler the server is waiting on, with the folio locked
+ * and under writeback.  See fuse_reverse_inval_inode() and
+ * fuse_iomap_writeback_range().
+ */
+extern const char fuse_notify_ctx_key[];
+
+/*
+ * What a task driving page cache work for a NOTIFY invalidate carries.
+ *
+ * @key tells it apart from anything else parked in journal_info.  The range
+ * is the one being revoked: the lock over it is still this client's until
+ * the handler returns, so writeback of it need not ask for a grant, while
+ * anything outside it must.
+ */
+struct fuse_notify_ctx {
+	const char	*key;
+	loff_t		start;
+	loff_t		end;		/* inclusive; LLONG_MAX to EOF */
+};
+
+static inline void *fuse_notify_ctx_enter(struct fuse_notify_ctx *ctx,
+					  loff_t start, loff_t end)
+{
+	void *old = current->journal_info;
+
+	ctx->key = fuse_notify_ctx_key;
+	ctx->start = start;
+	ctx->end = end;
+	current->journal_info = ctx;
+	return old;
+}
+
+static inline void fuse_notify_ctx_leave(void *old)
+{
+	current->journal_info = old;
+}
+
+static inline struct fuse_notify_ctx *fuse_notify_ctx(void)
+{
+	struct fuse_notify_ctx *ctx = current->journal_info;
+
+	return (ctx && ctx->key == fuse_notify_ctx_key) ? ctx : NULL;
+}
+
+static inline bool fuse_in_notify_ctx(void)
+{
+	return fuse_notify_ctx();
+}
+
+/* Is [@pos, @pos + @len) the range the revoke in progress is taking away? */
+static inline bool fuse_in_notify_range(loff_t pos, unsigned int len)
+{
+	struct fuse_notify_ctx *ctx = fuse_notify_ctx();
+
+	return ctx && pos >= ctx->start && pos + len - 1 <= ctx->end;
+}
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
@@ -159,6 +222,15 @@ struct fuse_inode {
 	/** Time in jiffies until the file attributes are valid */
 	u64 i_time;
 
+	/*
+	 * Time in jiffies until mode/uid/gid (the permission-check subset of
+	 * STATX_BASIC_STATS) are valid. Tracked separately from i_time so that
+	 * a partial statx refresh covering only the perm bits can extend the
+	 * permission-check cache without falsely advancing i_time for the
+	 * other (un-refreshed) attributes.
+	 */
+	u64 i_perm_time;
+
 	/* Which attributes are invalid */
 	u32 inval_mask;
 
@@ -201,35 +273,6 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Server-materialized size: an upper bound for how far
-			 * the server holds file data.  Seeded from
-			 * server-reported attributes, advanced when the server
-			 * acknowledges data (writeback completion,
-			 * fuse_write_update_attr()), lowered again on
-			 * truncate.  A read-modify-write of a block starting
-			 * at or past this bound needs no READ request under a
-			 * held DLM write lock: the server has no data there
-			 * (see fuse_iomap_read_folio_range()).  Protected by
-			 * fi->lock.
-			 */
-			loff_t server_size;
-
-			/*
-			 * Serializes buffered-write page-cache dirtying against
-			 * the forced-direct-IO latch transition driven by
-			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
-			 * may be delivered by the same server thread that still
-			 * owes a reply to an in-flight write holding the inode
-			 * lock.  The buffered writer holds this for read around
-			 * the dirtying and re-checks the latch under it; the
-			 * NOTIFY latch site takes it for write (trylock, never
-			 * blocking) around its page-cache invalidate + latch set.
-			 * Only regular files initialise it -- it shares storage
-			 * with the readdir-cache union arm.
-			 */
-			struct percpu_rw_semaphore *wb_inval_rwsem;
-
-			/*
 			 * Rate of FUSE_NOTIFY_INVAL_INODE data invalidations
 			 * for this whole file: notify_stamp is the jiffies of
 			 * the last one, notify_interval_ewma the EWMA of the
@@ -241,6 +284,20 @@ struct fuse_inode {
 			 */
 			unsigned long notify_stamp;
 			unsigned int notify_interval_ewma;
+
+			/*
+			 * Buffered writes that have claimed an i_size
+			 * extension and not yet dirtied it.
+			 *
+			 * The DLM path holds i_rwsem shared, so several
+			 * writers extend i_size at once and each one is
+			 * ahead of the server until its bytes are sent.
+			 * While this is non zero the local size wins over
+			 * the server's; see fuse_attr_cache_mask().
+			 * FUSE_I_SIZE_UNSTABLE cannot serve: it is one bit
+			 * and every writer clears it.
+			 */
+			atomic_t size_extenders;
 		};
 
 		/* readdir cache (directory only) */
@@ -561,6 +618,8 @@ struct fuse_req {
 #ifdef CONFIG_FUSE_IO_URING
 	void *ring_entry;
 	void *ring_queue;
+	/** Defers fuse_request_end() to the ring task's task work */
+	struct callback_head ring_end_work;
 #endif
 	/** When (in jiffies) the request was created */
 	unsigned long create_time;
@@ -714,17 +773,6 @@ struct fuse_sync_bucket {
 	atomic_t count;
 	wait_queue_head_t waitq;
 	struct rcu_head rcu;
-};
-
-/**
- * DLM retry tracking for iomap write deadlock workaround.
- *
- * Temporary workaround until mainline iomap gains AOP_TRUNCATED_PAGE
- * retry support. Tracks tasks that need to retry write operations due
- * to DLM lock contention (-EAGAIN from FUSE server).
- */
-struct fuse_dlm_retry {
-	bool retry_needed;
 };
 
 /**
@@ -1014,6 +1062,9 @@ struct fuse_conn {
 	/* do we have support for dlm in the fs? */
 	unsigned int dlm:1;
 
+	/* Is extended lookup implemented by fs? */
+	unsigned int lookupx:1;
+
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
@@ -1028,7 +1079,6 @@ struct fuse_conn {
 
 	/* Use io_uring for communication */
 	unsigned int io_uring;
-
 
 	/* Does the filesystem support compound operations? */
 	unsigned int compound_open_getattr:1;
@@ -1107,12 +1157,8 @@ struct fuse_conn {
 		unsigned int req_timeout;
 	} timeout;
 
-	/**
-	 * XArray tracking tasks that need DLM retry.
-	 * Maps task pointer -> struct fuse_dlm_retry.
-	 * Temporary workaround for iomap write deadlock.
-	 */
-	struct xarray dlm_retry_tasks;
+	/* The foffset alignment in PAGE */
+	unsigned int alignment_pages;
 };
 
 /*

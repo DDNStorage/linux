@@ -28,6 +28,8 @@ module_param(allow_sys_admin_access, bool, 0644);
 MODULE_PARM_DESC(allow_sys_admin_access,
 		 "Allow users with CAP_SYS_ADMIN in initial userns to bypass allow_other access check");
 
+static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, uint32_t mask);
+
 struct dentry_bucket {
 	struct rb_root tree;
 	spinlock_t lock;
@@ -373,6 +375,73 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
 	args->out_args[0].value = outarg;
 }
 
+/**
+ * fuse_do_lookupx - Perform a FUSE_LOOKUPX operation
+ *
+ * @ext_out: extended output argument structure
+ * @lookup_flags: lookup flags (e.g., FUSE_LOOKUPX_FOR_REVALIDATE)
+ */
+static int fuse_do_lookupx(struct fuse_mount *fm, u64 nodeid,
+			    const struct qstr *name,
+			    struct fuse_lookupx_out *ext_out,
+			    uint32_t lookup_flags)
+{
+	struct fuse_conn *fc = fm->fc;
+	FUSE_ARGS(args);
+	struct fuse_lookupx_in inarg = { .lookup_flags = lookup_flags };
+	int err;
+
+	memset(ext_out, 0, sizeof(*ext_out));
+	args.nodeid = nodeid;
+
+	if (!fc->lookupx)
+		goto fallback;
+
+	args.opcode = FUSE_LOOKUPX;
+	args.in_numargs = 4;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.in_args[1].size = 0;
+	args.in_args[1].value = NULL;
+	args.in_args[2].size = name->len;
+	args.in_args[2].value = name->name;
+	args.in_args[3].size = 1;
+	args.in_args[3].value = "";
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(struct fuse_lookupx_out);
+	args.out_args[0].value = ext_out;
+
+	err = fuse_simple_request(fm, &args);
+	if (err) {
+		if (err == -ENOSYS) {
+			fc->lookupx = 0;
+			goto fallback;
+		}
+		return err;
+	}
+
+	return 0;
+
+fallback:
+	args.opcode = FUSE_LOOKUP;
+	args.in_numargs = 3;
+	fuse_set_zero_arg0(&args);
+	args.in_args[1].size = name->len;
+	args.in_args[1].value = name->name;
+	args.in_args[2].size = 1;
+	args.in_args[2].value = "";
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(struct fuse_entry_out);
+	args.out_args[0].value = &ext_out->entry;
+
+	err = fuse_simple_request(fm, &args);
+	if (err)
+		return err;
+
+	ext_out->mask = STATX_BASIC_STATS;
+	return 0;
+}
+
 /*
  * Check whether the dentry is still valid
  *
@@ -400,10 +469,11 @@ static int fuse_dentry_revalidate(struct inode *dir, const struct qstr *name,
 		goto invalid;
 	else if (time_before64(fuse_dentry_time(entry), get_jiffies_64()) ||
 		 (flags & (LOOKUP_EXCL | LOOKUP_REVAL | LOOKUP_RENAME_TARGET))) {
-		struct fuse_entry_out outarg;
-		FUSE_ARGS(args);
+		struct fuse_lookupx_out ext_out;
+		struct fuse_statx sx;
 		struct fuse_forget_link *forget;
 		u64 attr_version;
+		uint32_t lookupx_flags = FUSE_LOOKUPX_FOR_REVALIDATE;
 
 		/* For negative dentries, always do a fresh lookup */
 		if (!inode)
@@ -421,19 +491,21 @@ static int fuse_dentry_revalidate(struct inode *dir, const struct qstr *name,
 			goto out;
 
 		attr_version = fuse_get_attr_version(fm->fc);
+		if (S_ISDIR(inode->i_mode))
+			lookupx_flags |= FUSE_LOOKUPX_TARGET_WAS_DIR;
 
-		fuse_lookup_init(fm->fc, &args, get_node_id(dir),
-				 name, &outarg);
-		ret = fuse_simple_request(fm, &args);
+		ret = fuse_do_lookupx(fm, get_node_id(dir),
+				      name, &ext_out,
+				      lookupx_flags);
 		/* Zero nodeid is same as -ENOENT */
-		if (!ret && !outarg.nodeid)
+		if (!ret && !ext_out.entry.nodeid)
 			ret = -ENOENT;
 		if (!ret) {
 			fi = get_fuse_inode(inode);
-			if (outarg.nodeid != get_node_id(inode) ||
-			    (bool) IS_AUTOMOUNT(inode) != (bool) (outarg.attr.flags & FUSE_ATTR_SUBMOUNT)) {
+			if (ext_out.entry.nodeid != get_node_id(inode) ||
+			    (bool) IS_AUTOMOUNT(inode) != (bool) (ext_out.entry.attr.flags & FUSE_ATTR_SUBMOUNT)) {
 				fuse_queue_forget(fm->fc, forget,
-						  outarg.nodeid, 1);
+						  ext_out.entry.nodeid, 1);
 				goto invalid;
 			}
 			spin_lock(&fi->lock);
@@ -443,15 +515,16 @@ static int fuse_dentry_revalidate(struct inode *dir, const struct qstr *name,
 		kfree(forget);
 		if (ret == -ENOMEM || ret == -EINTR)
 			goto out;
-		if (ret || fuse_invalid_attr(&outarg.attr) ||
-		    fuse_stale_inode(inode, outarg.generation, &outarg.attr))
+		if (ret || fuse_invalid_attr(&ext_out.entry.attr) ||
+		    fuse_stale_inode(inode, ext_out.entry.generation, &ext_out.entry.attr))
 			goto invalid;
 
 		forget_all_cached_acls(inode);
-		fuse_change_attributes(inode, &outarg.attr, NULL,
-				       ATTR_TIMEOUT(&outarg),
+		fuse_attr_to_statx(&ext_out.entry.attr, &sx, ext_out.mask);
+		fuse_change_attributes(inode, &ext_out.entry.attr, &sx,
+				       ATTR_TIMEOUT(&ext_out.entry),
 				       attr_version);
-		fuse_change_entry_timeout(entry, &outarg);
+		fuse_change_entry_timeout(entry, &ext_out.entry);
 	} else if (inode) {
 		fi = get_fuse_inode(inode);
 		if (flags & LOOKUP_RCU) {
@@ -846,6 +919,10 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outentry, 0, sizeof(outentry));
 	inarg.flags = flags;
+
+	/* The kernel owns append positioning; see fuse_send_open() */
+	if (fm->fc->writeback_cache)
+		inarg.flags &= ~O_APPEND;
 	inarg.mode = mode;
 	inarg.umask = current_umask();
 
@@ -1411,8 +1488,35 @@ static void fuse_statx_to_attr(struct fuse_statx *sx, struct fuse_attr *attr)
 	attr->blksize = sx->blksize;
 }
 
+static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, uint32_t mask)
+{
+	memset(sx, 0, sizeof(*sx));
+	sx->mask = mask;
+	sx->ino = attr->ino;
+	sx->size = attr->size;
+	sx->blocks = attr->blocks;
+	sx->atime.tv_sec = attr->atime;
+	sx->mtime.tv_sec = attr->mtime;
+	sx->ctime.tv_sec = attr->ctime;
+	sx->atime.tv_nsec = attr->atimensec;
+	sx->mtime.tv_nsec = attr->mtimensec;
+	sx->ctime.tv_nsec = attr->ctimensec;
+	sx->mode = attr->mode;
+	sx->nlink = attr->nlink;
+	sx->uid = attr->uid;
+	sx->gid = attr->gid;
+	sx->rdev_major = MAJOR(attr->rdev);
+	sx->rdev_minor = MINOR(attr->rdev);
+	sx->blksize = attr->blksize;
+}
+
+/*
+ * @param sx_mask request mask send to to fuse-server
+ * @param mandatory_sx_mask subset of (or complete) sx_mask that the server
+ * has to fulfill
+*/
 static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
-			 struct file *file, struct kstat *stat)
+			 struct file *file, struct kstat *stat, u32 sx_mask, u32 mandatory_sx_mask)
 {
 	int err;
 	struct fuse_attr attr;
@@ -1423,6 +1527,12 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 	u64 attr_version = fuse_get_attr_version(fm->fc);
 	FUSE_ARGS(args);
 
+	/*
+	 * mandatory_sx_mask should be a subset of sx_mask.
+	 * If it's not, we have a logic error somewhere in the call chain.
+	 */
+	WARN_ON_ONCE((mandatory_sx_mask & sx_mask) != mandatory_sx_mask);
+
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outarg, 0, sizeof(outarg));
 	/* Directories have separate file-handle space */
@@ -1432,9 +1542,12 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 		inarg.getattr_flags |= FUSE_GETATTR_FH;
 		inarg.fh = ff->fh;
 	}
-	/* For now leave sync hints as the default, request all stats. */
+	/*
+	 * For permission checks, we only need mode, uid, gid.
+	 * This is an optimization to avoid fetching all stats when not needed.
+	 */
 	inarg.sx_flags = 0;
-	inarg.sx_mask = STATX_BASIC_STATS | STATX_BTIME;
+	inarg.sx_mask = sx_mask;
 	args.opcode = FUSE_STATX;
 	args.nodeid = get_node_id(inode);
 	args.in_numargs = 1;
@@ -1448,6 +1561,17 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 		return err;
 
 	sx = &outarg.stat;
+
+	/*
+	 * Verify the server returned at least what we requested.
+	 * The server may return more attributes than requested (which is fine),
+	 * but must not return fewer.
+	 */
+	if ((sx->mask & mandatory_sx_mask) != mandatory_sx_mask) {
+		fuse_make_bad(inode);
+		return -EIO;
+	}
+
 	if (((sx->mask & STATX_SIZE) && !fuse_valid_size(sx->size)) ||
 	    ((sx->mask & STATX_TYPE) && (!fuse_valid_type(sx->mode) ||
 					 inode_wrong_type(inode, sx->mode)))) {
@@ -1456,7 +1580,7 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 	}
 
 	fuse_statx_to_attr(&outarg.stat, &attr);
-	if ((sx->mask & STATX_BASIC_STATS) == STATX_BASIC_STATS) {
+	if (sx->mask & STATX_BASIC_STATS) {
 		fuse_change_attributes(inode, &attr, &outarg.stat,
 				       ATTR_TIMEOUT(&outarg), attr_version);
 	}
@@ -1521,30 +1645,31 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
 	bool sync;
 	u32 inval_mask = READ_ONCE(fi->inval_mask);
 	u32 cache_mask = fuse_get_cache_mask(inode);
-
+	u32 mandatory_sx_mask = request_mask & STATX_BASIC_STATS;
+	u32 sx_mask = request_mask;
 
 	/* FUSE only supports basic stats and possibly btime */
-	request_mask &= STATX_BASIC_STATS | STATX_BTIME;
+	sx_mask &= STATX_BASIC_STATS | STATX_BTIME;
 retry:
 	if (fc->no_statx)
-		request_mask &= STATX_BASIC_STATS;
+		sx_mask &= STATX_BASIC_STATS;
 
-	if (!request_mask)
+	if (!sx_mask)
 		sync = false;
 	else if (flags & AT_STATX_FORCE_SYNC)
 		sync = true;
 	else if (flags & AT_STATX_DONT_SYNC)
 		sync = false;
-	else if (request_mask & inval_mask & ~cache_mask)
+	else if (sx_mask & inval_mask & ~cache_mask)
 		sync = true;
 	else
 		sync = time_before64(fi->i_time, get_jiffies_64());
 
 	if (sync) {
 		forget_all_cached_acls(inode);
-		/* Try statx if BTIME is requested */
-		if (!fc->no_statx && (request_mask & ~STATX_BASIC_STATS)) {
-			err = fuse_do_statx(idmap, inode, file, stat);
+		if (!fc->no_statx) {
+			err = fuse_do_statx(idmap, inode, file, stat, sx_mask,
+					    mandatory_sx_mask);
 			if (err == -ENOSYS) {
 				fc->no_statx = 1;
 				err = 0;
@@ -1554,7 +1679,7 @@ retry:
 			err = fuse_do_getattr(idmap, inode, stat, file);
 		}
 	} else if (stat) {
-		generic_fillattr(idmap, request_mask, inode, stat);
+		generic_fillattr(idmap, sx_mask, inode, stat);
 		stat->mode = fi->orig_i_mode;
 		stat->ino = fi->orig_ino;
 		stat->blksize = 1 << fi->cached_i_blkbits;
@@ -1721,13 +1846,14 @@ static int fuse_access(struct inode *inode, int mask)
 	return err;
 }
 
-static int fuse_perm_getattr(struct inode *inode, int mask)
+static int fuse_perm_getattr(struct inode *inode, int mask, int perm_mask)
 {
 	if (mask & MAY_NOT_BLOCK)
 		return -ECHILD;
 
 	forget_all_cached_acls(inode);
-	return fuse_do_getattr(&nop_mnt_idmap, inode, NULL, NULL);
+	return fuse_update_get_attr(&nop_mnt_idmap, inode, NULL, NULL, perm_mask,
+				    AT_STATX_FORCE_SYNC);
 }
 
 /*
@@ -1749,6 +1875,7 @@ static int fuse_permission(struct mnt_idmap *idmap,
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	bool refreshed = false;
 	int err = 0;
+	int perm_mask = STATX_MODE | STATX_UID | STATX_GID;
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -1762,13 +1889,12 @@ static int fuse_permission(struct mnt_idmap *idmap,
 	if (fc->default_permissions ||
 	    ((mask & MAY_EXEC) && S_ISREG(inode->i_mode))) {
 		struct fuse_inode *fi = get_fuse_inode(inode);
-		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
 
 		if (perm_mask & READ_ONCE(fi->inval_mask) ||
-		    time_before64(fi->i_time, get_jiffies_64())) {
+		    time_before64(fi->i_perm_time, get_jiffies_64())) {
 			refreshed = true;
 
-			err = fuse_perm_getattr(inode, mask);
+			err = fuse_perm_getattr(inode, mask, perm_mask);
 			if (err)
 				return err;
 		}
@@ -1781,7 +1907,7 @@ static int fuse_permission(struct mnt_idmap *idmap,
 		   attributes.  This is also needed, because the root
 		   node will at first have no permissions */
 		if (err == -EACCES && !refreshed) {
-			err = fuse_perm_getattr(inode, mask);
+			err = fuse_perm_getattr(inode, mask, perm_mask);
 			if (!err)
 				err = generic_permission(idmap,
 							 inode, mask);
@@ -1798,7 +1924,7 @@ static int fuse_permission(struct mnt_idmap *idmap,
 			if (refreshed)
 				return -EACCES;
 
-			err = fuse_perm_getattr(inode, mask);
+			err = fuse_perm_getattr(inode, mask, perm_mask);
 			if (!err && !(inode->i_mode & S_IXUGO))
 				return -EACCES;
 		}
@@ -2176,35 +2302,24 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		WARN_ON(!(attr->ia_valid & ATTR_SIZE));
 		WARN_ON(attr->ia_size != 0);
 		if (fc->atomic_o_trunc) {
-			struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
-
 			/*
 			 * No need to send request to userspace, since actual
 			 * truncation has already been done by OPEN.  But still
 			 * need to truncate page cache.
 			 *
-			 * Revoke and drop under the coherency gate write side,
-			 * like the NOTIFY invalidate path: a gate reader that
-			 * already re-validated its grant must not have the
-			 * lock tree and the cache yanked mid-hold, or it
-			 * would repopulate the truncated range trusting a
-			 * grant that no longer exists.  Waiting for gate
-			 * readers here is safe: we hold i_rwsem exclusive, so
-			 * no gate holder can be waiting on it (the write path
-			 * takes i_rwsem before the gate, the read path never
-			 * takes it).
+			 * Dropping every grant here does not need a reader or
+			 * writer fenced out: truncate_pagecache() discards the
+			 * folios rather than writing them, and a write racing
+			 * this is a write racing an O_TRUNC open, which has no
+			 * order to preserve.  i_rwsem is held exclusive
+			 * anyway, so no cached write is in progress.
 			 */
-			if (wb_sem)
-				percpu_down_write(wb_sem);
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_cache_release_locks(fi);
 			spin_lock(&fi->lock);
-			fi->server_size = 0;
 			i_size_write(inode, 0);
 			spin_unlock(&fi->lock);
 			truncate_pagecache(inode, 0);
-			if (wb_sem)
-				percpu_up_write(wb_sem);
 			goto out;
 		}
 		file = NULL;
@@ -2295,13 +2410,6 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	/* see the comment in fuse_change_attributes() */
 	if (!is_wb || is_truncate)
 		i_size_write(inode, outarg.attr.size);
-	/*
-	 * A truncate settles the size on the server; only shrink the
-	 * server-materialized bound: growing just exposes zeros, which the
-	 * bound need not cover (see fuse_iomap_read_folio_range()).
-	 */
-	if (is_truncate && (loff_t) outarg.attr.size < fi->server_size)
-		fi->server_size = outarg.attr.size;
 
 	if (is_truncate) {
 		/* NOTE: this may release/reacquire fi->lock */
@@ -2315,23 +2423,17 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	 */
 	if ((is_truncate || !is_wb) &&
 	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
-		struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
-
 		/*
-		 * Revoke and drop under the coherency gate write side; see
-		 * the atomic-O_TRUNC branch above.  i_rwsem is held
-		 * exclusive here as well (setattr), so waiting out gate
-		 * readers cannot deadlock.
+		 * Revoke past the new size and drop what is beyond it; see
+		 * the atomic-O_TRUNC branch above for why this needs nothing
+		 * fenced out.  i_rwsem is held exclusive here as well.
 		 */
-		if (wb_sem)
-			percpu_down_write(wb_sem);
 		if (fc->dlm && fc->writeback_cache)
-			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK, -1);
+			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK,
+					      U64_MAX);
 
 		truncate_pagecache(inode, outarg.attr.size);
 		invalidate_inode_pages2(mapping);
-		if (wb_sem)
-			percpu_up_write(wb_sem);
 	}
 
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
