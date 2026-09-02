@@ -2852,18 +2852,13 @@ static int fuse_writepage_locked(struct folio *folio)
 
 	/*
 	 * Hold the range again before sending it; see fuse_writepages_fill().
-	 * fuse_launder_folio() cleared the folio, so put it back on failure
-	 * rather than lose the bytes; the invalidate that laundered it then
-	 * reports the folio busy, as it does for any folio it cannot free.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
 		error = fuse_dlm_regrant_range(ff, inode, folio_pos(folio),
 					       folio_pos(folio) +
 					       folio_size(folio) - 1);
-		if (error < 0 && error != -ENOSYS) {
-			filemap_dirty_folio(mapping, folio);
+		if (error < 0 && error != -ENOSYS)
 			goto err_writepage_args;
-		}
 	}
 
 	wpa = fuse_writepage_args_setup(folio, ff);
@@ -2887,7 +2882,15 @@ static int fuse_writepage_locked(struct folio *folio)
 err_writepage_args:
 	fuse_file_put(ff, false);
 err:
-	mapping_set_error(folio->mapping, error);
+	/*
+	 * fuse_launder_folio() cleared the folio, so put it back rather than
+	 * lose the bytes: no grant, no file open for writing and no request
+	 * to send it on all leave them the newest there are.  The invalidate
+	 * that laundered it then reports the folio busy, as it does for any
+	 * folio it cannot free.
+	 */
+	filemap_dirty_folio(mapping, folio);
+	mapping_set_error(mapping, error);
 	return error;
 }
 
@@ -2988,8 +2991,18 @@ static int fuse_writepages_fill(struct folio *folio,
 	if (!data->ff) {
 		err = -EIO;
 		data->ff = fuse_write_file_get(fi);
-		if (!data->ff)
+		if (!data->ff) {
+			/*
+			 * No file left open for writing, which the last
+			 * writer's close leaves behind for a background
+			 * pass to find.  The bytes are still the newest
+			 * there are, and write_cache_pages() took the dirty
+			 * flag off before calling here, so put it back
+			 * rather than drop a write fsync reported done.
+			 */
+			folio_redirty_for_writepage(wbc, folio);
 			goto out_unlock;
+		}
 	}
 
 	/*
@@ -3049,8 +3062,10 @@ static int fuse_writepages_fill(struct folio *folio,
 	if (data->wpa == NULL) {
 		err = -ENOMEM;
 		wpa = fuse_writepage_args_setup(folio, data->ff);
-		if (!wpa)
+		if (!wpa) {
+			folio_redirty_for_writepage(wbc, folio);
 			goto out_unlock;
+		}
 		fuse_file_get(wpa->ia.ff);
 
 		data->max_pages = 1;
