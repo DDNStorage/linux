@@ -938,16 +938,29 @@ static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
 					 pgoff_t end, bool may_be_dirty)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t last;
 	bool frozen;
 
 	spin_lock(&fi->lock);
 	frozen = fi->writectr < 0;
 	spin_unlock(&fi->lock);
 
-	if (frozen || !may_be_dirty)
+	if (frozen || !may_be_dirty) {
 		invalidate_mapping_pages(inode->i_mapping, start, end);
-	else
-		invalidate_inode_pages2_range(inode->i_mapping, start, end);
+		return;
+	}
+
+	/*
+	 * A drop that can launder writes the range back itself first.
+	 * fuse_launder_folio() is handed one folio at a time and sends a
+	 * FUSE_WRITE for each, where a writeback pass batches the same bytes
+	 * up to fc->max_write; what it sends the drop then only waits for.
+	 */
+	last = end == (pgoff_t)-1 ? LLONG_MAX :
+	       (((loff_t)end + 1) << PAGE_SHIFT) - 1;
+	filemap_write_and_wait_range(inode->i_mapping,
+				     (loff_t)start << PAGE_SHIFT, last);
+	invalidate_inode_pages2_range(inode->i_mapping, start, end);
 }
 
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
