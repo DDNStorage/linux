@@ -197,6 +197,19 @@ struct dlm_locked_area
 #define FUSE_NOTIFY_EWMA_SHIFT		2
 #define FUSE_NOTIFY_EWMA_SEED		(2 * FUSE_NOTIFY_DIO_INTERVAL)
 
+/*
+ * Streamed file trigger: the same buffer size arriving over and over is a
+ * writer working through a file a record at a time.  The sizes are folded
+ * into an exponentially weighted moving average (weight 1/2^SHIFT, kept
+ * shifted), and a run of FUSE_WRITE_STREAM_RUN writes within
+ * 1/2^FUSE_WRITE_TOL_SHIFT of it says the writer is still on it.  The sample
+ * is capped to keep the shifted accumulator inside an unsigned int.
+ */
+#define FUSE_WRITE_EWMA_SHIFT		2
+#define FUSE_WRITE_TOL_SHIFT		3
+#define FUSE_WRITE_STREAM_RUN		4
+#define FUSE_WRITE_EWMA_MAX		(UINT_MAX >> FUSE_WRITE_EWMA_SHIFT)
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -291,6 +304,24 @@ struct fuse_inode {
 			 * and every writer clears it.
 			 */
 			atomic_t size_extenders;
+
+			/*
+			 * The buffered writes of this inode, whatever
+			 * handle they come through: write_size_ewma is the
+			 * moving average of their sizes and
+			 * write_stream_run how many of the last ones came
+			 * in at that size, which together say the file is
+			 * being streamed; write_stream_next is where the
+			 * next write has to land to carry the run of
+			 * positions on, and write_stream_start the first
+			 * byte of that run no writeback kick has covered.
+			 * Hints only, read and written without a lock; see
+			 * fuse_write_stream_update().
+			 */
+			unsigned int write_size_ewma;
+			unsigned int write_stream_run;
+			loff_t write_stream_next;
+			loff_t write_stream_start;
 		};
 
 		/* readdir cache (directory only) */
