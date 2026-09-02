@@ -362,6 +362,12 @@ bool fuse_open_drop_cache(struct inode *inode)
 	bool emptied;
 
 	filemap_invalidate_lock(inode->i_mapping);
+	/*
+	 * Write back first: the drop launders whatever it finds dirty a
+	 * folio at a time, a FUSE_WRITE per page, where writeback batches
+	 * the same bytes.
+	 */
+	filemap_write_and_wait(inode->i_mapping);
 	invalidate_inode_pages2(inode->i_mapping);
 	emptied = !filemap_range_has_page(inode->i_mapping, 0, LLONG_MAX);
 	filemap_invalidate_unlock(inode->i_mapping);
