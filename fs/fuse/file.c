@@ -3009,6 +3009,28 @@ static int fuse_writepages_fill(struct folio *folio,
 	 * -ENOSYS, which is not a failure.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
+		/*
+		 * Driven by a NOTIFY invalidate.  A grant this folio does not
+		 * already hold would have to be asked for from inside the
+		 * handler the server is waiting on, for the range that
+		 * handler is revoking, with the folio locked and under
+		 * writeback.  The server cannot answer that until the revoke
+		 * completes, and the revoke cannot complete until this
+		 * returns.
+		 *
+		 * Leave the folio dirty instead.  An ordinary writeback sends
+		 * it with a grant of its own; nothing is lost and no error is
+		 * recorded for a later fsync to report.
+		 */
+		if (fuse_in_notify_ctx() &&
+		    !fuse_dlm_lock_is_held(fi, folio_pos(folio),
+					   folio_size(folio),
+					   FUSE_PAGE_LOCK_WRITE)) {
+			folio_redirty_for_writepage(wbc, folio);
+			err = 0;
+			goto out_unlock;
+		}
+
 		err = fuse_dlm_regrant_range(data->ff, inode, folio_pos(folio),
 					     folio_pos(folio) +
 					     folio_size(folio) - 1);

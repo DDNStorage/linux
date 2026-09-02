@@ -891,6 +891,9 @@ static bool fuse_notify_inval_hot(struct fuse_inode *fi)
 	return avg < FUSE_NOTIFY_DIO_INTERVAL;
 }
 
+/* Address only; see fuse_notify_ctx_enter() */
+const char fuse_notify_ctx_key[1];
+
 /*
  * Revoke the DLM grants backing an invalidated byte range.  Grants are
  * recorded page-aligned, so widen the revoke to page boundaries: dropping
@@ -984,6 +987,14 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	forget_all_cached_acls(inode);
 	security_inode_invalidate_secctx(inode);
 	if (offset >= 0) {
+		/*
+		 * Everything below drives this inode's page cache on behalf
+		 * of the revoke, so mark the task: writeback reached from
+		 * here must not send a DLM request.  See
+		 * fuse_writepages_fill().
+		 */
+		void *notify_ctx = fuse_notify_ctx_enter();
+
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)
 			pg_end = -1;
@@ -1140,6 +1151,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			fuse_notify_invalidate_range(inode, pg_start, pg_end,
 						     true);
 		}
+		fuse_notify_ctx_leave(notify_ctx);
 	}
 	iput(inode);
 	return 0;
