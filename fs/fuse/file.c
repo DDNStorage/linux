@@ -2002,6 +2002,117 @@ static ssize_t fuse_dlm_buffered_write(struct kiocb *iocb,
 	return total;
 }
 
+/*
+ * The size a writeback request ends on: the alignment the server asked for,
+ * or without one the largest power of two write it takes.  fc->max_write is
+ * at least 4096 once INIT has been answered, and only then is there a
+ * writeback cache to dirty.
+ */
+static loff_t fuse_write_chunk_size(struct fuse_conn *fc)
+{
+	if (fc->alignment_pages)
+		return (loff_t)fc->alignment_pages << PAGE_SHIFT;
+
+	return rounddown_pow_of_two(fc->max_write);
+}
+
+/*
+ * Fold one buffered write size into the moving average of this inode's write
+ * sizes and report whether the file is being streamed: the same buffer size
+ * arriving FUSE_WRITE_STREAM_RUN times over, which is what a writer working
+ * through a file a record at a time looks like from here.  A size outside the
+ * tolerance around the average starts the run again from that size, so a
+ * writer changing its record is followed rather than averaged with what it
+ * did before.
+ *
+ * The average is per inode rather than per handle, so a stream stays one
+ * stream across reopens and across the handles of a shared file, whose
+ * writers are streaming it together without any one of them being sequential.
+ *
+ * A hint only, read and written without the inode lock, which the DLM path
+ * holds shared: writers landing on it together cost a misread run, not
+ * correctness.
+ */
+static bool fuse_write_stream_update(struct fuse_inode *fi, size_t len)
+{
+	unsigned int sample = min_t(size_t, len, FUSE_WRITE_EWMA_MAX);
+	unsigned int avg = fi->write_size_ewma >> FUSE_WRITE_EWMA_SHIFT;
+
+	if (fi->write_stream_run &&
+	    abs_diff(sample, avg) <= avg >> FUSE_WRITE_TOL_SHIFT) {
+		/* E += sample - (E >> SHIFT); avg = E >> SHIFT */
+		fi->write_size_ewma += sample - avg;
+		if (fi->write_stream_run < FUSE_WRITE_STREAM_RUN)
+			fi->write_stream_run++;
+	} else {
+		fi->write_size_ewma = sample << FUSE_WRITE_EWMA_SHIFT;
+		fi->write_stream_run = 1;
+	}
+
+	return fi->write_stream_run >= FUSE_WRITE_STREAM_RUN;
+}
+
+/*
+ * Start non-integrity writeback on the aligned chunks a streamed file has
+ * left behind.
+ *
+ * fuse_writepage_need_send() ends a request on the server's alignment, or
+ * on the largest write it takes, but where one starts is the flusher's
+ * choice, and nothing sends the range at all until a dirty limit or the
+ * closing flush asks for it.  Kicking a chunk as the writer leaves it puts
+ * both bounds on that same size and keeps the tail off the flush.
+ *
+ * @stream is the size average saying the file is streamed; the run of
+ * positions is kept here, because a chunk is complete only once the writes
+ * have carried on past it.  A write that does not continue the previous one
+ * leaves nothing behind it and sends nothing.
+ *
+ * A hint only: nothing waits for it, and a chunk that is partly dirty or
+ * already written back sends what it has.  The run is read and written
+ * without the inode lock, which the DLM path holds shared, so writers
+ * landing on it together cost a kick, not correctness.
+ */
+static void fuse_writeback_kick_stream(struct kiocb *iocb, loff_t pos,
+				       size_t len, bool stream)
+{
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t chunk, start, end;
+	bool sequential;
+
+	sequential = pos == fi->write_stream_next;
+	fi->write_stream_next = pos + (loff_t)len;
+	if (!sequential || !stream) {
+		/* Nothing behind this write is known to be finished */
+		fi->write_stream_start = pos;
+		return;
+	}
+
+	chunk = fuse_write_chunk_size(get_fuse_conn(inode));
+	start = round_down(fi->write_stream_start, chunk);
+	end = round_down(fi->write_stream_next, chunk);
+	/* No bound crossed, so nothing has been left complete */
+	if (end <= fi->write_stream_start)
+		return;
+
+	fi->write_stream_start = end;
+	/*
+	 * What filemap_fdatawrite_range_kick() does upstream: a range write
+	 * with no integrity, which this kernel has no helper for.
+	 */
+	{
+		struct writeback_control wbc = {
+			.sync_mode	= WB_SYNC_NONE,
+			.nr_to_write	= LONG_MAX,
+			.range_start	= start,
+			.range_end	= end - 1,
+		};
+
+		filemap_fdatawrite_wbc(file->f_mapping, &wbc);
+	}
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -2011,6 +2122,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct inode *inode = mapping->host;
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool stream = false;
 	bool exclusive = true;
 	loff_t dlm_pos = 0;
 	size_t dlm_len = 0;
@@ -2062,6 +2175,17 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if ((fc->handle_killpriv_v2 || fc->dlm) &&
 		    setattr_should_drop_suidgid(idmap, file_inode(file)))
 			goto writethrough;
+
+		/*
+		 * Every write that can be cached feeds the size average,
+		 * streamed or not: a writer changing its record has to be seen
+		 * as well.  The size is the one the caller asked for, before
+		 * generic_write_checks() has had a chance to clamp it, which is
+		 * the record the writer is working with.
+		 */
+		if (!(iocb->ki_flags & IOCB_DIRECT))
+			stream = fuse_write_stream_update(fi,
+							  iov_iter_count(from));
 
 		exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
 
@@ -2224,8 +2348,14 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 wb_out:
 		fuse_cache_wr_unlock(inode, exclusive);
-		if (written > 0)
+		if (written > 0) {
+			/* The cached branch, the only one leaving folios dirty */
+			if (!(iocb->ki_flags & IOCB_DIRECT))
+				fuse_writeback_kick_stream(iocb,
+							   iocb->ki_pos - written,
+							   written, stream);
 			written = generic_write_sync(iocb, written);
+		}
 		return written ? written : err;
 	}
 
@@ -4291,6 +4421,10 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->ra_lookahead = 0;
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
+	fi->write_size_ewma = 0;
+	fi->write_stream_run = 0;
+	fi->write_stream_next = 0;
+	fi->write_stream_start = 0;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
