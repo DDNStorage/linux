@@ -724,6 +724,16 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 	if (fuse_is_bad(inode))
 		return -EIO;
 
+	/*
+	 * Get the sending out of the way before the lock.  It is the long
+	 * part: a pass takes back every grant it finds gone, a cluster round
+	 * trip each, and cached writers hold i_rwsem shared
+	 * (fuse_cache_wr_exclusive_lock()) and would all wait behind it.
+	 * Errors are left to the pass below, which collects them from the
+	 * mapping.
+	 */
+	filemap_fdatawrite_range(file->f_mapping, start, end);
+
 	inode_lock(inode);
 
 	/*
