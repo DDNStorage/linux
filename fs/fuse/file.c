@@ -2124,6 +2124,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	bool stream = false;
+	bool through = false;
 	bool exclusive = true;
 	loff_t dlm_pos = 0;
 	size_t dlm_len = 0;
@@ -2186,6 +2187,22 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (!(iocb->ki_flags & IOCB_DIRECT))
 			stream = fuse_write_stream_update(fi,
 							  iov_iter_count(from));
+
+		/*
+		 * A streamed write of FUSE_WRITE_STREAM_MIN or more is sent
+		 * from here instead, out of the caller's own pages.  Cached,
+		 * the bytes are copied twice on their way to the server, into
+		 * the folios and out of them into the ring the request is read
+		 * from, and the folios are dropped unread; sent from here they
+		 * are copied once.  Size is the whole of the test: what a
+		 * record is worth saving the copy on, not where it lands or how
+		 * it fits the alignment the server asked for.
+		 *
+		 * Not on a mapped file: the folios these bytes replace have to
+		 * be dropped afterwards, and a mapped one is not.
+		 */
+		through = stream && !mapping_mapped(mapping) &&
+			  iov_iter_count(from) >= FUSE_WRITE_STREAM_MIN;
 
 		exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
 
@@ -2333,6 +2350,47 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				goto wb_out;
 			written = direct_write_fallback(iocb, from, written,
 					generic_perform_write(iocb, from));
+		} else if (through) {
+			struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
+			loff_t pos = iocb->ki_pos;
+
+			count = iov_iter_count(from);
+			/*
+			 * What is cached under the write goes to the server
+			 * before it and is dropped after: the folios hold the
+			 * bytes these replace, and
+			 * invalidate_inode_pages2_range() launders rather than
+			 * drops, so a dirty one left here would reach the
+			 * server on top of them.
+			 */
+			if (mapping->nrpages) {
+				err = filemap_write_and_wait_range(mapping, pos,
+							pos + count - 1);
+				if (err) {
+					written = err;
+					goto wb_out;
+				}
+			}
+
+			written = fuse_direct_io(&io, from, &iocb->ki_pos,
+						 FUSE_DIO_WRITE);
+			if (written < 0) {
+				err = written;
+				goto wb_out;
+			}
+
+			/*
+			 * These bytes never reach fuse_write_end(), which is
+			 * where the cached path commits i_size, so commit it
+			 * here the way the direct path does, retiring the
+			 * attribute replies that left before the write.
+			 */
+			fuse_write_update_attr(inode, iocb->ki_pos, written);
+
+			if (written > 0 && mapping->nrpages)
+				invalidate_inode_pages2_range(mapping,
+					pos >> PAGE_SHIFT,
+					(iocb->ki_pos - 1) >> PAGE_SHIFT);
 		} else {
 			/*
 			 * Under DLM the unaligned edges go through to the
@@ -2350,7 +2408,7 @@ wb_out:
 		fuse_cache_wr_unlock(inode, exclusive);
 		if (written > 0) {
 			/* The cached branch, the only one leaving folios dirty */
-			if (!(iocb->ki_flags & IOCB_DIRECT))
+			if (!through && !(iocb->ki_flags & IOCB_DIRECT))
 				fuse_writeback_kick_stream(iocb,
 							   iocb->ki_pos - written,
 							   written, stream);
