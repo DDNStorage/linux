@@ -210,6 +210,9 @@ struct dlm_locked_area
 #define FUSE_WRITE_STREAM_RUN		4
 #define FUSE_WRITE_EWMA_MAX		(UINT_MAX >> FUSE_WRITE_EWMA_SHIFT)
 
+/* Under this size the copy into the page cache is not worth avoiding */
+#define FUSE_WRITE_STREAM_MIN		(64 * 1024)
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
