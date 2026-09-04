@@ -179,11 +179,11 @@ void fuse_dlm_cache_init(struct fuse_inode *inode)
  * about, so a fence over a page cannot miss a pin on that page.
  */
 static void fuse_dlm_span_set(struct fuse_dlm_span *span, loff_t offset,
-			      size_t length)
+			      size_t length, struct task_struct *owner)
 {
 	span->start = (uint64_t)offset & PAGE_MASK;
 	span->end = ((uint64_t)offset + length - 1) | (PAGE_SIZE - 1);
-	span->owner = current;
+	span->owner = owner;
 }
 
 /*
@@ -243,7 +243,7 @@ void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 	if (fuse_in_notify_ctx())
 		return;
 
-	fuse_dlm_span_set(pin, offset, length);
+	fuse_dlm_span_set(pin, offset, length, current);
 
 	spin_lock(&cache->pin_lock);
 	while (fuse_dlm_overlaps_locked(&cache->fences, pin->start, pin->end)) {
@@ -285,7 +285,7 @@ bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 	if (fuse_in_notify_ctx())
 		return true;
 
-	fuse_dlm_span_set(pin, offset, length);
+	fuse_dlm_span_set(pin, offset, length, current);
 
 	spin_lock(&cache->pin_lock);
 	fenced = fuse_dlm_overlaps_locked(&cache->fences, pin->start,
@@ -295,6 +295,62 @@ bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 	spin_unlock(&cache->pin_lock);
 
 	return !fenced;
+}
+
+/**
+ * fuse_dlm_trypin_span - fuse_dlm_trypin() for a fill that ends elsewhere
+ * @inode: the fuse inode
+ * @pin: caller-owned storage, live until fuse_dlm_unpin_span()
+ * @offset: byte offset the caller is about to fill
+ * @length: length of the region in bytes
+ *
+ * For a read whose reply lands in another task: the node is dropped by
+ * fuse_dlm_unpin_span() from wherever the fill ends, and carries no
+ * owner, so a fuse_dlm_unpin() by the task that took it cannot match it
+ * instead of its own.
+ *
+ * Never sleeps, and has no notify-context shortcut: a fill is not
+ * reached from a revoke handler, and a pin taken there would have to be
+ * dropped from a task that is not in one.
+ *
+ * Return: true if the range is pinned, false if a revoke of it is
+ * draining.
+ */
+bool fuse_dlm_trypin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+			  loff_t offset, size_t length)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	bool fenced;
+
+	fuse_dlm_span_set(pin, offset, length, NULL);
+
+	spin_lock(&cache->pin_lock);
+	fenced = fuse_dlm_overlaps_locked(&cache->fences, pin->start,
+					  pin->end);
+	if (!fenced)
+		list_add(&pin->list, &cache->pins);
+	spin_unlock(&cache->pin_lock);
+
+	return !fenced;
+}
+
+/**
+ * fuse_dlm_unpin_span - release the pin fuse_dlm_trypin_span() took
+ * @inode: the fuse inode
+ * @pin: the node published there
+ */
+void fuse_dlm_unpin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	bool waiters;
+
+	spin_lock(&cache->pin_lock);
+	list_del(&pin->list);
+	waiters = !list_empty(&cache->fences);
+	spin_unlock(&cache->pin_lock);
+
+	if (waiters)
+		wake_up_all(&cache->pin_wq);
 }
 
 /**

@@ -16,6 +16,7 @@
 #include <linux/sched/signal.h>
 #include <linux/module.h>
 #include <linux/swap.h>
+#include <linux/fadvise.h>
 #include <linux/falloc.h>
 #include <linux/uio.h>
 #include <linux/fs.h>
@@ -1134,10 +1135,99 @@ static int fuse_read_folio_merge(struct file *file, struct folio *folio)
 	return 0;
 }
 
+/**
+ * fuse_read_grant - take the grant a page cache fill runs under
+ * @file: file to read through
+ * @pos: byte offset the read starts at
+ * @count: bytes the read asks for
+ *
+ * ->read_folio and ->readahead are entered with the folios they fill
+ * already locked, and no grant may be asked for under a page lock
+ * (Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt).
+ * A read asks here, before anything is locked, and the fill paths only
+ * confirm what this took.
+ *
+ * Readahead fills past the end of the read, so ask for a window beyond
+ * it as well, bounded by the file since readahead stops there.  A run of
+ * folios no grant covers is given back unfilled and fetched one folio at
+ * a time, so what is asked for here is what readahead is worth.
+ *
+ * Return: what fuse_get_dlm_lock() returned, 0 when there is nothing to
+ * ask for.
+ */
+static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	loff_t size = i_size_read(inode);
+	loff_t ahead = (loff_t)file->f_ra.ra_pages << PAGE_SHIFT;
+	loff_t end = pos + count;
+
+	if (!fc->writeback_cache || !fc->dlm)
+		return 0;
+
+	if (end < size)
+		end += min(ahead, size - end);
+
+	if (end <= pos)
+		return 0;
+
+	return fuse_get_dlm_lock(file, pos, end - pos, FUSE_PAGE_LOCK_READ);
+}
+
+/**
+ * fuse_read_folio_retry - back off a fill with no grant to run under
+ * @file: file to read through
+ * @folio: the folio handed over locked, unlocked here
+ * @pos: byte offset of @folio
+ * @len: its size in bytes
+ *
+ * Neither reason a fill is refused can be dealt with while the folio is
+ * held: waiting a revoke out would hold the page cache that revoke is
+ * about to drop, and no grant may be asked for under a page lock at all
+ * (Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt).
+ * Unlock, do both, and send the caller round again to find the range
+ * covered.
+ *
+ * Return: AOP_TRUNCATED_PAGE, or a negative error.
+ */
+static int fuse_read_folio_retry(struct file *file, struct folio *folio,
+				 loff_t pos, size_t len)
+{
+	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
+	struct fuse_dlm_span pin;
+	int err;
+
+	folio_unlock(folio);
+
+	/* Wait the revoke out; what it leaves behind is asked for below */
+	fuse_dlm_pin(fi, &pin, pos, len);
+	fuse_dlm_unpin(fi);
+
+	err = fuse_read_grant(file, pos, len);
+	if (err == -ENOSYS)
+		return AOP_TRUNCATED_PAGE;
+	if (err < 0)
+		return err;
+	/*
+	 * Granted but unrecorded, so the retry finds the range uncovered
+	 * and comes straight back here.  Report it rather than spin.
+	 */
+	if (err > 0)
+		return -ENOMEM;
+
+	return AOP_TRUNCATED_PAGE;
+}
+
 static int fuse_read_folio(struct file *file, struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
+	loff_t pos = folio_pos(folio);
+	size_t len = folio_size(folio);
+	struct fuse_dlm_span pin;
+	bool pinned = false;
 	int err;
 
 	err = -EIO;
@@ -1156,6 +1246,30 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 	folio_wait_writeback(folio);
 
 	/*
+	 * The grant the folio is filled under, held from the confirmation
+	 * until the bytes are in the page cache.  What lands here is served
+	 * to every later reader of the file, so it must neither be fetched
+	 * under a grant a revoke has taken away nor be dropped into a range
+	 * a revoke has just swept: such a folio is uptodate and covered by
+	 * nothing, and no further notify comes for a lock this client no
+	 * longer holds.
+	 *
+	 * The pin closes the second, since a revoke over the folio waits
+	 * for the fill and drops the folio after it; the confirmation
+	 * closes the first.  Both fail into fuse_read_folio_retry().
+	 */
+	if (fc->dlm && fc->writeback_cache) {
+		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
+		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
+						     FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin(fi);
+			pinned = false;
+		}
+		if (!pinned)
+			return fuse_read_folio_retry(file, folio, pos, len);
+	}
+
+	/*
 	 * Only a folio still holding what a write put in it has anything to
 	 * keep.  One that was merely being written back is clean by now,
 	 * waited out just above, and reads whole.
@@ -1170,6 +1284,12 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 	fuse_invalidate_atime(inode);
  out:
 	folio_unlock(folio);
+	/*
+	 * After the unlock, so a revoke draining this pin finds the folio
+	 * it has to drop unlocked and takes it out.
+	 */
+	if (pinned)
+		fuse_dlm_unpin(fi);
 	return err;
 }
 
@@ -1259,19 +1379,40 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 		folio_end_read(ap->folios[i], !err);
 		folio_put(ap->folios[i]);
 	}
+
+	/*
+	 * Dropped after the folios, which are filled, uptodate and unlocked
+	 * by now: a revoke draining this pin finds them and takes them out.
+	 * Held until here so it cannot have swept before they were there.
+	 */
+	if (ia->read.dlm_fi)
+		fuse_dlm_unpin_span(ia->read.dlm_fi, &ia->read.dlm_pin);
+
 	if (ia->ff)
 		fuse_file_put(ia->ff, false);
 
 	fuse_io_free(ia);
 }
 
-static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
-				unsigned int count)
+/**
+ * fuse_send_readpages - read a run of folios of a readahead window
+ * @ia: the request, owning the folios and the pin over them
+ * @file: file to read through
+ * @count: bytes to read, starting at the first folio
+ *
+ * Return: 0 once the request is on its way or has been completed,
+ * -EAGAIN when a revoke of the range refused the grant and nothing was
+ * sent.  The folios are given back either way.
+ */
+static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
+			       unsigned int count)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
+	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
 	struct fuse_args_pages *ap = &ia->ap;
 	loff_t pos = folio_pos(ap->folios[0]);
+	unsigned int i;
 	ssize_t res;
 	int err;
 
@@ -1286,6 +1427,29 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 	}
 	WARN_ON((loff_t) (pos + count) < 0);
 
+	/*
+	 * The grant the read took in fuse_read_grant(), confirmed under a
+	 * pin and held until the reply has filled the folios.  A revoke of the range
+	 * waits for that, so the reply cannot be fetched under a grant the
+	 * server has since handed on, and cannot land behind a sweep that
+	 * would leave the folios uptodate and covered by nothing.
+	 *
+	 * Refused, or gone since it was asked for: give the folios back
+	 * unfilled rather than serve what no lock covers.  The read that
+	 * wanted them comes back through fuse_read_folio(), which asks
+	 * again with no folio held.
+	 */
+	if (fm->fc->dlm && fm->fc->writeback_cache) {
+		if (!fuse_dlm_trypin_span(fi, &ia->read.dlm_pin, pos, count))
+			goto uncovered;
+		if (!fuse_dlm_lock_is_held(fi, pos, count,
+					   FUSE_PAGE_LOCK_READ)) {
+			fuse_dlm_unpin_span(fi, &ia->read.dlm_pin);
+			goto uncovered;
+		}
+		ia->read.dlm_fi = fi;
+	}
+
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	ia->read.attr_ver = fuse_get_attr_version(fm->fc);
 	if (fm->fc->async_read) {
@@ -1293,12 +1457,21 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 		ap->args.end = fuse_readpages_end;
 		err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
 		if (!err)
-			return;
+			return 0;
 	} else {
 		res = fuse_simple_request(fm, &ap->args);
 		err = res < 0 ? res : 0;
 	}
 	fuse_readpages_end(fm, &ap->args, err);
+	return 0;
+
+uncovered:
+	for (i = 0; i < ap->num_folios; i++) {
+		folio_end_read(ap->folios[i], false);
+		folio_put(ap->folios[i]);
+	}
+	fuse_io_free(ia);
+	return -EAGAIN;
 }
 
 static void fuse_readahead(struct readahead_control *rac)
@@ -1312,44 +1485,21 @@ static void fuse_readahead(struct readahead_control *rac)
 		return;
 
 	/*
-	 * Readahead fills the page cache past the range the reader locked,
-	 * so take a DLM read grant over the whole window here too.  Folios
+	 * Readahead fills the page cache past the range the reader asked
+	 * for, and what lands there has to be covered by a grant: folios
 	 * the server handed out no lock for are folios it will not revoke
 	 * when a remote node writes them, and a later read would be served
-	 * from stale cache.  Take the grant before any folio is pulled off
-	 * @rac, so the window is either fully covered or not populated.
+	 * from stale cache.
 	 *
-	 * Speculative pages are not worth serving uncovered: on a failed
-	 * request drop the window and let read_pages() clean up the folios
-	 * left in @rac.  A server without DLM support answers -ENOSYS and
-	 * clears fc->dlm, which is not a failure.
+	 * No grant is asked for here.  ->readahead is entered with every
+	 * folio of the window already locked, and none may be asked for
+	 * under a page lock; the read this window belongs to took one over
+	 * it in fuse_read_grant(), before the page cache was entered.
 	 *
-	 * ->readahead is entered with every folio of the window already
-	 * locked, and pulling one off @rac is what unlocks it, so the round
-	 * trip is taken under those locks.  See the readahead line of
-	 * Documentation/filesystems/locking.rst.
-	 *
-	 * What keeps that from closing a cycle is the direction a revoke
-	 * travels.  This asks for a read grant on a range it holds nothing
-	 * on, so the lock in the way is another node's, and the revoke that
-	 * frees it is sent there.  Nothing here has to run for this request
-	 * to be answered, so the folios stay locked only for as long as the
-	 * round trip.
-	 *
-	 * A window this already holds part of is the open edge: the query
-	 * fails for the whole of it, so the request goes out while that part
-	 * is still held, and a revoke for that part is sent here.  Whether
-	 * the server can answer while a revoke of its own is outstanding is
-	 * not something this side can know.
+	 * What that left uncovered fuse_send_readpages() declines, one run
+	 * of folios at a time, and those folios go back unfilled for
+	 * fuse_read_folio() to fetch with no folio held.
 	 */
-	if (fc->writeback_cache && fc->dlm) {
-		int err = fuse_get_dlm_lock(rac->file, readahead_pos(rac),
-					    readahead_length(rac),
-					    FUSE_PAGE_LOCK_READ);
-
-		if (err < 0 && err != -ENOSYS)
-			return;
-	}
 
 	max_pages = min_t(unsigned int, fc->max_pages,
 			fc->max_read / PAGE_SIZE);
@@ -1413,7 +1563,8 @@ static void fuse_readahead(struct readahead_control *rac)
 			pages += folio_pages;
 			folio = NULL;
 		}
-		fuse_send_readpages(ia, rac->file, pages << PAGE_SHIFT);
+		if (fuse_send_readpages(ia, rac->file, pages << PAGE_SHIFT))
+			break;
 		nr_pages -= pages;
 	}
 	if (folio) {
@@ -1444,18 +1595,22 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			return err;
 	}
 
-	/* if we have dlm support acquire a read lock for the area
-	 * we are reading from. */
-	if (fc->writeback_cache && fc->dlm)
-		fuse_get_dlm_lock(file, iocb->ki_pos, iov_iter_count(to),
-				  FUSE_PAGE_LOCK_READ);
+	/*
+	 * The grant this read and the readahead behind it fill under.  Not
+	 * for O_DIRECT, which takes no DLM lock at all: it fills no page
+	 * cache, and what it reads is the server's to order.
+	 */
+	if (!(iocb->ki_flags & IOCB_DIRECT))
+		fuse_read_grant(file, iocb->ki_pos, iov_iter_count(to));
 
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
 	 * supersedes, so the read either misses and refetches or returns
-	 * data that was current when it was copied.  There is nothing to
-	 * fence: unlike a write, a read leaves nothing behind that could
-	 * reach the server under a grant it no longer holds.
+	 * data that was current when it was copied.  What a read does leave
+	 * behind is the page cache it fills, which must not outlast the
+	 * grant it was fetched under; that is fenced where the filling
+	 * happens, in fuse_read_folio() and fuse_send_readpages(), and the
+	 * grant taken here is what they confirm.
 	 */
 	if (fuse_inode_force_dio(inode)) {
 		size_t count = iov_iter_count(to);
@@ -2378,8 +2533,13 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 * too early, an expanding write would fall through to a READ of a
 	 * range that cannot hold data -- which fails outright on a handle
 	 * the client opened write-only.
+	 *
+	 * O_DIRECT takes no DLM lock at all, here or anywhere: it dirties
+	 * no page cache, so there is nothing for a grant to cover, and its
+	 * bytes are the server's to order against the rest of the cluster.
 	 */
-	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_APPEND)) {
+	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+	    !(iocb->ki_flags & IOCB_APPEND)) {
 		err = fuse_cache_wr_dlm_lock(file, iocb->ki_pos,
 					     iov_iter_count(from));
 		if (err)
@@ -2403,7 +2563,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 * lock does not pin i_size either: attribute replies move it under
 	 * fi->lock alone.  Take the grant here, where the range is settled.
 	 */
-	if (writeback && fc->dlm && (iocb->ki_flags & IOCB_APPEND)) {
+	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+	    (iocb->ki_flags & IOCB_APPEND)) {
 		err = fuse_cache_wr_dlm_lock(file, iocb->ki_pos, count);
 		if (err)
 			goto out;
@@ -2464,6 +2625,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 								   false));
 	} else if (through) {
 		struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
+		struct fuse_dlm_span pin;
 		loff_t pos = iocb->ki_pos;
 
 		/*
@@ -2480,8 +2642,20 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				goto out;
 		}
 
+		/*
+		 * These bytes never enter the page cache, so a revoke
+		 * cannot find them by flushing it, and the grant they were
+		 * taken under can be handed on while they are still on the
+		 * wire.  Hold it across the FUSE_WRITE, as the writethrough
+		 * edges do; a revoke of the range waits for the reply.
+		 */
+		err = fuse_dlm_pin_write(file, &pin, pos, count);
+		if (err)
+			goto out;
+
 		written = fuse_direct_io(&io, from, &iocb->ki_pos,
 					 FUSE_DIO_WRITE);
+		fuse_dlm_unpin(fi);
 		if (written < 0) {
 			err = written;
 			goto out;
@@ -2952,8 +3126,10 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
-	else
-		return filemap_splice_read(in, ppos, pipe, len, flags);
+
+	fuse_read_grant(in, *ppos, len);
+
+	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
 
 static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
@@ -3860,9 +4036,22 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	return VM_FAULT_LOCKED;
 }
 
+/*
+ * A read fault fills the page cache through ->read_folio and
+ * ->readahead, which run with the folios locked.  Ask for the grant they
+ * fill under before filemap_fault() locks any of them.
+ */
+static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
+{
+	fuse_read_grant(vmf->vma->vm_file, (loff_t)vmf->pgoff << PAGE_SHIFT,
+			PAGE_SIZE);
+
+	return filemap_fault(vmf);
+}
+
 static const struct vm_operations_struct fuse_file_vm_ops = {
 	.close		= fuse_vma_close,
-	.fault		= filemap_fault,
+	.fault		= fuse_filemap_fault,
 	.map_pages	= filemap_map_pages,
 	.page_mkwrite	= fuse_page_mkwrite,
 };
@@ -4683,6 +4872,21 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
 	return ret;
 }
 
+/*
+ * POSIX_FADV_WILLNEED, and readahead(2) with it, populate the page cache
+ * through ->readahead, which runs with the folios locked.  Ask for the
+ * grant that fill needs while nothing is held; a window no grant covers
+ * is given back unfilled.
+ */
+static int fuse_fadvise(struct file *file, loff_t offset, loff_t len,
+			int advice)
+{
+	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0)
+		fuse_read_grant(file, offset, len);
+
+	return generic_fadvise(file, offset, len, advice);
+}
+
 static const struct file_operations fuse_file_operations = {
 	.llseek		= fuse_file_llseek,
 	.read_iter	= fuse_file_read_iter,
@@ -4702,6 +4906,7 @@ static const struct file_operations fuse_file_operations = {
 	.poll		= fuse_file_poll,
 	.fallocate	= fuse_file_fallocate,
 	.copy_file_range = fuse_copy_file_range,
+	.fadvise	= fuse_fadvise,
 };
 
 static const struct address_space_operations fuse_file_aops  = {

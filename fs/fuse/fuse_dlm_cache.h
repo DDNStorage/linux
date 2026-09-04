@@ -24,10 +24,14 @@ struct fuse_file;
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
 
 /*
- * A range held on one of the two lists in struct fuse_dlm_cache: a
- * writer between confirming a grant and dirtying under it (@owner set),
- * or a revoke taking grants away (@owner NULL).  Caller-owned storage,
- * live until the matching unpin or revoke end.
+ * A range held on one of the two lists in struct fuse_dlm_cache: an IO
+ * between confirming a grant and publishing the page cache it covers,
+ * or a revoke taking grants away.  Caller-owned storage, live until the
+ * matching unpin or revoke end.
+ *
+ * @owner is the pinning task where the pin is dropped by owner, and NULL
+ * on every fence and on a pin dropped by node because the fill it covers
+ * ends in another task.
  */
 struct fuse_dlm_span {
 	/* Page-aligned byte offsets, both inclusive */
@@ -122,7 +126,9 @@ struct fuse_dlm_shard {
  * between sends those bytes out after the server has handed the lock on.
  * The pin closes that: a revoke waits for the pins over the range it is
  * taking away before it removes anything, so a grant confirmed under a
- * pin is still held when the bytes become visible to writeback.
+ * pin is still held when the bytes become visible to writeback.  A read
+ * is the same the other way round, a fill landing in a range the revoke
+ * has already swept staying cached under no grant at all.
  *
  * Both sides are ranges rather than a count, so a revoke fences only the
  * writers it overlaps and a write outside it runs on.  Refusal and wait
@@ -149,8 +155,9 @@ struct fuse_dlm_cache {
 	/* Protects @pins and @fences */
 	spinlock_t pin_lock;
 	/*
-	 * Writers between confirming a grant and dirtying under it, each
-	 * over the range it is about to write.  See the pin comment above.
+	 * IO between confirming a grant and publishing under it: a writer
+	 * over what it is about to dirty, a read over what it is about to
+	 * fill.  See the pin comment above.
 	 */
 	struct list_head pins;
 	/* Revokes in progress, each over the range it takes away */
@@ -207,6 +214,15 @@ void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 		     loff_t offset, size_t length);
 void fuse_dlm_unpin(struct fuse_inode *inode);
+
+/*
+ * fuse_dlm_trypin() for a fill whose reply lands in another task: @pin
+ * is dropped by node rather than by owner, and is live from the request
+ * until fuse_dlm_unpin_span().
+ */
+bool fuse_dlm_trypin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+			  loff_t offset, size_t length);
+void fuse_dlm_unpin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin);
 
 /*
  * Fence the writers that hold a grant over [@offset, @offset + @len) but
