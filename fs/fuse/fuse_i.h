@@ -46,11 +46,29 @@
  */
 extern const char fuse_notify_ctx_key[];
 
-static inline void *fuse_notify_ctx_enter(void)
+/*
+ * What a task driving page cache work for a NOTIFY invalidate carries.
+ *
+ * @key tells it apart from anything else parked in journal_info.  The range
+ * is the one being revoked: the lock over it is still this client's until
+ * the handler returns, so writeback of it need not ask for a grant, while
+ * anything outside it must.
+ */
+struct fuse_notify_ctx {
+	const char	*key;
+	loff_t		start;
+	loff_t		end;		/* inclusive; LLONG_MAX to EOF */
+};
+
+static inline void *fuse_notify_ctx_enter(struct fuse_notify_ctx *ctx,
+					  loff_t start, loff_t end)
 {
 	void *old = current->journal_info;
 
-	current->journal_info = (void *)fuse_notify_ctx_key;
+	ctx->key = fuse_notify_ctx_key;
+	ctx->start = start;
+	ctx->end = end;
+	current->journal_info = ctx;
 	return old;
 }
 
@@ -59,9 +77,24 @@ static inline void fuse_notify_ctx_leave(void *old)
 	current->journal_info = old;
 }
 
+static inline struct fuse_notify_ctx *fuse_notify_ctx(void)
+{
+	struct fuse_notify_ctx *ctx = current->journal_info;
+
+	return (ctx && ctx->key == fuse_notify_ctx_key) ? ctx : NULL;
+}
+
 static inline bool fuse_in_notify_ctx(void)
 {
-	return current->journal_info == (void *)fuse_notify_ctx_key;
+	return fuse_notify_ctx();
+}
+
+/* Is [@pos, @pos + @len) the range the revoke in progress is taking away? */
+static inline bool fuse_in_notify_range(loff_t pos, unsigned int len)
+{
+	struct fuse_notify_ctx *ctx = fuse_notify_ctx();
+
+	return ctx && pos >= ctx->start && pos + len - 1 <= ctx->end;
 }
 
 /** Default max number of pages that can be used in a single read request */
@@ -274,6 +307,38 @@ struct fuse_inode {
 			unsigned int write_stream_run;
 			loff_t write_stream_next;
 			loff_t write_stream_start;
+
+			/*
+			 * Buffered writes that have committed an i_size
+			 * extension and not yet dirtied the folio under
+			 * it.
+			 *
+			 * The DLM path holds i_rwsem shared, so several
+			 * writers extend i_size at once and each one is
+			 * ahead of the server until its bytes are sent.
+			 * While this is non zero the local size wins over
+			 * the server's; see fuse_attr_cache_mask().
+			 * FUSE_I_SIZE_UNSTABLE cannot serve: it is one bit
+			 * and every writer clears it.
+			 */
+			atomic_t size_extenders;
+
+			/*
+			 * High water mark of i_size, and the size the
+			 * queued writepage requests are cropped against.
+			 * A truncate lowers it
+			 * (fuse_writeback_crop_truncated()); otherwise it
+			 * only follows i_size back down once no request is
+			 * left to protect (fuse_writepage_end()).
+			 *
+			 * i_size itself cannot serve: with DLM the server's
+			 * size is applied to it (fuse_attr_cache_mask()),
+			 * and a reply that is only behind the local writers
+			 * would have fuse_send_writepage() crop away bytes
+			 * on their way out.  Protected by fi->lock;
+			 * writeback-cache regular files only.
+			 */
+			loff_t wb_crop;
 		};
 
 		/* readdir cache (directory only) */
@@ -1282,6 +1347,15 @@ struct fuse_io_args {
 		struct {
 			struct fuse_read_in in;
 			u64 attr_ver;
+			/*
+			 * The grant the folios are filled under, held
+			 * from the request until the reply has filled
+			 * them; see fuse_send_readpages().  @dlm_fi is
+			 * the inode to drop it on, and NULL when there
+			 * is no pin to drop.
+			 */
+			struct fuse_dlm_span dlm_pin;
+			struct fuse_inode *dlm_fi;
 		} read;
 		struct {
 			struct fuse_write_in in;
@@ -1311,7 +1385,7 @@ void fuse_file_free(struct fuse_file *ff);
 int fuse_finish_open(struct inode *inode, struct file *file);
 
 /* Drop the page cache an open must not keep; true if it came out empty */
-bool fuse_open_drop_cache(struct inode *inode);
+void fuse_open_drop_cache(struct inode *inode);
 
 void fuse_sync_release(struct fuse_inode *fi, struct fuse_file *ff,
 		       unsigned int flags);
@@ -1546,6 +1620,23 @@ void fuse_flush_writepages(struct inode *inode);
 
 void fuse_set_nowrite(struct inode *inode);
 void fuse_release_nowrite(struct inode *inode);
+
+/*
+ * A truncate has lowered i_size under fuse_set_nowrite().  That shrink is
+ * the authoritative one: the bytes above it are gone, and the writepage
+ * requests still standing over them are meant to be cropped away rather
+ * than kept.  Let the crop follow i_size back down.
+ *
+ * Every other shrink -- under DLM, any attribute reply that is merely
+ * behind the local writers -- must not, which is what fi->wb_crop is for.
+ * Called under fi->lock; see fuse_flush_writepages().
+ */
+static inline void fuse_writeback_crop_truncated(struct inode *inode,
+						 loff_t size)
+{
+	if (get_fuse_conn(inode)->writeback_cache && S_ISREG(inode->i_mode))
+		get_fuse_inode(inode)->wb_crop = size;
+}
 
 /**
  * Scan all fuse_mounts belonging to fc to find the first where

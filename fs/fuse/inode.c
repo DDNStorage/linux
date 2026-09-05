@@ -498,20 +498,26 @@ u32 fuse_get_cache_mask(struct inode *inode)
  * for exactly what the grant covers:
  *
  *  - size, when the server reports less than i_size and the tail it does not
- *    know about, [srv_size, i_size), is entirely under a write grant.  Taking
- *    the server's answer would shrink i_size and have truncate_pagecache()
- *    throw the unwritten tail away.
- *  - mtime and ctime, while a write grant covers unwritten data: our writes
- *    have stamped them locally and the server's stamps predate them.  Only
- *    while the cache is actually dirty, not for as long as the grant lives:
- *    a grant is held until it is revoked or the inode is evicted, and past
- *    the writeback the server's stamps are the newer ones.  Keeping ours
+ *    know about, [attr->size, i_size), is under a write grant or still
+ *    cached.  Taking the server's answer would shrink i_size, and a shrink
+ *    is destructive here in a way it is not upstream, where the writeback
+ *    cache always keeps STATX_SIZE and this never runs: truncate_pagecache()
+ *    throws the tail away dirty or not, and fuse_send_writepage() crops the
+ *    requests already queued over it, ending their writeback as if they had
+ *    been sent.  Neither reports an error, so fsync() succeeds over the
+ *    hole.  Upstream only lowers i_size under fuse_set_nowrite(), which is
+ *    what makes both safe there.
+ *  - mtime and ctime, while the page cache is dirty or under writeback: our
+ *    writes have stamped them locally and the server's stamps predate them.
+ *    Only while the cache is actually dirty, not for as long as a grant
+ *    lives: a grant is held until it is revoked or the inode is evicted, and
+ *    past the writeback the server's stamps are the newer ones.  Keeping ours
  *    beyond that would hide a remote chown or chmod indefinitely.
  *
  * A remote truncate cannot slip through.  It has to revoke the grant first,
- * and the revoke launders the tail and drops the grant, so by the time the
- * smaller size is reported neither check holds and the server's answer is
- * applied as usual.  A grant the server made but that could not be recorded
+ * and the revoke launders the tail, drops the grant and drops the folios, so
+ * by the time the smaller size is reported none of the checks hold and the
+ * server's answer is applied as usual.  A grant the server made but that could not be recorded
  * (FUSE_DLM_GRANT_UNRECORDED) is invisible to the lock tree and falls back to
  * trusting the server, as before.
  *
@@ -536,33 +542,51 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 	 * the tail grants itself while cached writes above the new size
 	 * are still waiting for writeback.
 	 */
-	if (!fuse_dlm_write_grant_exists(fi) &&
-	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) &&
-	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
-		return cache_mask;
-
 	if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
 	    mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
 		cache_mask |= STATX_MTIME | STATX_CTIME;
 
 	/*
 	 * The local size stays authoritative while the extension is
-	 * covered by a write grant, and also while anything in
-	 * [attr->size, size) is dirty or under writeback: those bytes
-	 * exist only here, and taking the server's smaller size would
-	 * truncate them away before they are ever sent.  The grant check
-	 * alone misses them, because a page-mkwrite grant is never
+	 * covered by a write grant, and also while [attr->size, size) is
+	 * cached at all: taking the server's smaller size would truncate
+	 * those folios away, and lowering i_size crops the writeback
+	 * requests already queued over them (fuse_send_writepage()), both
+	 * of which throw bytes away without reporting an error.  The grant
+	 * check alone misses them, because a page-mkwrite grant is never
 	 * recorded and a local truncate revokes its own tail grants.
+	 *
+	 * Any folio, not just a dirty one.  A reply that is merely behind
+	 * -- the server has not seen the tail yet -- always has those
+	 * folios here, but not always dirty: writeback can have cleaned
+	 * one while the reply that would move the server's size was still
+	 * on the wire, and the beyond-EOF shortcut in fuse_write_begin()
+	 * turns a short i_size into a folio zeroed over data the server
+	 * does hold.  A remote truncate is not caught by mistake: it has
+	 * to revoke first, and the revoke drops the range, so by the time
+	 * the smaller size is reported there is nothing cached there and
+	 * the shrink applies.
+	 *
+	 * All three miss a write that has committed its extension and not
+	 * yet dirtied the folio under it: nothing is cached there, and a
+	 * NOTIFY can revoke the grant in between.  With i_rwsem held
+	 * shared several writers sit in that window at once, which is why
+	 * they are counted rather than flagged.  Cheapest test first: the
+	 * grant query sleeps.
 	 */
 	if (have_size && size > (loff_t) attr->size &&
-	    (fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
-				   FUSE_PAGE_LOCK_WRITE) ||
-	     filemap_range_needs_writeback(inode->i_mapping, attr->size,
-					   size - 1)))
+	    (atomic_read(&fi->size_extenders) ||
+	     filemap_range_has_page(inode->i_mapping, attr->size, size - 1) ||
+	     fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
+				   FUSE_PAGE_LOCK_WRITE)))
 		cache_mask |= STATX_SIZE;
 
 	return cache_mask;
 }
+
+/* Defined below, next to the NOTIFY paths that are its other caller. */
+static void fuse_invalidate_mapping_range(struct inode *inode, pgoff_t start,
+					  pgoff_t end, bool may_be_dirty);
 
 static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr,
 				     struct fuse_statx *sx, u64 attr_valid,
@@ -603,6 +627,30 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 
 	oldsize = inode->i_size;
 	/*
+	 * fuse_attr_cache_mask() answered before the grant query slept, and a
+	 * write below EOF bumps neither fi->attr_version nor
+	 * fi->size_extenders: it extends nothing, so the version check cannot
+	 * drop the reply and the count cannot hold the size.  Folios can have
+	 * been dirtied in the doomed range since the answer, and
+	 * truncate_pagecache() below throws them away with no error to report
+	 * it.
+	 *
+	 * Re-test here instead, where nothing sleeps between the answer and
+	 * the truncate acting on it, and keep the local size when the range
+	 * still holds bytes the server has not seen.  A remote truncate is
+	 * unaffected: it revokes first, and the revoke launders and drops the
+	 * range, so there is nothing here to find.
+	 */
+	if (have_size && !(cache_mask & STATX_SIZE) && fc->dlm &&
+	    fc->writeback_cache && S_ISREG(inode->i_mode) &&
+	    (loff_t) attr->size < oldsize &&
+	    filemap_range_needs_writeback(inode->i_mapping, attr->size,
+					  oldsize - 1)) {
+		cache_mask |= STATX_SIZE;
+		attr->size = oldsize;
+	}
+
+	/*
 	 * In case of writeback_cache enabled, the cached writes beyond EOF
 	 * extend local i_size without keeping userspace server in sync. So,
 	 * attr->size coming from server can be stale. We cannot trust it.
@@ -627,8 +675,51 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 		bool have_mtime = !sx || (sx->mask & STATX_MTIME);
 
 		if (have_size && oldsize != attr->size) {
-			truncate_pagecache(inode, attr->size);
-			if (!fc->explicit_inval_data)
+			/*
+			 * Not under DLM.  This runs after fi->lock is
+			 * dropped and takes nothing a writer holds, so a
+			 * folio dirtied between the decision and the walk,
+			 * or during it, is discarded with no error to report
+			 * it.  A real truncate may do this because
+			 * fuse_set_nowrite() and i_rwsem hold the writers
+			 * off; an attribute reply holds off nothing.
+			 *
+			 * Keeping the folios costs nothing either way.  If
+			 * the size was wrong they are written back and the
+			 * size recovers; if it was right, the revoke that had
+			 * to precede it already dropped the range and there
+			 * is nothing here to discard.
+			 */
+			if (!(fc->dlm && fc->writeback_cache))
+				truncate_pagecache(inode, attr->size);
+			/*
+			 * A size that differs from the cached one is
+			 * upstream's evidence that another client wrote
+			 * the file, and the data cache is dropped on the
+			 * strength of it.  Under DLM that evidence is
+			 * redundant: a remote write cannot land without
+			 * revoking the grant covering it, and the revoke
+			 * invalidates the range on its way through
+			 * (fuse_reverse_inval_inode()).  Coherency is the
+			 * grant's job here, not the size delta's.
+			 *
+			 * It is also not affordable.  A shared file reaches
+			 * this on every write: another node extends it, the
+			 * GETATTR that fuse_cache_write_iter() takes for
+			 * STATX_MODE returns the larger size, and
+			 * fuse_attr_cache_mask() holds STATX_SIZE only for
+			 * the opposite direction -- a local size ahead of
+			 * the server's.  So a write that wanted the mode
+			 * bits invalidates the whole mapping, and on a
+			 * writeback mapping that is a laundering pass, not
+			 * a drop: every dirty folio in the file goes out
+			 * one FUSE_WRITE at a time, with the writer parked
+			 * behind all of it.
+			 *
+			 * The size itself is still taken below.  Only the
+			 * data cache is kept.
+			 */
+			if (!fc->explicit_inval_data && !fc->dlm)
 				inval = true;
 		} else if (have_mtime && fc->auto_inval_data) {
 			struct timespec64 new_mtime = {
@@ -644,29 +735,16 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 				inval = true;
 		}
 
-		if (inval)
-			invalidate_inode_pages2(inode->i_mapping);
-
 		/*
-		 * The DLM record has to follow the cache out, as on every
-		 * other path that drops it.  A revoked range exists only to
-		 * make writeback take the grant again before sending the
-		 * folios under it, so once they are gone it describes
-		 * nothing and would sit in the tree unfreed.  The pages above
-		 * the new size are gone unconditionally; the rest only when
-		 * the invalidate really emptied the mapping, so a folio that
-		 * survived (or was faulted back) keeps its record.
+		 * Through the helper rather than invalidate_inode_pages2():
+		 * it writes the range back in batched writeback first, where
+		 * the bare invalidate would launder it a folio per round
+		 * trip, and it substitutes a plain drop while writepages are
+		 * frozen, where laundering would wait for a reply that
+		 * fuse_flush_writepages() is holding back.
 		 */
-		if (fc->dlm && fc->writeback_cache) {
-			if (have_size && oldsize != attr->size)
-				fuse_dlm_ranges_dropped(fi,
-							PAGE_ALIGN(attr->size),
-							U64_MAX);
-			if (inval &&
-			    !filemap_range_has_page(inode->i_mapping, 0,
-						    LLONG_MAX))
-				fuse_dlm_ranges_dropped(fi, 0, U64_MAX);
-		}
+		if (inval)
+			fuse_invalidate_mapping_range(inode, 0, -1, true);
 	}
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
@@ -934,8 +1012,8 @@ static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
  * fuse_do_setattr() invalidates the mapping after releasing the freeze, the
  * O_TRUNC open path calls truncate_pagecache().
  */
-static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
-					 pgoff_t end, bool may_be_dirty)
+static void fuse_invalidate_mapping_range(struct inode *inode, pgoff_t start,
+					  pgoff_t end, bool may_be_dirty)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	loff_t last;
@@ -968,8 +1046,6 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 {
 	struct fuse_inode *fi;
 	struct inode *inode;
-	uint64_t pg_first;
-	uint64_t pg_last;
 	loff_t end_byte;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
@@ -1006,7 +1082,10 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * here must not send a DLM request.  See
 		 * fuse_writepages_fill().
 		 */
-		void *notify_ctx = fuse_notify_ctx_enter();
+		struct fuse_notify_ctx ctx;
+		struct fuse_dlm_span fence;
+		void *notify_ctx;
+		bool fenced;
 
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)
@@ -1014,17 +1093,38 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		else
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
 
-		/*
-		 * Byte bounds of the same region, and the page aligned form
-		 * the DLM record is told about.  A grant is recorded page
-		 * aligned, so the range handed to it has to cover whole
-		 * pages or the record would keep a range the page cache no
-		 * longer backs.
-		 */
+		/* Byte bounds of the same region */
 		end_byte = len <= 0 ? LLONG_MAX : offset + len - 1;
-		pg_first = (uint64_t)offset & PAGE_MASK;
-		pg_last = len <= 0 ? U64_MAX :
-			  (((uint64_t)offset + len - 1) | (PAGE_SIZE - 1));
+
+		notify_ctx = fuse_notify_ctx_enter(&ctx, offset, end_byte);
+
+		/*
+		 * Fence the writers that hold a grant over this range but
+		 * have not dirtied under it yet.  Their bytes are in no page
+		 * cache and on no wire, so nothing below can find them, and
+		 * once the grant is gone they would go out behind the
+		 * handover.  Published before the flush so what it drains is
+		 * flushed with everything else.
+		 *
+		 * Only the writers over this range: a write elsewhere in the
+		 * file holds a grant this handler does not touch, and neither
+		 * waits for the other.
+		 *
+		 * Entered after fuse_notify_ctx_enter(): the page cache work
+		 * below is this handler's own and must not fence itself.
+		 *
+		 * A fenced writer may be waiting for a FUSE_WRITE reply, so
+		 * this waits on the server the same way the flush below does.
+		 *
+		 * Regular files only: the record shares the readdir cache
+		 * union arm and exists nowhere else.  Latched into a local,
+		 * since fc->dlm can be cleared while this runs and the fence
+		 * has to come off the list either way.
+		 */
+		fenced = S_ISREG(inode->i_mode) && fc->dlm &&
+			 fc->writeback_cache;
+		if (fenced)
+			fuse_dlm_revoke_begin(fi, &fence, offset, len);
 
 		/*
 		 * A data invalidation means another (remote) entity is modifying
@@ -1095,6 +1195,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * waiting on.  do_writepages() runs in this context,
 			 * so the grant is asked for before the revoke.
 			 *
+			 * One pass is enough: the fence above has drained the
+			 * writers that held a grant without having dirtied
+			 * under it, and refuses new ones, so nothing can turn
+			 * up dirty behind this.
+			 *
 			 * Waited out here rather than left to the drop, which
 			 * launders when the range may be dirty and so waits
 			 * for these same replies.  One explicit wait, before
@@ -1102,7 +1207,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * writeback to block on.  Either way a server that
 			 * revokes from a thread it also needs to answer
 			 * FUSE_WRITE on deadlocks here, the same contract
-			 * fuse_notify_invalidate_range() states for a frozen
+			 * fuse_invalidate_mapping_range() states for a frozen
 			 * inode.  The error is left to the mapping, where
 			 * fsync collects it.
 			 */
@@ -1132,23 +1237,12 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * cached there.
 			 */
 			if (fuse_inode_force_dio(inode))
-				fuse_notify_invalidate_range(inode, 0, -1, true);
+				fuse_invalidate_mapping_range(inode, 0, -1,
+							      true);
 			else if (has_pages)
-				fuse_notify_invalidate_range(inode, pg_start,
-							     pg_end,
-							     may_be_dirty);
-
-			/*
-			 * A revoked range exists to describe page cache
-			 * dirtied before the grant went; with that cache gone
-			 * it has nothing left to say.  Only when it really
-			 * went: an invalidate can leave a busy folio behind,
-			 * and that folio still needs its record.
-			 */
-			if (has_pages &&
-			    !filemap_range_has_page(inode->i_mapping, offset,
-						    end_byte))
-				fuse_dlm_ranges_dropped(fi, pg_first, pg_last);
+				fuse_invalidate_mapping_range(inode, pg_start,
+							      pg_end,
+							      may_be_dirty);
 
 			if (latched)
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
@@ -1161,9 +1255,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 */
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
-			fuse_notify_invalidate_range(inode, pg_start, pg_end,
-						     true);
+			fuse_invalidate_mapping_range(inode, pg_start, pg_end,
+						      true);
 		}
+		if (fenced)
+			fuse_dlm_revoke_end(fi, &fence);
 		fuse_notify_ctx_leave(notify_ctx);
 	}
 	iput(inode);
