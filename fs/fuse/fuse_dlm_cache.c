@@ -918,23 +918,21 @@ void fuse_dlm_fill_end(struct fuse_inode *fi)
 	up_read(&fi->dlm_locked_areas.lock);
 }
 
-/**
- * fuse_get_dlm_lock - request a dlm lock from the fuse server
- * @file:   the file being accessed
- * @offset: byte offset into the file (need not be page-aligned)
- * @length: length of the region in bytes (need not be page-aligned)
- * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+/*
+ * Send one FUSE_DLM_WB_LOCK for [@pg_start, @pg_end] and record what it
+ * grants.  Split out of __fuse_get_dlm_lock() and kept out of line so
+ * the caller's fast path, which finds the range already covered and
+ * sends nothing, does not carry this frame: struct fuse_args alone is
+ * over a hundred bytes and would be zeroed on every lookup.
  *
- * Return: 0 when the range is covered by a recorded grant on return,
- * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
- * recording it failed (covered cluster-wide, invisible to
- * fuse_dlm_lock_is_held()), a negative error code otherwise.  Callers
- * re-validating the grant must not re-request on a nonzero return or
- * they would spin.
+ * Return: 0 when the grant is recorded, -EAGAIN to ask again,
+ * FUSE_DLM_GRANT_UNRECORDED when the server granted but recording
+ * failed, a negative error otherwise.
  */
-static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
-			       loff_t offset, size_t length,
-			       enum fuse_page_lock_mode mode)
+static noinline int fuse_dlm_send_lock(struct fuse_file *ff,
+				       struct inode *inode, uint64_t pg_start,
+				       uint64_t pg_end,
+				       enum fuse_page_lock_mode mode)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -944,37 +942,8 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
 	struct fuse_dlm_range req;
-	uint64_t pg_start, pg_end;
 	uint64_t grant_start, grant_end;
 	int err;
-
-	/* An empty range needs no lock. */
-	if (!length)
-		return 0;
-
-	/*
-	 * note that the offset and length don't have to be page aligned
-	 * here but since we only get here on writeback caching we will
-	 * send out page aligned requests
-	 */
-	pg_start = (uint64_t)offset & PAGE_MASK;
-	pg_end = ((uint64_t)offset + length - 1) | (PAGE_SIZE - 1);
-
-restart:
-	/* note that this can be run from different processes
-	 * at the same time. It is intentionally not protected
-	 * since a DLM implementation in the FUSE server should take care
-	 * of any races in lock requests.
-	 * The early exit uses the same helper the callers re-validate
-	 * with, so this check and a later fuse_dlm_lock_is_held() can
-	 * never disagree about what counts as covered. */
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
-		/*
-		 * Already covered, and the record says nothing beyond that,
-		 * so this is one shared acquisition end to end.
-		 */
-		return 0;
-	}
 
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outarg, 0, sizeof(outarg));
@@ -1013,15 +982,15 @@ restart:
 		 * error, so ask again instead of reporting it.
 		 */
 		if (err == -EDEADLK || err == -EAGAIN)
-			goto retry;
+			return -EAGAIN;
 		return err;
 	}
 
-	if (inarg.start < outarg.start || inarg.end > outarg.end) {
+	if (pg_start < outarg.start || pg_end > outarg.end) {
 		/* fuse server is seriously broken */
 		fuse_dlm_request_abort(fi, &req);
 		pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",
-			inarg.start, inarg.end, outarg.start, outarg.end);
+			pg_start, pg_end, outarg.start, outarg.end);
 		fuse_abort_conn(fc);
 		return -EIO;
 	}
@@ -1056,17 +1025,15 @@ restart:
 	/* A last-byte offset, so it is the successor that aligns */
 	grant_end -= (grant_end + 1) & (PAGE_SIZE - 1);
 
-	/* Retire the request and record the grant */
+	/*
+	 * Retire the request and record the grant.  -EAGAIN here is a
+	 * revoke overlapping the range while it was in flight, so the
+	 * grant is dead and the caller asks again: no one else holds the
+	 * range, and the write path turns an error into a failed write.
+	 */
 	err = fuse_dlm_request_commit(fi, &req, grant_start, grant_end, mode);
-	if (err == -EAGAIN) {
-		/*
-		 * A revoke overlapping this range was processed while the
-		 * request was in flight, so the grant is dead.  Retry
-		 * rather than fail: no one else holds the range, and the
-		 * write path turns an error into a failed write.
-		 */
-		goto retry;
-	}
+	if (err == -EAGAIN)
+		return -EAGAIN;
 
 	/*
 	 * A failure to record (small-allocation -ENOMEM) does not undo
@@ -1080,25 +1047,81 @@ restart:
 		return FUSE_DLM_GRANT_UNRECORDED;
 
 	return 0;
+}
 
-retry:
+/**
+ * fuse_get_dlm_lock - request a dlm lock from the fuse server
+ * @file:   the file being accessed
+ * @offset: byte offset into the file (need not be page-aligned)
+ * @length: length of the region in bytes (need not be page-aligned)
+ * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ *
+ * Return: 0 when the range is covered by a recorded grant on return,
+ * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
+ * recording it failed (covered cluster-wide, invisible to
+ * fuse_dlm_lock_is_held()), a negative error code otherwise.  Callers
+ * re-validating the grant must not re-request on a nonzero return or
+ * they would spin.
+ *
+ * The common case sends nothing: the range is already covered and this
+ * is the lookup and nothing else.
+ */
+static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
+			       loff_t offset, size_t length,
+			       enum fuse_page_lock_mode mode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	uint64_t pg_start, pg_end;
+	int err;
+
+	/* An empty range needs no lock. */
+	if (!length)
+		return 0;
+
 	/*
-	 * Ask again, for as long as it takes.  Every pass is a whole round
-	 * trip, so a range being taken away as fast as it is given paces
-	 * this loop rather than spinning it, and no caller holds a folio
-	 * while a request is out: writeback confirms its grant under a pin
-	 * and so never reaches the request below, and ->readahead asks for
-	 * nothing.
-	 *
-	 * A count would turn a contended range into an IO error, which the
-	 * callers cannot tell from a real one and which a write reports to
-	 * a caller that has no reason to expect it.  Waiting out the
-	 * notifications that caused it is the better answer.  A fatal
-	 * signal still ends it, so a killed task and close() get out.
+	 * note that the offset and length don't have to be page aligned
+	 * here but since we only get here on writeback caching we will
+	 * send out page aligned requests
 	 */
-	if (fatal_signal_pending(current))
-		return -EINTR;
-	goto restart;
+	pg_start = (uint64_t)offset & PAGE_MASK;
+	pg_end = ((uint64_t)offset + length - 1) | (PAGE_SIZE - 1);
+
+	for (;;) {
+		/*
+		 * note that this can be run from different processes
+		 * at the same time. It is intentionally not protected
+		 * since a DLM implementation in the FUSE server should take
+		 * care of any races in lock requests.
+		 * The early exit uses the same helper the callers
+		 * re-validate with, so this check and a later
+		 * fuse_dlm_lock_is_held() can never disagree about what
+		 * counts as covered.
+		 */
+		if (fuse_dlm_lock_is_held(fi, offset, length, mode))
+			return 0;
+
+		err = fuse_dlm_send_lock(ff, inode, pg_start, pg_end, mode);
+		if (err != -EAGAIN)
+			return err;
+
+		/*
+		 * Ask again, for as long as it takes.  Every pass is a whole
+		 * round trip, so a range being taken away as fast as it is
+		 * given paces this loop rather than spinning it, and no
+		 * caller holds a folio while a request is out: writeback
+		 * confirms its grant under a pin and so never reaches the
+		 * request above, and ->readahead asks for nothing.
+		 *
+		 * A count would turn a contended range into an IO error,
+		 * which the callers cannot tell from a real one and which a
+		 * write reports to a caller that has no reason to expect it.
+		 * Waiting the notifications out is the better answer.  A
+		 * fatal signal still ends it, so a killed task and close()
+		 * get out.
+		 */
+		if (fatal_signal_pending(current))
+			return -EINTR;
+	}
 }
 
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
