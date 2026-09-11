@@ -622,12 +622,42 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	u32 cache_mask;
 	loff_t oldsize;
+	loff_t unsent_size = 0;
 	struct timespec64 old_mtime;
 	bool have_size = !sx || (sx->mask & STATX_SIZE);
 	bool have_mtime = !sx || (sx->mask & STATX_MTIME);
 	bool have_ctime = !sx || (sx->mask & STATX_CTIME);
+	bool unsent = false;
 
 	cache_mask = fuse_attr_cache_mask(inode, attr, have_size);
+
+	/*
+	 * fuse_attr_cache_mask() answered before the grant query slept, and a
+	 * write below EOF bumps neither fi->attr_version nor
+	 * fi->size_extenders: it extends nothing, so the version check cannot
+	 * drop the reply and the count cannot hold the size.  Folios can have
+	 * been dirtied in the doomed range since the answer, and
+	 * truncate_pagecache() below throws them away with no error to report
+	 * it.
+	 *
+	 * Ask again here, after everything that sleeps, and keep the local
+	 * size when the range still holds bytes the server has not seen.  A
+	 * remote truncate is unaffected: it revokes first, and the revoke
+	 * launders and drops the range, so there is nothing here to find.
+	 *
+	 * Outside fi->lock, which excludes nothing this asks about: a folio is
+	 * dirtied without it, so holding it would not make the answer any more
+	 * current, only the walk longer.  What the answer is tied to is the
+	 * i_size it was bounded by, which the decision below insists on.
+	 */
+	if (have_size && !(cache_mask & STATX_SIZE) && fc->dlm &&
+	    fc->writeback_cache && S_ISREG(inode->i_mode)) {
+		unsent_size = i_size_read(inode);
+		unsent = (loff_t) attr->size < unsent_size &&
+			 filemap_range_needs_writeback(inode->i_mapping,
+						       attr->size,
+						       unsent_size - 1);
+	}
 
 	spin_lock(&fi->lock);
 
@@ -668,26 +698,8 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 				      evict_ctr);
 
 	oldsize = inode->i_size;
-	/*
-	 * fuse_attr_cache_mask() answered before the grant query slept, and a
-	 * write below EOF bumps neither fi->attr_version nor
-	 * fi->size_extenders: it extends nothing, so the version check cannot
-	 * drop the reply and the count cannot hold the size.  Folios can have
-	 * been dirtied in the doomed range since the answer, and
-	 * truncate_pagecache() below throws them away with no error to report
-	 * it.
-	 *
-	 * Re-test here instead, where nothing sleeps between the answer and
-	 * the truncate acting on it, and keep the local size when the range
-	 * still holds bytes the server has not seen.  A remote truncate is
-	 * unaffected: it revokes first, and the revoke launders and drops the
-	 * range, so there is nothing here to find.
-	 */
-	if (have_size && !(cache_mask & STATX_SIZE) && fc->dlm &&
-	    fc->writeback_cache && S_ISREG(inode->i_mode) &&
-	    (loff_t) attr->size < oldsize &&
-	    filemap_range_needs_writeback(inode->i_mapping, attr->size,
-					  oldsize - 1)) {
+	/* Only the range the walk above covered, or it answered for another */
+	if (unsent && oldsize == unsent_size) {
 		cache_mask |= STATX_SIZE;
 		attr->size = oldsize;
 	}
