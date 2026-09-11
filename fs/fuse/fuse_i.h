@@ -32,7 +32,70 @@
 #include <linux/pid_namespace.h>
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
+#include <linux/sched.h>
 #include "fuse_dlm_cache.h"
+
+/*
+ * Page cache work driven by a NOTIFY invalidate is marked on the task.
+ *
+ * Writeback reached from there must not ask the server for a grant: the
+ * range is the one the server is revoking, and the request would go out
+ * from inside the handler the server is waiting on, with the folio locked
+ * and under writeback.  See fuse_reverse_inval_inode() and
+ * fuse_iomap_writeback_range().
+ */
+extern const char fuse_notify_ctx_key[];
+
+/*
+ * What a task driving page cache work for a NOTIFY invalidate carries.
+ *
+ * @key tells it apart from anything else parked in journal_info.  The range
+ * is the one being revoked: the lock over it is still this client's until
+ * the handler returns, so writeback of it need not ask for a grant, while
+ * anything outside it must.
+ */
+struct fuse_notify_ctx {
+	const char	*key;
+	loff_t		start;
+	loff_t		end;		/* inclusive; LLONG_MAX to EOF */
+};
+
+static inline void *fuse_notify_ctx_enter(struct fuse_notify_ctx *ctx,
+					  loff_t start, loff_t end)
+{
+	void *old = current->journal_info;
+
+	ctx->key = fuse_notify_ctx_key;
+	ctx->start = start;
+	ctx->end = end;
+	current->journal_info = ctx;
+	return old;
+}
+
+static inline void fuse_notify_ctx_leave(void *old)
+{
+	current->journal_info = old;
+}
+
+static inline struct fuse_notify_ctx *fuse_notify_ctx(void)
+{
+	struct fuse_notify_ctx *ctx = current->journal_info;
+
+	return (ctx && ctx->key == fuse_notify_ctx_key) ? ctx : NULL;
+}
+
+static inline bool fuse_in_notify_ctx(void)
+{
+	return fuse_notify_ctx();
+}
+
+/* Is [@pos, @pos + @len) the range the revoke in progress is taking away? */
+static inline bool fuse_in_notify_range(loff_t pos, unsigned int len)
+{
+	struct fuse_notify_ctx *ctx = fuse_notify_ctx();
+
+	return ctx && pos >= ctx->start && pos + len - 1 <= ctx->end;
+}
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
@@ -131,15 +194,47 @@ struct dlm_locked_area
  * Force-DIO switch trigger: an exponentially weighted moving average of the
  * interval (in jiffies) between FUSE_NOTIFY_INVAL_INODE data invalidations for
  * a file.  When the average spacing falls below FUSE_NOTIFY_DIO_INTERVAL -- a
- * remote writer streaming invalidations -- and the file is open for writing
- * here, it is latched into direct IO.  These are the source-level (not
- * externally tunable) parameters of the heuristic: EWMA weight 1/2^SHIFT,
- * seeded and capped at SEED so it takes a short burst rather than a single
- * notify to trip.
+ * remote writer streaming invalidations -- and the file is open here, it is
+ * latched into direct IO.  These are the source-level (not externally tunable)
+ * parameters of the heuristic: EWMA weight 1/2^SHIFT, seeded and capped at SEED
+ * so it takes a short burst rather than a single notify to trip.
+ *
+ * The average is folded on arrival and cannot age on its own, so what takes the
+ * latch off again is the last invalidation reaching FUSE_NOTIFY_DIO_COLD old.
  */
 #define FUSE_NOTIFY_DIO_INTERVAL	max_t(unsigned long, HZ / 10, 1)
 #define FUSE_NOTIFY_EWMA_SHIFT		2
 #define FUSE_NOTIFY_EWMA_SEED		(2 * FUSE_NOTIFY_DIO_INTERVAL)
+#define FUSE_NOTIFY_DIO_COLD		(8 * FUSE_NOTIFY_DIO_INTERVAL)
+
+/*
+ * Streamed file trigger: the same buffer size arriving over and over is a
+ * task working through a file a record at a time.  The sizes are folded
+ * into an exponentially weighted moving average (weight 1/2^SHIFT, kept
+ * shifted), and a run of FUSE_STREAM_RUN requests within
+ * 1/2^FUSE_STREAM_TOL_SHIFT of it says the task is still on it.  The sample
+ * is capped to keep the shifted accumulator inside an unsigned int.
+ */
+#define FUSE_STREAM_EWMA_SHIFT		2
+#define FUSE_STREAM_TOL_SHIFT		3
+#define FUSE_STREAM_RUN			4
+#define FUSE_STREAM_EWMA_MAX		(UINT_MAX >> FUSE_STREAM_EWMA_SHIFT)
+
+/* Under this size the copy through the page cache is not worth avoiding */
+#define FUSE_WRITE_STREAM_MIN		(64 * 1024)
+#define FUSE_READ_STREAM_MIN		(10 * PAGE_SIZE)
+
+/*
+ * A write(2) extent held against the other writers of the same inode.
+ * Caller storage, live from fuse_write_range_lock() until the matching
+ * unlock.
+ */
+struct fuse_write_range {
+	/* Byte offsets, both inclusive */
+	loff_t			start;
+	loff_t			end;
+	struct list_head	list;
+};
 
 /** FUSE inode */
 struct fuse_inode {
@@ -158,6 +253,15 @@ struct fuse_inode {
 
 	/** Time in jiffies until the file attributes are valid */
 	u64 i_time;
+
+	/*
+	 * Time in jiffies until mode/uid/gid (the permission-check subset of
+	 * STATX_BASIC_STATS) are valid. Tracked separately from i_time so that
+	 * a partial statx refresh covering only the perm bits can extend the
+	 * permission-check cache without falsely advancing i_time for the
+	 * other (un-refreshed) attributes.
+	 */
+	u64 i_perm_time;
 
 	/* Which attributes are invalid */
 	u32 inval_mask;
@@ -201,46 +305,75 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Server-materialized size: an upper bound for how far
-			 * the server holds file data.  Seeded from
-			 * server-reported attributes, advanced when the server
-			 * acknowledges data (writeback completion,
-			 * fuse_write_update_attr()), lowered again on
-			 * truncate.  A read-modify-write of a block starting
-			 * at or past this bound needs no READ request under a
-			 * held DLM write lock: the server has no data there
-			 * (see fuse_iomap_read_folio_range()).  Protected by
-			 * fi->lock.
-			 */
-			loff_t server_size;
-
-			/*
-			 * Serializes buffered-write page-cache dirtying against
-			 * the forced-direct-IO latch transition driven by
-			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
-			 * may be delivered by the same server thread that still
-			 * owes a reply to an in-flight write holding the inode
-			 * lock.  The buffered writer holds this for read around
-			 * the dirtying and re-checks the latch under it; the
-			 * NOTIFY latch site takes it for write (trylock, never
-			 * blocking) around its page-cache invalidate + latch set.
-			 * Only regular files initialise it -- it shares storage
-			 * with the readdir-cache union arm.
-			 */
-			struct percpu_rw_semaphore *wb_inval_rwsem;
-
-			/*
 			 * Rate of FUSE_NOTIFY_INVAL_INODE data invalidations
 			 * for this whole file: notify_stamp is the jiffies of
 			 * the last one, notify_interval_ewma the EWMA of the
 			 * inter-arrival interval (jiffies, scaled by
 			 * 2^FUSE_NOTIFY_EWMA_SHIFT).  A rapid stream (short
-			 * average interval) with a local writer latches the
-			 * inode into direct IO.  Protected by fi->lock; regular
-			 * files only (shares the readdir-cache union arm).
+			 * average interval) with the file open here latches
+			 * the inode into direct IO, and notify_stamp going
+			 * stale takes it out again.  Protected by fi->lock;
+			 * regular files only (shares the readdir-cache union
+			 * arm).
 			 */
 			unsigned long notify_stamp;
 			unsigned int notify_interval_ewma;
+
+			/*
+			 * Buffered writes that have claimed an i_size
+			 * extension and not yet dirtied it.
+			 *
+			 * The DLM path holds i_rwsem shared, so several
+			 * writers extend i_size at once and each one is
+			 * ahead of the server until its bytes are sent.
+			 * While this is non zero the local size wins over
+			 * the server's; see fuse_attr_cache_mask().
+			 * FUSE_I_SIZE_UNSTABLE cannot serve: it is one bit
+			 * and every writer clears it.
+			 */
+			atomic_t size_extenders;
+
+			/*
+			 * The buffered writes in flight over this inode,
+			 * one entry per write(2) over the bytes it covers.
+			 * A write waits for the overlapping entries
+			 * published before its own, so two writers on the
+			 * same bytes do not interleave a folio at a time.
+			 *
+			 * Node local.  The DLM grant over those bytes is
+			 * held by the node rather than by a task: it orders
+			 * this client against the rest of the cluster and
+			 * says nothing about the writers on it.  Nothing in
+			 * the revoke path takes this, so a revoke never
+			 * waits behind a write.
+			 */
+			spinlock_t wr_lock;
+			struct list_head wr_ranges;
+			wait_queue_head_t wr_wq;
+
+			/*
+			 * The buffered writes of this inode, whatever
+			 * handle they come through: write_size_ewma is the
+			 * moving average of their sizes and
+			 * write_stream_run how many of the last ones came
+			 * in at that size, which together say the file is
+			 * being streamed; write_stream_next is where the
+			 * next write has to land to carry the run of
+			 * positions on, and write_stream_start the first
+			 * byte of that run no writeback kick has covered.
+			 * read_size_ewma and read_stream_run are the same
+			 * average over the reads that could be cached, kept
+			 * apart so a write phase and a read phase over one
+			 * file do not fold into each other.
+			 * Hints only, read and written without a lock; see
+			 * fuse_stream_update().
+			 */
+			unsigned int write_size_ewma;
+			unsigned int write_stream_run;
+			loff_t write_stream_next;
+			loff_t write_stream_start;
+			unsigned int read_size_ewma;
+			unsigned int read_stream_run;
 		};
 
 		/* readdir cache (directory only) */
@@ -321,10 +454,16 @@ enum {
 	 * Latched into direct IO: a NOTIFY_INVAL_INODE arrived while the file
 	 * was open for writing here, so another (remote) entity is modifying it
 	 * concurrently.  Reads and writes are routed direct (shared-lock
-	 * parallel dio) until the last writer closes or the inode is mmapped.
-	 * See fuse_reverse_inval_inode()/fuse_file_io_open().
+	 * parallel dio) until the notifies stop, the last writer closes, or the
+	 * inode is mmapped.  See fuse_reverse_inval_inode()/fuse_file_io_open().
 	 */
 	FUSE_I_FORCE_DIO,
+	/*
+	 * The page cache has been emptied under that latch, so no cached write
+	 * from before it can still be in flight.  Set once per latch by
+	 * fuse_force_dio_drain(), cleared wherever FUSE_I_FORCE_DIO is.
+	 */
+	FUSE_I_FORCE_DIO_DRAINED,
 };
 
 struct fuse_conn;
@@ -561,6 +700,8 @@ struct fuse_req {
 #ifdef CONFIG_FUSE_IO_URING
 	void *ring_entry;
 	void *ring_queue;
+	/** Defers fuse_request_end() to the ring task's task work */
+	struct callback_head ring_end_work;
 #endif
 	/** When (in jiffies) the request was created */
 	unsigned long create_time;
@@ -714,17 +855,6 @@ struct fuse_sync_bucket {
 	atomic_t count;
 	wait_queue_head_t waitq;
 	struct rcu_head rcu;
-};
-
-/**
- * DLM retry tracking for iomap write deadlock workaround.
- *
- * Temporary workaround until mainline iomap gains AOP_TRUNCATED_PAGE
- * retry support. Tracks tasks that need to retry write operations due
- * to DLM lock contention (-EAGAIN from FUSE server).
- */
-struct fuse_dlm_retry {
-	bool retry_needed;
 };
 
 /**
@@ -1014,6 +1144,9 @@ struct fuse_conn {
 	/* do we have support for dlm in the fs? */
 	unsigned int dlm:1;
 
+	/* Is extended lookup implemented by fs? */
+	unsigned int lookupx:1;
+
 	/** Passthrough support for read/write IO */
 	unsigned int passthrough:1;
 
@@ -1028,7 +1161,6 @@ struct fuse_conn {
 
 	/* Use io_uring for communication */
 	unsigned int io_uring;
-
 
 	/* Does the filesystem support compound operations? */
 	unsigned int compound_open_getattr:1;
@@ -1107,12 +1239,8 @@ struct fuse_conn {
 		unsigned int req_timeout;
 	} timeout;
 
-	/**
-	 * XArray tracking tasks that need DLM retry.
-	 * Maps task pointer -> struct fuse_dlm_retry.
-	 * Temporary workaround for iomap write deadlock.
-	 */
-	struct xarray dlm_retry_tasks;
+	/* The foffset alignment in PAGE */
+	unsigned int alignment_pages;
 };
 
 /*
@@ -1282,6 +1410,15 @@ struct fuse_io_args {
 		struct {
 			struct fuse_read_in in;
 			u64 attr_ver;
+			/*
+			 * The grant the folios are filled under, held
+			 * from the request until the reply has filled
+			 * them; see fuse_send_readpages().  @dlm_fi is
+			 * the inode to drop it on, and NULL when there
+			 * is no pin to drop.
+			 */
+			struct fuse_dlm_span dlm_pin;
+			struct fuse_inode *dlm_fi;
 		} read;
 		struct {
 			struct fuse_write_in in;
@@ -1596,6 +1733,9 @@ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
 
 /** CUSE pass fuse_direct_io() a file which f_mapping->host is not from FUSE */
 #define FUSE_DIO_CUSE  (1 << 1)
+
+/** Caller holds i_rwsem shared, so fuse_set_nowrite() must not be used */
+#define FUSE_DIO_SHARED (1 << 2)
 
 ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		       loff_t *ppos, int flags);

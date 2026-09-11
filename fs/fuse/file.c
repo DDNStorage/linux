@@ -16,6 +16,7 @@
 #include <linux/sched/signal.h>
 #include <linux/module.h>
 #include <linux/swap.h>
+#include <linux/fadvise.h>
 #include <linux/falloc.h>
 #include <linux/uio.h>
 #include <linux/fs.h>
@@ -70,6 +71,17 @@ static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
 	inarg.flags = open_flags & ~(O_CREAT | O_EXCL | O_NOCTTY);
 	if (!fm->fc->atomic_o_trunc)
 		inarg.flags &= ~O_TRUNC;
+
+	/*
+	 * With the writeback cache the kernel owns append positioning:
+	 * writeback sends FUSE_WRITE with explicit offsets, and a server
+	 * that opens its backing file O_APPEND has pwrite(2) ignore them
+	 * (Linux appends regardless of offset).  Any re-sent or reordered
+	 * run is then placed at EOF: duplicated data and a growing file.
+	 * Do not hand the flag to the server at all.
+	 */
+	if (fm->fc->writeback_cache)
+		inarg.flags &= ~O_APPEND;
 
 	if (fm->fc->handle_killpriv_v2 &&
 	    (inarg.flags & O_TRUNC) && !capable(CAP_FSETID)) {
@@ -176,6 +188,10 @@ static int fuse_compound_open_getattr(struct fuse_mount *fm, u64 nodeid,
 	if (!fm->fc->atomic_o_trunc)
 		open_in.flags &= ~O_TRUNC;
 
+	/* The kernel owns append positioning; see fuse_send_open() */
+	if (fm->fc->writeback_cache)
+		open_in.flags &= ~O_APPEND;
+
 	if (fm->fc->handle_killpriv_v2 &&
 	    (open_in.flags & O_TRUNC) && !capable(CAP_FSETID))
 		open_in.open_flags |= FUSE_OPEN_KILL_SUIDGID;
@@ -251,19 +267,19 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 							 &attr_outarg, outargp);
 			if (err == -ENOSYS)
 				fc->compound_open_getattr = 0;
-                        if (!err)
+			if (!err)
 				fuse_change_attributes(inode, &attr_outarg.attr,
-					NULL,
-					ATTR_TIMEOUT(&attr_outarg),
-					fuse_get_attr_version(fc));
-                }
-                if (err == -ENOSYS) {
+						       NULL,
+						       ATTR_TIMEOUT(&attr_outarg),
+						       fuse_get_attr_version(fc));
+		}
+		if (err == -ENOSYS) {
 			err = fuse_send_open(fm, nodeid, open_flags, opcode, outargp);
-                        if (!err) {
+			if (!err) {
 				ff->fh = outargp->fh;
 				ff->open_flags = outargp->open_flags;
-                        }
-                }
+			}
+		}
 
 		if (err) {
 			if (err != -ENOSYS) {
@@ -346,7 +362,6 @@ static void fuse_truncate_update_attr(struct inode *inode, struct file *file)
 
 	spin_lock(&fi->lock);
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
-	fi->server_size = 0;
 	i_size_write(inode, 0);
 	spin_unlock(&fi->lock);
 	file_update_time(file);
@@ -397,10 +412,26 @@ static int fuse_open(struct inode *inode, struct file *file)
 	if (is_wb_truncate || dax_truncate)
 		fuse_release_nowrite(inode);
 	if (!err) {
-		if (is_truncate)
+		if (is_truncate) {
+			/*
+			 * Every grant goes with the cache, as on the
+			 * fuse_do_setattr() O_TRUNC path: a record left
+			 * behind would keep naming bytes the folios no
+			 * longer hold.  i_rwsem is held exclusive
+			 * (is_wb_truncate), so no cached write is mid-record.
+			 */
+			if (fc->dlm && fc->writeback_cache)
+				fuse_dlm_cache_release_locks(fi);
 			truncate_pagecache(inode, 0);
-		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE)) {
+			/*
+			 * Write back first: the drop launders whatever it
+			 * finds dirty a folio at a time, a FUSE_WRITE per
+			 * page, where writeback batches the same bytes.
+			 */
+			filemap_write_and_wait(inode->i_mapping);
 			invalidate_inode_pages2(inode->i_mapping);
+		}
 	}
 	if (dax_truncate)
 		filemap_invalidate_unlock(inode->i_mapping);
@@ -422,17 +453,23 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 
 	/* Inode is NULL on error path of fuse_create_open() */
 	if (likely(fi)) {
+		bool writer;
+
 		spin_lock(&fi->lock);
+		writer = !list_empty(&ff->write_entry);
 		list_del(&ff->write_entry);
 		/*
 		 * Leave forced direct IO mode once the last writer is gone: with
 		 * no local writer left there is no cached-write contention with
 		 * the remote modifier that triggered the switch.  Restore
-		 * FUSE_I_CACHE_IO_MODE for any frozen cached opens.
+		 * FUSE_I_CACHE_IO_MODE for any frozen cached opens.  A reader
+		 * closing ends nothing: an inode latched with no writer at all
+		 * leaves on the cold check in fuse_force_dio_active().
 		 */
-		if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
+		if (writer && test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
 		    list_empty(&fi->write_files)) {
 			clear_bit(FUSE_I_FORCE_DIO, &fi->state);
+			clear_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
 			if (fi->iocachectr > 0)
 				set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		}
@@ -468,6 +505,27 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	ra->inode = sync ? NULL : igrab(&fi->inode);
 }
 
+/*
+ * Drop the page cache of an inode leaving the forced direct IO latch.
+ *
+ * Anything still dirty here is what a write racing the latch left behind, since
+ * the drain empties the mapping and nothing dirties it while it is on.  Send
+ * that with writeback rather than leave it to the drop: invalidate_inode_pages2()
+ * launders a folio at a time, a FUSE_WRITE per page for bytes writeback batches
+ * into max_write requests.  Errors stay on the mapping for fsync to collect.
+ *
+ * The usual case is an empty or clean mapping, where both calls are a load and
+ * the drop finds nothing to write.
+ */
+static void fuse_force_dio_drop(struct address_space *mapping)
+{
+	if (filemap_range_needs_writeback(mapping, 0, LLONG_MAX)) {
+		filemap_fdatawrite(mapping);
+		filemap_fdatawait_keep_errors(mapping);
+	}
+	invalidate_inode_pages2(mapping);
+}
+
 void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir)
 {
@@ -482,15 +540,14 @@ void fuse_file_release(struct inode *inode, struct fuse_file *ff,
 	 * If this release dropped the last writer, fuse_prepare_release()
 	 * cleared the forced-direct-IO latch (under fi->lock).  Drop any clean
 	 * folios a read racing the latch may have repopulated so they cannot be
-	 * served stale once caching mode resumes.  No inode lock or
-	 * wb_inval_rwsem: release may run on the fuse server thread (async fput
+	 * served stale once caching mode resumes.  No inode lock: release may
+	 * run on the fuse server thread (async fput
 	 * from aio completion), where blocking on a contended inode lock could
-	 * stall the connection.  Writes were routed direct while latched, so
-	 * only clean folios exist and this invalidate is server-free; the last
-	 * writer is gone, so no forced-dio writer can race the drop.
+	 * stall the connection.  The last writer is gone, so no forced-dio writer
+	 * can race the drop.
 	 */
 	if (was_force_dio && !test_bit(FUSE_I_FORCE_DIO, &fi->state))
-		invalidate_inode_pages2(inode->i_mapping);
+		fuse_force_dio_drop(inode->i_mapping);
 
 	if (ra && ff->flock) {
 		ra->inarg.release_flags |= FUSE_RELEASE_FLOCK_UNLOCK;
@@ -673,6 +730,16 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 
 	if (fuse_is_bad(inode))
 		return -EIO;
+
+	/*
+	 * Get the sending out of the way before the lock.  It is the long
+	 * part: a pass takes back every grant it finds gone, a cluster round
+	 * trip each, and cached writers hold i_rwsem shared
+	 * (fuse_cache_wr_exclusive_lock()) and would all wait behind it.
+	 * Errors are left to the pass below, which collects them from the
+	 * mapping.
+	 */
+	filemap_fdatawrite_range(file->f_mapping, start, end);
 
 	inode_lock(inode);
 
@@ -1020,6 +1087,107 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	return 0;
 }
 
+/**
+ * fuse_read_folio_range - read part of a folio from the server
+ * @file: file to read through
+ * @folio: the folio to fill
+ * @off: offset within @folio to start at
+ * @len: bytes to read
+ *
+ * fuse_do_readfolio() cannot serve a partial folio: it asks for
+ * page_zeroing, and fuse_copy_folio() answers that by zeroing the whole
+ * folio whenever the request covers less than all of it.  Ask without it
+ * and zero exactly what the reply left short, which is the server saying
+ * the file ends there.
+ *
+ * Return: 0, AOP_TRUNCATED_PAGE, or a negative error.
+ */
+static int fuse_read_folio_range(struct file *file, struct folio *folio,
+				 size_t off, size_t len)
+{
+	struct inode *inode = folio->mapping->host;
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	loff_t pos = folio_pos(folio) + off;
+	struct fuse_folio_desc desc = {
+		.offset = off,
+		.length = len,
+	};
+	struct fuse_io_args ia = {
+		.ap.args.out_pages = true,
+		.ap.num_folios = 1,
+		.ap.folios = &folio,
+		.ap.descs = &desc,
+	};
+	ssize_t res;
+
+	/* Don't overflow end offset */
+	if (pos + (desc.length - 1) == LLONG_MAX)
+		desc.length--;
+
+	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
+	res = fuse_simple_request(fm, &ia.ap.args);
+	if (res < 0) {
+		/* See fuse_do_readfolio() for why READ can return -EDEADLK */
+		if ((res == -EDEADLK || res == -EAGAIN) && fm->fc->dlm)
+			res = AOP_TRUNCATED_PAGE;
+		return res;
+	}
+
+	if (res < desc.length)
+		folio_zero_range(folio, off + res, desc.length - res);
+
+	return 0;
+}
+
+/**
+ * fuse_read_folio_merge - fill @folio without disturbing what it holds
+ * @file: file to read through
+ * @folio: the folio to fill
+ *
+ * iomap tracks a folio a block at a time, and a write that covered some
+ * of its blocks and not others leaves it valid in the ones it covered
+ * and not in the rest.  The valid ones hold what that write put there,
+ * which writeback may not have sent yet; reading over them would lose
+ * it.  Fetch the rest, in as few requests as the gaps allow.
+ *
+ * A folio the page cache tracks in one piece has no per block state to
+ * ask, and none to have: it is dirty only if a write covered it whole,
+ * and then it is valid and never reaches here.
+ *
+ * Return: 0, AOP_TRUNCATED_PAGE, or a negative error.
+ */
+static int fuse_read_folio_merge(struct file *file, struct folio *folio)
+{
+	size_t bsize = i_blocksize(folio->mapping->host);
+	size_t size = folio_size(folio);
+	size_t off = 0;
+
+	while (off < size) {
+		size_t run = 0;
+		int err;
+
+		/* Skip what the folio already holds */
+		while (off < size &&
+		       iomap_is_partially_uptodate(folio, off, bsize))
+			off += bsize;
+
+		/* Take the gap behind it in one request */
+		while (off + run < size &&
+		       !iomap_is_partially_uptodate(folio, off + run, bsize))
+			run += bsize;
+
+		if (!run)
+			break;
+
+		err = fuse_read_folio_range(file, folio, off, run);
+		if (err)
+			return err;
+		off += run;
+	}
+
+	return 0;
+}
+
 static int fuse_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 			    unsigned int flags, struct iomap *iomap,
 			    struct iomap *srcmap)
@@ -1047,8 +1215,8 @@ struct fuse_fill_read_data {
 static bool fuse_folios_need_send(struct fuse_conn *fc, loff_t pos,
 				  unsigned len, struct fuse_args_pages *ap,
 				  unsigned cur_bytes, bool write);
-static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
-				unsigned int count, bool async);
+static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
+			       unsigned int count, bool async);
 
 static int fuse_handle_readahead(struct folio *folio,
 				 struct readahead_control *rac,
@@ -1135,9 +1303,129 @@ static const struct iomap_read_ops fuse_iomap_read_ops = {
 	.submit_read = fuse_iomap_read_submit,
 };
 
+/**
+ * fuse_read_grant - take the grant a page cache fill runs under
+ * @file: file to read through
+ * @pos: byte offset the read starts at
+ * @count: bytes the read asks for
+ *
+ * ->read_folio and ->readahead are entered with the folios they fill
+ * already locked, and no grant may be asked for under a page lock
+ * (Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt).
+ * A read asks here, before anything is locked, and the fill paths only
+ * confirm what this took.
+ *
+ * Readahead fills past the end of the read, so ask for what it will fill
+ * as well, bounded by the file since readahead stops there.  A run of
+ * folios no grant covers is given back unfilled and fetched one folio at
+ * a time, so what is asked for here is what readahead is worth.
+ *
+ * That is two windows, not one.  A read landing on the marker of the
+ * current window [s, s + W) has the next one, [s + W, s + 2W), submitted
+ * on its behalf (page_cache_async_ra()), and with a grant of one window
+ * past the read that next window ends up to W - count beyond the grant.
+ * With a server that grants exactly what is asked, nearly all of it was
+ * declined and refetched a folio at a time: 29024 of 32768 pages of a
+ * 32k-record stream, at 85 MiB/s against 2 GB/s.
+ *
+ * And what is needed is not what is asked for.  The need moves with
+ * every read, so a grant sized to it is never wide enough for the next
+ * read and a server that grants exactly is asked once per read(2): 4096
+ * round trips for 128 MiB of 32k records, at 500 MiB/s.  Ask only when
+ * the need is not already held, and then for two windows more than it,
+ * so the grant carries the reads across them before the next request.
+ * A server that grants wider is asked no more often than before.
+ *
+ * Return: what fuse_get_dlm_lock() returned, 0 when there is nothing to
+ * ask for or the need is already held.  A caller filling through the page
+ * cache can drop it: the fill confirms the grant itself and declines what
+ * this did not take, so the failure arrives there with a folio to report
+ * it on.  The two that cannot fall back on that act on it instead --
+ * fuse_read_folio_retry(), which would come straight back here, and
+ * fuse_fadvise(), which has nothing left to populate.
+ */
+static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t size = i_size_read(inode);
+	loff_t ahead = 2 * ((loff_t)file->f_ra.ra_pages << PAGE_SHIFT);
+	loff_t need = pos + count;
+	loff_t want;
+
+	if (!fc->writeback_cache || !fc->dlm)
+		return 0;
+
+	if (need < size)
+		need += min(ahead, size - need);
+
+	if (need <= pos)
+		return 0;
+
+	if (fuse_dlm_lock_is_held(fi, pos, need - pos, FUSE_PAGE_LOCK_READ))
+		return 0;
+
+	want = need;
+	if (want < size)
+		want += min(ahead, size - want);
+
+	return fuse_get_dlm_lock(file, pos, want - pos, FUSE_PAGE_LOCK_READ);
+}
+
+/**
+ * fuse_read_folio_retry - back off a fill with no grant to run under
+ * @file: file to read through
+ * @folio: the folio handed over locked, unlocked here
+ * @pos: byte offset of @folio
+ * @len: its size in bytes
+ *
+ * Neither reason a fill is refused can be dealt with while the folio is
+ * held: waiting a revoke out would hold the page cache that revoke is
+ * about to drop, and no grant may be asked for under a page lock at all
+ * (Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt).
+ * Unlock, do both, and send the caller round again to find the range
+ * covered.
+ *
+ * Return: AOP_TRUNCATED_PAGE, or a negative error.
+ */
+static int fuse_read_folio_retry(struct file *file, struct folio *folio,
+				 loff_t pos, size_t len)
+{
+	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
+	struct fuse_dlm_span pin;
+	int err;
+
+	folio_unlock(folio);
+
+	/* Wait the revoke out; what it leaves behind is asked for below */
+	fuse_dlm_pin(fi, &pin, pos, len);
+	fuse_dlm_unpin(fi);
+
+	err = fuse_read_grant(file, pos, len);
+	if (err == -ENOSYS)
+		return AOP_TRUNCATED_PAGE;
+	if (err < 0)
+		return err;
+	/*
+	 * Granted but unrecorded, so the retry finds the range uncovered
+	 * and comes straight back here.  Report it rather than spin.
+	 */
+	if (err > 0)
+		return -ENOMEM;
+
+	return AOP_TRUNCATED_PAGE;
+}
+
 static int fuse_read_folio(struct file *file, struct folio *folio)
 {
 	struct inode *inode = folio->mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	loff_t pos = folio_pos(folio);
+	size_t len = folio_size(folio);
+	struct fuse_dlm_span pin;
+	bool pinned = false;
 	struct fuse_fill_read_data data = {
 		.file = file,
 	};
@@ -1145,7 +1433,6 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 		.cur_folio = folio,
 		.ops = &fuse_iomap_read_ops,
 		.read_ctx = &data,
-
 	};
 
 	if (fuse_is_bad(inode)) {
@@ -1153,54 +1440,96 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 		return -EIO;
 	}
 
+	/*
+	 * Writeback unlocks a folio as soon as it has handed it over, with
+	 * the writeback flag still on it, so this can be reached while a
+	 * FUSE_WRITE is still reading out of it.  Filling it now would
+	 * rewrite what is being sent, and past the end of the file the reply
+	 * comes back short and zeroes it.  Nothing reached here before a
+	 * partial write started leaving folios invalid, because a dirty
+	 * folio was always valid and never came this way.
+	 */
+	folio_wait_writeback(folio);
+
+	/*
+	 * The grant the folio is filled under, held from the confirmation
+	 * until the bytes are in the page cache.  What lands here is served
+	 * to every later reader of the file, so it must neither be fetched
+	 * under a grant a revoke has taken away nor be dropped into a range
+	 * a revoke has just swept: such a folio is uptodate and covered by
+	 * nothing, and no further notify comes for a lock this client no
+	 * longer holds.
+	 *
+	 * The pin closes the second, since a revoke over the folio waits
+	 * for the fill and drops the folio after it; the confirmation
+	 * closes the first.  Both fail into fuse_read_folio_retry().
+	 */
+	if (fc->dlm && fc->writeback_cache) {
+		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
+					      FUSE_PAGE_LOCK_READ);
+		if (!pinned)
+			return fuse_read_folio_retry(file, folio, pos, len);
+	}
+
+	/*
+	 * Only a folio still holding what a write put in it has anything to
+	 * keep.  One that was merely being written back is clean by now,
+	 * waited out just above, and reads whole.
+	 *
+	 * The gaps are read one run at a time rather than through iomap,
+	 * which owns the whole folio and would fill what is kept here.
+	 */
+	if (fc->writeback_cache && folio_test_dirty(folio)) {
+		int err = fuse_read_folio_merge(file, folio);
+
+		if (!err)
+			folio_mark_uptodate(folio);
+
+		fuse_invalidate_atime(inode);
+		folio_unlock(folio);
+		/*
+		 * After the unlock, so a revoke draining this pin finds the
+		 * folio it has to drop unlocked and takes it out.
+		 */
+		if (pinned)
+			fuse_dlm_unpin(fi);
+		return err;
+	}
+
 	iomap_read_folio(&fuse_iomap_ops, &ctx, NULL);
 	fuse_invalidate_atime(inode);
+	if (pinned)
+		fuse_dlm_unpin(fi);
 	return 0;
 }
+
+/*
+ * What iomap_file_buffered_write() carries for fuse, reached from the
+ * read-back callback as iter->private.  @file is what that callback needs
+ * anyway, so the retry flag rides along and lives exactly as long as the
+ * call, with nothing to allocate or free.
+ */
+struct fuse_iomap_write_ctx {
+	struct file *file;
+	/* fuse_iomap_read_folio_range() hit AOP_TRUNCATED_PAGE */
+	bool retry_needed;
+	/*
+	 * The grant ->get_folio pinned, live until ->put_folio drops it.
+	 * Here rather than on their stacks, which do not span the pair.
+	 */
+	struct fuse_dlm_span pin;
+};
 
 static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 				       struct folio *folio, loff_t pos,
 				       size_t len)
 {
-	struct file *file = iter->private;
-	struct inode *inode = file_inode(file);
-	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_iomap_write_ctx *ctx = iter->private;
+	struct file *file = ctx->file;
 	size_t off = offset_in_folio(folio, pos);
-	bool hole;
 	int ret;
 
-	/*
-	 * Expanding writes claim their new i_size up front (see
-	 * fuse_cache_write_iter()), which keeps iomap's own beyond-EOF
-	 * zeroing in iomap_block_needs_zeroing() from ever firing for the
-	 * write's own range: every block of a file expansion would be read
-	 * from the server although it cannot contain data.  Zero-fill
-	 * locally instead when the server is known to hold no data in the
-	 * range and we hold the DLM write lock covering it:
-	 *
-	 *  - fi->server_size bounds the data materialized on the server
-	 *    (writeback and direct write acknowledgements, server
-	 *    attributes),
-	 *  - local data not yet acknowledged sits in uptodate blocks, which
-	 *    iomap never passes to this callback,
-	 *  - the page-granular DLM write lock excludes data written by
-	 *    other nodes, re-checked against the live lock tree so a
-	 *    revoked lock falls back to reading.
-	 */
-	if (fc->dlm) {
-		spin_lock(&fi->lock);
-		hole = pos >= fi->server_size;
-		spin_unlock(&fi->lock);
-
-		if (hole && fuse_dlm_range_is_locked(fi, pos, pos + len - 1,
-						     FUSE_PAGE_LOCK_WRITE)) {
-			folio_zero_range(folio, off, len);
-			return 0;
-		}
-	}
-
-	ret = fuse_do_readfolio(file, folio, off, len);
+	ret = fuse_read_folio_range(file, folio, off, len);
 
 	/*
 	 * TEMPORARY WORKAROUND for iomap write deadlock:
@@ -1211,7 +1540,7 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 	 *
 	 * However, iomap doesn't understand AOP_TRUNCATED_PAGE.
 	 * We need to:
-	 * 1. Mark the retry flag (caller stored it in xarray)
+	 * 1. Mark the retry flag on the caller's write context
 	 * 2. Convert to -EAGAIN so iomap sees an error
 	 * 3. Let fuse_cache_write_iter() detect and retry
 	 *
@@ -1222,13 +1551,7 @@ static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE support.
 	 */
 	if (ret == AOP_TRUNCATED_PAGE) {
-		struct fuse_dlm_retry *retry;
-		unsigned long task_key = (unsigned long)current;
-
-		retry = xa_load(&fc->dlm_retry_tasks, task_key);
-		if (retry) {
-			retry->retry_needed = true;
-		}
+		ctx->retry_needed = true;
 
 		/* Convert to -EAGAIN for iomap */
 		ret = -EAGAIN;
@@ -1265,19 +1588,41 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 					ap->descs[i].length, err);
 		folio_put(ap->folios[i]);
 	}
+
+	/*
+	 * Dropped after the folios, which are filled, uptodate and unlocked
+	 * by now: a revoke draining this pin finds them and takes them out.
+	 * Held until here so it cannot have swept before they were there.
+	 */
+	if (ia->read.dlm_fi)
+		fuse_dlm_unpin_span(ia->read.dlm_fi, &ia->read.dlm_pin);
+
 	if (ia->ff)
 		fuse_file_put(ia->ff, false);
 
 	fuse_io_free(ia);
 }
 
-static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
-				unsigned int count, bool async)
+/**
+ * fuse_send_readpages - read a run of folios of a read or readahead window
+ * @ia: the request, owning the folios and the pin over them
+ * @file: file to read through
+ * @count: bytes to read, starting at the first folio
+ * @async: send in the background instead of waiting for the reply
+ *
+ * Return: 0 once the request is on its way or has been completed,
+ * -EAGAIN when a revoke of the range refused the grant and nothing was
+ * sent.  The folios are given back either way.
+ */
+static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
+			       unsigned int count, bool async)
 {
 	struct fuse_file *ff = file->private_data;
 	struct fuse_mount *fm = ff->fm;
+	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
 	struct fuse_args_pages *ap = &ia->ap;
 	loff_t pos = folio_pos(ap->folios[0]);
+	unsigned int i;
 	ssize_t res;
 	int err;
 
@@ -1292,6 +1637,25 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 	}
 	WARN_ON((loff_t) (pos + count) < 0);
 
+	/*
+	 * The grant the read took in fuse_read_grant(), confirmed under a
+	 * pin and held until the reply has filled the folios.  A revoke of the range
+	 * waits for that, so the reply cannot be fetched under a grant the
+	 * server has since handed on, and cannot land behind a sweep that
+	 * would leave the folios uptodate and covered by nothing.
+	 *
+	 * Refused, or gone since it was asked for: give the folios back
+	 * unfilled rather than serve what no lock covers.  The read that
+	 * wanted them comes back through fuse_read_folio(), which asks
+	 * again with no folio held.
+	 */
+	if (fm->fc->dlm && fm->fc->writeback_cache) {
+		if (!fuse_dlm_trypin_held_span(fi, &ia->read.dlm_pin, pos,
+					       count, FUSE_PAGE_LOCK_READ))
+			goto uncovered;
+		ia->read.dlm_fi = fi;
+	}
+
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	ia->read.attr_ver = fuse_get_attr_version(fm->fc);
 	if (async) {
@@ -1299,12 +1663,21 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 		ap->args.end = fuse_readpages_end;
 		err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
 		if (!err)
-			return;
+			return 0;
 	} else {
 		res = fuse_simple_request(fm, &ap->args);
 		err = res < 0 ? res : 0;
 	}
 	fuse_readpages_end(fm, &ap->args, err);
+	return 0;
+
+uncovered:
+	for (i = 0; i < ap->num_folios; i++) {
+		folio_end_read(ap->folios[i], false);
+		folio_put(ap->folios[i]);
+	}
+	fuse_io_free(ia);
+	return -EAGAIN;
 }
 
 static void fuse_readahead(struct readahead_control *rac)
@@ -1324,26 +1697,129 @@ static void fuse_readahead(struct readahead_control *rac)
 	if (fuse_is_bad(inode))
 		return;
 
+	/*
+	 * A latched inode keeps no page cache, and this window was not asked
+	 * for by a read that has to be served (madvise(), fadvise()).  Decline
+	 * it: read_pages() drops the folios of a window left unfilled.
+	 */
+	if (fuse_inode_force_dio(inode))
+		return;
+
+	/*
+	 * Readahead fills the page cache past the range the reader asked
+	 * for, and what lands there has to be covered by a grant: folios
+	 * the server handed out no lock for are folios it will not revoke
+	 * when a remote node writes them, and a later read would be served
+	 * from stale cache.
+	 *
+	 * No grant is asked for here.  ->readahead is entered with every
+	 * folio of the window already locked, and none may be asked for
+	 * under a page lock; the read this window belongs to took one over
+	 * it in fuse_read_grant(), before the page cache was entered.
+	 *
+	 * What that left uncovered fuse_send_readpages() declines, one run
+	 * of folios at a time, and those folios go back unfilled for
+	 * fuse_read_folio() to fetch with no folio held.
+	 */
+
 	iomap_readahead(&fuse_iomap_ops, &ctx, NULL);
 }
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to);
 
 /*
- * Bound on re-requesting a revoked DLM grant before a cached read is
- * served unlocked; see fuse_cache_read_iter().
+ * Empty the page cache of an inode just latched into direct IO.
+ *
+ * The notify that set the latch dropped the mapping, but it holds no inode
+ * lock, so a cached write that had already passed both latch checks went on
+ * dirtying folios behind it.  Left there, writeback would put them on the
+ * server on top of the direct writes that replace them, and direct reads,
+ * which do not look in the page cache, would miss them entirely.
+ *
+ * i_rwsem taken exclusive is what settles it: fuse_cache_write_iter() dirties
+ * under it, so by the time it is held every such writer has finished, and none
+ * can start behind this one.  A write that takes the lock afterwards rechecks
+ * the latch and reroutes before it touches the cache.  So the mapping stays
+ * empty from here on and the bit records that, leaving the latched IO paths
+ * with nothing to flush.
+ *
+ * Called from the top of the IO paths, with no inode lock held.  A no-op for
+ * a file the server itself opened direct, which is never latched.
  */
-#define FUSE_DLM_READ_RETRIES 3
+static int fuse_force_dio_drain(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	int err = 0;
+
+	if (!test_bit(FUSE_I_FORCE_DIO, &fi->state) ||
+	    test_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state))
+		return 0;
+
+	inode_lock(inode);
+	/*
+	 * The latch may have gone while this waited for the lock, and the drain
+	 * is only owed to one that is still on.  On a flush error the bit stays
+	 * clear so the next IO tries again, and the error goes to this caller
+	 * rather than being left for a later fsync to find.
+	 */
+	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
+	    !test_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state)) {
+		err = filemap_write_and_wait(inode->i_mapping);
+		if (!err) {
+			invalidate_inode_pages2(inode->i_mapping);
+			set_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
+		}
+	}
+	inode_unlock(inode);
+
+	return err;
+}
+
+/*
+ * Fold one request size into a moving average of this inode's sizes and
+ * report whether the file is being streamed: the same buffer size arriving
+ * FUSE_STREAM_RUN times over, which is what a task working through a file a
+ * record at a time looks like from here.  A size outside the tolerance around
+ * the average starts the run again from that size, so a task changing its
+ * record is followed rather than averaged with what it did before.
+ *
+ * The average is per inode rather than per handle, so a stream stays one
+ * stream across reopens and across the handles of a shared file, whose users
+ * are streaming it together without any one of them being sequential.
+ *
+ * A hint only, read and written without the inode lock, which the DLM path
+ * holds shared: callers landing on it together cost a misread run, not
+ * correctness.
+ */
+static bool fuse_stream_update(unsigned int *ewma, unsigned int *run,
+			       size_t len)
+{
+	unsigned int sample = min_t(size_t, len, FUSE_STREAM_EWMA_MAX);
+	unsigned int avg = *ewma >> FUSE_STREAM_EWMA_SHIFT;
+
+	if (*run && abs_diff(sample, avg) <= avg >> FUSE_STREAM_TOL_SHIFT) {
+		/* E += sample - (E >> SHIFT); avg = E >> SHIFT */
+		*ewma += sample - avg;
+		if (*run < FUSE_STREAM_RUN)
+			(*run)++;
+	} else {
+		*ewma = sample << FUSE_STREAM_EWMA_SHIFT;
+		*run = 1;
+	}
+
+	return *run >= FUSE_STREAM_RUN;
+}
 
 static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
-	struct inode *inode = file->f_mapping->host;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
+	size_t count = iov_iter_count(to);
+	bool stream = false;
 	ssize_t res;
-	int lock_err = 0;
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -1351,74 +1827,82 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * i_size is up to date).
 	 */
 	if (fc->auto_inval_data ||
-	    (iocb->ki_pos + iov_iter_count(to) > i_size_read(inode))) {
+	    (iocb->ki_pos + count > i_size_read(inode))) {
 		int err;
 		err = fuse_update_attributes(inode, iocb->ki_filp, STATX_SIZE);
 		if (err)
 			return err;
 	}
 
-	/* if we have dlm support acquire a read lock for the area
-	 * we are reading from. */
-	if (fc->writeback_cache && fc->dlm)
-		lock_err = fuse_get_dlm_lock(file, iocb->ki_pos,
-					     iov_iter_count(to),
-					     FUSE_PAGE_LOCK_READ);
+	/*
+	 * Every read that could be cached feeds the size average, streamed or
+	 * not: a reader changing its record has to be seen as well.  O_DIRECT
+	 * is not one of them, and an empty read says nothing about a record.
+	 */
+	if (count && !(iocb->ki_flags & IOCB_DIRECT))
+		stream = fuse_stream_update(&fi->read_size_ewma,
+					    &fi->read_stream_run, count);
 
 	/*
-	 * Fence the cache-serving read against a NOTIFY invalidate so we never
-	 * hand back a folio the server has just superseded.  The gate read side
-	 * is per-CPU cheap; the NOTIFY holds the write side with priority.
-	 * Re-check the forced-DIO latch under it: if a storm latched us while we
-	 * waited on a pending writer, reroute to direct like the buffered write
-	 * path, so we do not repopulate the cache the latch just dropped.
-	 * wb_sem is NULL on non-writeback+dlm mounts (gate inactive).
+	 * A streamed read of FUSE_READ_STREAM_MIN or more is served into the
+	 * caller's own pages instead.  Cached, the bytes are copied twice on
+	 * their way out of the server, into the folios and out of them into
+	 * the caller, and the folios are dropped unread; served from here they
+	 * are copied once, and the grant the fill would have run under is not
+	 * asked for at all.  What that gives up is the readahead of the next
+	 * record, not the wait for this one.
+	 *
+	 * Not on a mapped file, which keeps its page cache either way, and not
+	 * for IOCB_NOWAIT, which the direct read has no way to honour.  A
+	 * caller that gets EAGAIN out of the cached path here comes back
+	 * without the flag and takes this branch on the retry.
+	 *
+	 * Dirty folios over the range have to reach the server first: a direct
+	 * read does not look in the page cache, and fuse_direct_io() flushes
+	 * only for a file opened FOPEN_DIRECT_IO.
 	 */
-	if (wb_sem) {
-		int tries = FUSE_DLM_READ_RETRIES;
+	if (stream && count >= FUSE_READ_STREAM_MIN &&
+	    !(iocb->ki_flags & IOCB_NOWAIT) && !mapping_mapped(mapping)) {
+		loff_t end = iocb->ki_pos + count - 1;
 
-retry:
-		percpu_down_read(wb_sem);
-		if (fuse_inode_force_dio(inode)) {
-			percpu_up_read(wb_sem);
-			return fuse_direct_read_iter(iocb, to);
+		if (filemap_range_needs_writeback(mapping, iocb->ki_pos, end)) {
+			res = filemap_write_and_wait_range(mapping, iocb->ki_pos,
+							   end);
+			if (res)
+				return res;
 		}
+		return fuse_direct_read_iter(iocb, to);
+	}
+
+	/*
+	 * The grant this read and the readahead behind it fill under.  Not
+	 * for O_DIRECT, which takes no DLM lock at all: it fills no page
+	 * cache, and what it reads is the server's to order.
+	 */
+	if (!(iocb->ki_flags & IOCB_DIRECT))
+		fuse_read_grant(file, iocb->ki_pos, count);
+
+	/*
+	 * A NOTIFY invalidate racing this read drops the folios it
+	 * supersedes, so the read either misses and refetches or returns
+	 * data that was current when it was copied.  What a read does leave
+	 * behind is the page cache it fills, which must not outlast the
+	 * grant it was fetched under; that is fenced where the filling
+	 * happens, in fuse_read_folio() and fuse_send_readpages(), and the
+	 * grant taken here is what they confirm.
+	 */
+	if (fuse_inode_force_dio(inode)) {
 		/*
-		 * The DLM lock was requested before entering the gate, and
-		 * the NOTIFY invalidate we may just have waited on revokes
-		 * locks under the gate write side.  Re-check the grant here
-		 * and re-request with the gate dropped, so a
-		 * FUSE_DLM_WB_LOCK round trip never parks a pending
-		 * invalidate behind our own gate hold.  Once the check
-		 * passes the lock cannot go away for the rest of the gate
-		 * hold.  A failed or unrecorded request falls through
-		 * unlocked, as before: the retry is taken even then (the
-		 * latch must be re-checked under the re-entered gate), so
-		 * lock_err has to stay sticky across it -- seeded by the
-		 * pre-gate request above -- or a grant that failed would
-		 * be re-requested forever.  The retry is also bounded: a
-		 * remote writer can revoke each successful grant before
-		 * the gate is re-entered, and a reader-only inode has no
-		 * force-DIO latch to end such a storm, so after
-		 * FUSE_DLM_READ_RETRIES re-requests the read is served
-		 * unlocked rather than looping without bound.
+		 * Latched between fuse_file_read_iter()'s check and this one,
+		 * so the drain it would have done falls here.
 		 */
-		if (!lock_err && fc->dlm && tries-- > 0 &&
-		    !fuse_dlm_lock_is_held(fi, iocb->ki_pos,
-					   iov_iter_count(to),
-					   FUSE_PAGE_LOCK_READ)) {
-			percpu_up_read(wb_sem);
-			lock_err = fuse_get_dlm_lock(file, iocb->ki_pos,
-						     iov_iter_count(to),
-						     FUSE_PAGE_LOCK_READ);
-			goto retry;
-		}
+		res = fuse_force_dio_drain(inode);
+		if (res)
+			return res;
+		return fuse_direct_read_iter(iocb, to);
 	}
 
 	res = generic_file_read_iter(iocb, to);
-
-	if (wb_sem)
-		percpu_up_read(wb_sem);
 
 	return res;
 }
@@ -1492,15 +1976,6 @@ bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written)
 
 	spin_lock(&fi->lock);
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
-	if (written > 0 && S_ISREG(inode->i_mode)) {
-		/*
-		 * The server acknowledged data up to @pos, keep the
-		 * server-materialized bound in sync for the expansion
-		 * zero-fill in fuse_iomap_read_folio_range().
-		 */
-		if (pos > fi->server_size)
-			fi->server_size = pos;
-	}
 	if (written > 0 && pos > inode->i_size) {
 		i_size_write(inode, pos);
 		ret = true;
@@ -1569,7 +2044,6 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 {
 	struct fuse_args_pages *ap = &ia->ap;
 	struct fuse_conn *fc = get_fuse_conn(mapping->host);
-	unsigned offset = pos & (PAGE_SIZE - 1);
 	size_t count = 0;
 	unsigned int num;
 	int err = 0;
@@ -1596,7 +2070,13 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 		if (mapping_writably_mapped(mapping))
 			flush_dcache_folio(folio);
 
-		folio_offset = ((index - folio->index) << PAGE_SHIFT) + offset;
+		/*
+		 * From @pos, not carried across iterations: a write landing
+		 * inside a folio it does not start covers the rest of it, and
+		 * a residue kept from that lands the next folio's copy past
+		 * its end.
+		 */
+		folio_offset = offset_in_folio(folio, pos);
 		bytes = min(folio_size(folio) - folio_offset, num);
 
 		tmp = copy_folio_from_iter_atomic(folio, folio_offset, bytes, ii);
@@ -1626,9 +2106,6 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 		count += tmp;
 		pos += tmp;
 		num -= tmp;
-		offset += tmp;
-		if (offset == folio_size(folio))
-			offset = 0;
 
 		/* If we copied full folio, mark it uptodate */
 		if (tmp == folio_size(folio))
@@ -1640,7 +2117,12 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 			ia->write.folio_locked = true;
 			break;
 		}
-		if (!fc->big_writes || offset != 0)
+		/*
+		 * Carry on only from a folio boundary: a copy that stopped
+		 * short leaves the next one starting inside a folio, which is
+		 * one request's worth on its own.
+		 */
+		if (!fc->big_writes || folio_offset + tmp != folio_size(folio))
 			break;
 	}
 
@@ -1787,7 +2269,102 @@ static void fuse_dio_unlock(struct kiocb *iocb, bool exclusive, bool uncached)
 	}
 }
 
+/*
+ * Pin [@pos, @pos + @len) with the grant over it confirmed, so the bytes
+ * can be dirtied under a lock that cannot be taken away meanwhile; see
+ * fuse_dlm_pin().  @pin is the caller's storage for the pin, which it
+ * drops with fuse_dlm_unpin() once the bytes are dirty.
+ *
+ * The grant is asked for again when it has gone, and the pin must not be
+ * held across that request: it is answered by the server the revoke
+ * waiting for the pin came from.  So confirm and request alternate, and
+ * no folio may be held here.
+ *
+ * Not capped.  A pass costs a round trip only when the grant has gone,
+ * which is a revoke landing between the request and the confirmation, so
+ * a busy range paces the loop rather than ending it.  Giving up would
+ * fail a write the caller has no reason to expect to fail and cannot
+ * distinguish from a real one, over a range that is contended and
+ * nothing worse.  A fatal signal ends it instead, so a killed task and
+ * close() get out.
+ */
+static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
+			      loff_t pos, size_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	int err;
+
+	for (;;) {
+		fuse_dlm_pin(fi, pin, pos, len);
+		/*
+		 * A server that turned out to have no DLM leaves nothing to
+		 * confirm, and the pin still pairs with the caller's unpin.
+		 */
+		if (!fc->dlm ||
+		    fuse_dlm_lock_is_held(fi, pos, len, FUSE_PAGE_LOCK_WRITE))
+			return 0;
+		fuse_dlm_unpin(fi);
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
+
+		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+		if (err < 0 && err != -ENOSYS)
+			return err;
+		if (err > 0) {
+			/*
+			 * Granted but unrecorded, so there is nothing for the
+			 * confirmation above to find.  The range is covered
+			 * cluster-wide; pin and proceed.
+			 */
+			fuse_dlm_pin(fi, pin, pos, len);
+			return 0;
+		}
+	}
+}
+
+/*
+ * The grant over the bytes about to be copied, held until ->put_folio
+ * hands the folio back dirty.  Nothing is locked yet, which is what lets
+ * this wait out a revoke and ask for the grant again; ->writeback_range
+ * can do neither.
+ */
+static struct folio *fuse_iomap_get_folio(struct iomap_iter *iter, loff_t pos,
+					  unsigned int len)
+{
+	struct fuse_iomap_write_ctx *ctx = iter->private;
+	struct folio *folio;
+	int err;
+
+	err = fuse_dlm_pin_write(ctx->file, &ctx->pin, pos, len);
+	if (err)
+		return ERR_PTR(err);
+
+	folio = iomap_get_folio(iter, pos, len);
+	if (IS_ERR(folio))
+		fuse_dlm_unpin(get_fuse_inode(iter->inode));
+
+	return folio;
+}
+
+/* iomap_write_end() has dirtied whatever was copied by now */
+static void fuse_iomap_put_folio(struct inode *inode, loff_t pos,
+				 unsigned int copied, struct folio *folio)
+{
+	folio_unlock(folio);
+	folio_put(folio);
+	fuse_dlm_unpin(get_fuse_inode(inode));
+}
+
 static const struct iomap_write_ops fuse_iomap_write_ops = {
+	.read_folio_range = fuse_iomap_read_folio_range,
+};
+
+static const struct iomap_write_ops fuse_iomap_dlm_write_ops = {
+	.get_folio	  = fuse_iomap_get_folio,
+	.put_folio	  = fuse_iomap_put_folio,
 	.read_folio_range = fuse_iomap_read_folio_range,
 };
 
@@ -1795,30 +2372,16 @@ static ssize_t fuse_writeback_write_iter(struct kiocb *iocb,
 					 struct iov_iter *from,
 					 struct file *file)
 {
-	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
-	ssize_t written, total_written = 0;
-
 	/*
 	 * TEMPORARY WORKAROUND for iomap write deadlock:
 	 *
-	 * Stack-allocate retry state and register it before calling
-	 * iomap. If fuse_iomap_read_folio_range() encounters
-	 * AOP_TRUNCATED_PAGE, it will mark retry_needed.
-	 *
-	 * Stack allocation ensures no memory leaks - the state is
-	 * valid for the duration of this function call and is
-	 * automatically cleaned up.
+	 * The context fuse_iomap_read_folio_range() marks when it hits
+	 * AOP_TRUNCATED_PAGE.  iomap hands it back through its private
+	 * pointer, which fuse needs for @file either way.
 	 */
-	struct fuse_dlm_retry retry_state = {
-		.retry_needed = false,
-	};
-	unsigned long task_key = (unsigned long)current;
-	int xa_ret;
-
-	xa_ret = xa_err(xa_store(&fc->dlm_retry_tasks, task_key,
-				 &retry_state, GFP_KERNEL));
-	if (xa_ret)
-		return xa_ret;
+	struct fuse_iomap_write_ctx ctx = { .file = file };
+	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
+	ssize_t written, total_written = 0;
 
 retry:
 	/*
@@ -1829,14 +2392,16 @@ retry:
 	 * the next iteration with iov_iter already drained, and iomap
 	 * would re-enter with len==0 and livelock on a 0-length mapping.
 	 */
-	retry_state.retry_needed = false;
+	ctx.retry_needed = false;
 
 	/*
 	 * Use iomap so that we can do granular uptodate reads
 	 * and granular dirty tracking for large folios.
 	 */
 	written = iomap_file_buffered_write(iocb, from, &fuse_iomap_ops,
-					    &fuse_iomap_write_ops, file);
+					    fc->dlm ? &fuse_iomap_dlm_write_ops :
+						      &fuse_iomap_write_ops,
+					    &ctx);
 
 	if (written > 0)
 		total_written += written;
@@ -1848,39 +2413,136 @@ retry:
 	 * The folio has been unlocked by fuse_do_readfolio(),
 	 * breaking the ABBA deadlock with page invalidation.
 	 *
-	 * Keep the entry in xarray and reuse it for the retry.
-	 *
 	 * Remove this when mainline iomap gains AOP_TRUNCATED_PAGE
 	 * retry support.
 	 */
-	if (retry_state.retry_needed && iov_iter_count(from))
+	if (ctx.retry_needed && iov_iter_count(from))
 		goto retry;
-
-	/* Remove from xarray now that we're done */
-	xa_erase(&fc->dlm_retry_tasks, task_key);
 
 	return written < 0 ? written : total_written;
 }
 
+/*
+ * The size a writeback request ends on: the alignment the server asked for,
+ * or without one the largest power of two write it takes.  fc->max_write is
+ * at least 4096 once INIT has been answered, and only then is there a
+ * writeback cache to dirty.
+ */
+static loff_t fuse_write_chunk_size(struct fuse_conn *fc)
+{
+	if (fc->alignment_pages)
+		return (loff_t)fc->alignment_pages << PAGE_SHIFT;
+
+	return rounddown_pow_of_two(fc->max_write);
+}
+
 static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from);
+
+/*
+ * Does a write published before @r still cover a byte of it?  Only the
+ * entries ahead of it on the list: the oldest of an overlapping set waits
+ * for nobody, so the list always drains.  Caller holds fuse_inode.wr_lock.
+ */
+static bool fuse_write_range_blocked_locked(struct fuse_inode *fi,
+					    struct fuse_write_range *r)
+{
+	struct fuse_write_range *o;
+
+	list_for_each_entry(o, &fi->wr_ranges, list) {
+		if (o == r)
+			return false;
+		if (o->start <= r->end && r->start <= o->end)
+			return true;
+	}
+
+	return false;
+}
+
+/* fuse_write_range_blocked_locked() taking the lock itself */
+static bool fuse_write_range_blocked(struct fuse_inode *fi,
+				     struct fuse_write_range *r)
+{
+	bool blocked;
+
+	spin_lock(&fi->wr_lock);
+	blocked = fuse_write_range_blocked_locked(fi, r);
+	spin_unlock(&fi->wr_lock);
+
+	return blocked;
+}
+
+/**
+ * fuse_write_range_lock - hold a write's bytes against the other writers
+ * @fi: the fuse inode
+ * @r: caller-owned storage, live until fuse_write_range_unlock()
+ * @pos: first byte the write covers
+ * @count: how many bytes it covers
+ *
+ * Writers sharing the inode rwsem are serialised by the folio lock alone,
+ * which lets two of them over the same bytes interleave a folio at a time.
+ * write(2) is atomic against another write(2), so hold the bytes for as
+ * long as the copy takes.  Writers on disjoint bytes, which is what the
+ * shared lock is for, never wait here.
+ *
+ * Not a DLM object: the grant over these bytes is the node's and orders
+ * this client against the cluster, not the tasks against each other.  No
+ * revoke path takes this, so it may be held across a folio lock, a
+ * read-modify-write and a grant request alike.
+ */
+static void fuse_write_range_lock(struct fuse_inode *fi,
+				  struct fuse_write_range *r, loff_t pos,
+				  size_t count)
+{
+	r->start = pos;
+	r->end = pos + count - 1;
+
+	spin_lock(&fi->wr_lock);
+	/*
+	 * Published before the wait and at the tail, so a write arriving
+	 * later waits for this one and an overlapping set runs in the order
+	 * it arrived.
+	 */
+	list_add_tail(&r->list, &fi->wr_ranges);
+	while (fuse_write_range_blocked_locked(fi, r)) {
+		spin_unlock(&fi->wr_lock);
+		wait_event(fi->wr_wq, !fuse_write_range_blocked(fi, r));
+		spin_lock(&fi->wr_lock);
+	}
+	spin_unlock(&fi->wr_lock);
+}
+
+/**
+ * fuse_write_range_unlock - release the bytes fuse_write_range_lock() held
+ * @fi: the fuse inode
+ * @r: the entry published there
+ */
+static void fuse_write_range_unlock(struct fuse_inode *fi,
+				    struct fuse_write_range *r)
+{
+	spin_lock(&fi->wr_lock);
+	list_del(&r->list);
+	spin_unlock(&fi->wr_lock);
+
+	wake_up_all(&fi->wr_wq);
+}
 
 /*
  * @return true if an exclusive inode lock is needed for a cached (buffered)
  * write.
  *
  * Buffered writes normally hold the inode rwsem exclusively, serialising all
- * writers even on disjoint ranges.  The DLM-serialised iomap writeback path is
- * the exception: the DLM already excludes cluster-wide, and i_size is committed
- * under fi->lock rather than the inode rwsem (see fuse_cache_write_iter()), so
- * disjoint writers (MPI-IO / IOR) may share the lock.  Mirrors
- * fuse_dio_wr_exclusive_lock() for the direct path.
+ * writers even on disjoint ranges.  The iomap writeback path under DLM is the
+ * exception: i_size is committed under fi->lock rather than the inode rwsem
+ * (see fuse_cache_write_iter()), and the bytes of two writers are held apart
+ * by fuse_write_range_lock() instead, so disjoint writers (MPI-IO / IOR) may
+ * share the lock.  Mirrors fuse_dio_wr_exclusive_lock() for the direct path.
  */
 static bool fuse_cache_wr_exclusive_lock(struct kiocb *iocb, bool writeback)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 
-	/* Only the DLM-serialised iomap writeback path relaxes the lock. */
+	/* Only the iomap writeback path under DLM relaxes the lock. */
 	if (!fc->dlm || !writeback)
 		return true;
 
@@ -1908,19 +2570,67 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
  * fc->dlm: the server has no DLM, proceed as a plain cached write.  Any
  * other failure means the cache would be dirtied without DLM coverage -
  * the caller must fail the write instead.  A granted-but-unrecorded
- * lock (positive return) is covered cluster-wide; proceed, but flag it
- * so the in-gate re-validation skips a check an invisible grant could
- * never pass.
+ * lock (positive return) is covered cluster-wide; proceed.
  */
-static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
-				  bool *unrecorded)
+static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 {
 	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
 
-	if (err < 0 && err != -ENOSYS)
-		return err;
-	*unrecorded = err > 0;
-	return 0;
+	return (err < 0 && err != -ENOSYS) ? err : 0;
+}
+
+/*
+ * Start non-integrity writeback on the aligned chunks a streamed file has
+ * left behind.
+ *
+ * fuse_writeback_reached_alignment() ends a request on the server's
+ * alignment and fuse_folios_need_send() on the largest write it takes, but
+ * where one starts is the flusher's choice, and nothing sends the range at
+ * all until a dirty limit or the closing flush asks for it.  Kicking a
+ * chunk as the writer leaves it puts both bounds on that same size and
+ * keeps the tail off the flush.
+ *
+ * @stream is the size average saying the file is streamed; the run of
+ * positions is kept here, because a chunk is complete only once the writes
+ * have carried on past it.  A write that does not continue the previous one
+ * leaves nothing behind it and sends nothing.
+ *
+ * A hint only: nothing waits for it, and a chunk that is partly dirty or
+ * already written back sends what it has.  The run is read and written
+ * without the inode lock, which the DLM path holds shared, so writers
+ * landing on it together cost a kick, not correctness.  Each mark is read
+ * once into a local for that to hold: reading write_stream_start twice,
+ * to round down and again to compare, lets a writer moving it in between
+ * invert the range the kick is given.
+ */
+static void fuse_writeback_kick_stream(struct kiocb *iocb, loff_t pos,
+				       size_t len, bool stream)
+{
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t chunk, run, start, end;
+	bool sequential;
+
+	sequential = pos == READ_ONCE(fi->write_stream_next);
+	WRITE_ONCE(fi->write_stream_next, pos + (loff_t)len);
+	if (!sequential || !stream) {
+		/* Nothing behind this write is known to be finished */
+		WRITE_ONCE(fi->write_stream_start, pos);
+		return;
+	}
+
+	run = READ_ONCE(fi->write_stream_start);
+	chunk = fuse_write_chunk_size(get_fuse_conn(inode));
+	start = round_down(run, chunk);
+	/* This write's own end, not the mark another writer may have moved */
+	end = round_down(pos + (loff_t)len, chunk);
+	/* No bound crossed, so nothing has been left complete */
+	if (end <= run)
+		return;
+
+	WRITE_ONCE(fi->write_stream_start, end);
+	filemap_flush_range(file->f_mapping, start, end - 1);
 }
 
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
@@ -1933,13 +2643,12 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	ssize_t err, count;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
+	struct fuse_write_range wr;
 	bool writeback = false;
-	bool wb_guard = false;
-	bool exclusive = true;
-	bool dlm_unrecorded = false;
-	loff_t dlm_pos = 0;
-	size_t dlm_len = 0;
+	bool stream = false;
+	bool through = false;
+	bool claimed = false;
+	bool exclusive;
 
 	if (fuse_inode_force_dio(inode))
 		return fuse_direct_write_iter(iocb, from);
@@ -1983,82 +2692,94 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			writeback = true;
 	}
 
-	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
+	/*
+	 * Every write that can be cached feeds the size average, streamed or
+	 * not: a writer changing its record has to be seen as well.  The size
+	 * is the one the caller asked for, before generic_write_checks() has
+	 * had a chance to clamp it, which is the record the writer is working
+	 * with.
+	 */
+	if (writeback && !(iocb->ki_flags & IOCB_DIRECT))
+		stream = fuse_stream_update(&fi->write_size_ewma,
+					    &fi->write_stream_run,
+					    iov_iter_count(from));
+
+	/*
+	 * A streamed write of FUSE_WRITE_STREAM_MIN or more is sent from here
+	 * instead, out of the caller's own pages.  Cached, the bytes are
+	 * copied twice on their way to the server, into the folios and out of
+	 * them into the ring the request is read from, and the folios are
+	 * dropped unread; sent from here they are copied once.  Size is the
+	 * whole of the test: what a record is worth saving the copy on, not
+	 * where it lands or how it fits the alignment the server asked for.
+	 *
+	 * Not on a mapped file: the folios these bytes replace have to be
+	 * dropped afterwards, and a mapped one is not.
+	 */
+	through = stream && !mapping_mapped(mapping) &&
+		  iov_iter_count(from) >= FUSE_WRITE_STREAM_MIN;
 
 	/*
 	 * Request the DLM write lock before taking i_rwsem: the request is
 	 * an unbounded cluster round trip, and holding the writer-priority
 	 * rwsem across it would park a truncate -- and behind it every
-	 * later writer -- for the duration.  The grant-to-use window this
-	 * leaves open is closed by the in-gate re-validation below.  Only
-	 * the append case must wait for the lock: its range depends on
-	 * i_size, which is stable only under the exclusive inode lock.
+	 * later writer -- for the duration.  Only the append case must wait
+	 * for the lock: its range depends on i_size, which is settled by
+	 * generic_write_checks() under the exclusive inode lock.
+	 *
+	 * The request may find that the server has no DLM at all and clear
+	 * fc->dlm, so pick the lock mode after it rather than before.  The
+	 * grant says nothing about the writers on this node: it is the
+	 * node's, and every task here writes under the same one.  What keeps
+	 * two of them off each other's bytes is fuse_write_range_lock()
+	 * below.
+	 *
+	 * O_DIRECT takes no DLM lock at all, here or anywhere: it dirties
+	 * no page cache, so there is nothing for a grant to cover, and its
+	 * bytes are the server's to order against the rest of the cluster.
 	 */
-	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_APPEND)) {
-		dlm_pos = iocb->ki_pos;
-		dlm_len = iov_iter_count(from);
-
-		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
-					     &dlm_unrecorded);
+	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+	    !(iocb->ki_flags & IOCB_APPEND)) {
+		err = fuse_cache_wr_dlm_lock(file, iocb->ki_pos,
+					     iov_iter_count(from));
 		if (err)
 			return err;
-
-		/*
-		 * The request above may have found that the server has no DLM
-		 * at all, in which case it cleared fc->dlm.  The relaxed shared
-		 * lock was chosen just before, while fc->dlm still read 1, and
-		 * it is only sound under DLM: the shared path claims the i_size
-		 * extension up front, which stops iomap from zeroing beyond
-		 * EOF, and the zero-fill that replaces it in
-		 * fuse_iomap_read_folio_range() is itself gated on fc->dlm.
-		 * Left as chosen, an expanding write would fall through to a
-		 * READ of a range that cannot hold data -- which fails outright
-		 * on a handle the client opened write-only.  Re-decide now,
-		 * while no lock is held yet.
-		 */
-		exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 	}
+
+	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 
 	if (exclusive)
 		inode_lock(inode);
 	else
 		inode_lock_shared(inode);
 
-	/* note that this small code dup will save us a lot of headache later
-	 * when appends are done concurrently without using parallel direct writes */
-	if (writeback && fc->dlm && (iocb->ki_flags & IOCB_APPEND)) {
-		/*
-		 * An append write lands at the current EOF no matter what
-		 * ki_pos holds: generic_write_checks() rewrites ki_pos to
-		 * i_size for IOCB_APPEND, and i_size is stable here because
-		 * append writes hold the inode lock exclusive.  Lock where
-		 * the data will land.
-		 */
-		dlm_pos = i_size_read(inode);
-		dlm_len = iov_iter_count(from);
-
-		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
-					     &dlm_unrecorded);
-		if (err)
-			goto out;
-	}
-
 	err = count = generic_write_checks(iocb, from);
 	if (err <= 0)
 		goto out;
 
 	/*
-	 * Kill suid/sgid and stamp the timestamps here, before the gate,
-	 * instead of leaving them next to the write itself.  kiocb_modified()
-	 * -> file_remove_privs() is the one that reaches the server: without
-	 * handle_killpriv[_v2] fuse_setattr() kills the bits by asking it (a
-	 * FUSE_GETATTR to refresh the mode, then a FUSE_SETATTR, which for a
-	 * writeback inode first flushes and freezes writepages), and
-	 * security_inode_killpriv() can drop the capability xattr with another
-	 * round trip.  A server may have to invalidate this inode from inside
-	 * such a handler; its NOTIFY_INVAL_INODE then blocks in
-	 * percpu_down_write() draining a gate reader that is itself waiting for
-	 * the reply.  Nothing held under the gate may wait for the server.
+	 * An append lands at the EOF generic_write_checks() has just written
+	 * into ki_pos, not where the caller pointed, and the exclusive inode
+	 * lock does not pin i_size either: attribute replies move it under
+	 * fi->lock alone.  Take the grant here, where the range is settled.
+	 */
+	if (writeback && fc->dlm && !(iocb->ki_flags & IOCB_DIRECT) &&
+	    (iocb->ki_flags & IOCB_APPEND)) {
+		err = fuse_cache_wr_dlm_lock(file, iocb->ki_pos, count);
+		if (err)
+			goto out;
+	}
+
+	/*
+	 * Kill suid/sgid and stamp the timestamps here, ahead of the write
+	 * itself.  kiocb_modified() -> file_remove_privs() is the one that
+	 * reaches the server: without handle_killpriv[_v2] fuse_setattr()
+	 * kills the bits by asking it (a FUSE_GETATTR to refresh the mode,
+	 * then a FUSE_SETATTR, which for a writeback inode first flushes and
+	 * freezes writepages), and security_inode_killpriv() can drop the
+	 * capability xattr with another round trip.  A server may have to
+	 * invalidate this inode from inside such a handler, and it must not
+	 * find this write holding anything it needs.
 	 *
 	 * This also runs before the forced-DIO re-route below, so a re-routed
 	 * write repeats it; there is nothing left to do the second time.
@@ -2067,30 +2788,38 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (err)
 		goto out;
 
-	wb_guard = !!wb_sem;
-	if (wb_guard) {
-retry:
-		percpu_down_read(wb_sem);
-		if (fuse_inode_force_dio(inode)) {
-			percpu_up_read(wb_sem);
-			fuse_cache_wr_unlock(inode, exclusive);
-			return fuse_direct_write_iter(iocb, from);
-		}
-		if (writeback && fc->dlm && !dlm_unrecorded &&
-		    !fuse_dlm_lock_is_held(fi, dlm_pos, dlm_len,
-					   FUSE_PAGE_LOCK_WRITE)) {
-			percpu_up_read(wb_sem);
-			err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
-						     &dlm_unrecorded);
-			if (err) {
-				/* The gate is already dropped; funnel the
-				 * failure through the one audited exit. */
-				wb_guard = false;
-				goto out;
-			}
-			goto retry;
-		}
+	if (fuse_inode_force_dio(inode)) {
+		/*
+		 * Latched while this write waited for the lock, so the drain
+		 * fuse_file_write_iter() would have done falls here.  Drop the
+		 * lock first: the drain takes it exclusive.
+		 */
+		fuse_cache_wr_unlock(inode, exclusive);
+		err = fuse_force_dio_drain(inode);
+		if (err)
+			return err;
+		return fuse_direct_write_iter(iocb, from);
 	}
+
+	/*
+	 * Hold these bytes against the writers sharing the inode lock.
+	 * Taken after the re-route above, which returns without passing
+	 * the release below, and after generic_write_checks() has settled
+	 * what the write covers.
+	 */
+	if (!exclusive) {
+		fuse_write_range_lock(fi, &wr, iocb->ki_pos, count);
+		claimed = true;
+	}
+
+	/*
+	 * A NOTIFY invalidate can revoke the grant requested above between
+	 * here and the dirtying below, and nothing stops it: the bytes are
+	 * caught on the way out instead.  fuse_dlm_unlock_range() keeps a
+	 * revoked range for as long as there is page cache under it, and
+	 * writeback holds the range again before sending anything.  So a
+	 * write racing a revoke costs a round trip, not coverage.
+	 */
 
 	task_io_account_write(count);
 
@@ -2099,7 +2828,58 @@ retry:
 		if (written < 0 || !iov_iter_count(from))
 			goto out;
 		written = direct_write_fallback(iocb, from, written,
-				fuse_perform_write(iocb, from));
+						fuse_perform_write(iocb, from));
+	} else if (through) {
+		struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
+		struct fuse_dlm_span pin;
+		loff_t pos = iocb->ki_pos;
+
+		/*
+		 * What is cached under the write goes to the server before
+		 * it and is dropped after: the folios hold the bytes these
+		 * replace, and invalidate_inode_pages2_range() launders
+		 * rather than drops, so a dirty one left here would reach
+		 * the server on top of them.
+		 */
+		if (mapping->nrpages) {
+			err = filemap_write_and_wait_range(mapping, pos,
+							   pos + count - 1);
+			if (err)
+				goto out;
+		}
+
+		/*
+		 * These bytes never enter the page cache, so a revoke
+		 * cannot find them by flushing it, and the grant they were
+		 * taken under can be handed on while they are still on the
+		 * wire.  Hold it across the FUSE_WRITE, as the writethrough
+		 * edges do; a revoke of the range waits for the reply.
+		 */
+		err = fuse_dlm_pin_write(file, &pin, pos, count);
+		if (err)
+			goto out;
+
+		written = fuse_direct_io(&io, from, &iocb->ki_pos,
+					 FUSE_DIO_WRITE |
+					 (exclusive ? 0 : FUSE_DIO_SHARED));
+		fuse_dlm_unpin(fi);
+		if (written < 0) {
+			err = written;
+			goto out;
+		}
+
+		/*
+		 * i_size is the server's again as soon as the bytes are
+		 * there, so no extension is claimed for them: this commits
+		 * it the way the direct path does, retiring the attribute
+		 * replies that left before the write.
+		 */
+		fuse_write_update_attr(inode, iocb->ki_pos, written);
+
+		if (written > 0 && mapping->nrpages)
+			invalidate_inode_pages2_range(mapping,
+					pos >> PAGE_SHIFT,
+					(iocb->ki_pos - 1) >> PAGE_SHIFT);
 	} else if (writeback) {
 		loff_t pos = iocb->ki_pos;
 		loff_t end = pos + count;
@@ -2130,12 +2910,39 @@ retry:
 			spin_lock(&fi->lock);
 			orig_size = i_size_read(inode);
 			if (end > orig_size) {
+				/*
+				 * Retire the attribute replies already on the
+				 * wire.  fuse_attr_cache_mask() decides whether
+				 * the server's size wins from an i_size it read
+				 * before this claim and before it slept in the
+				 * lock tree query, so a GETATTR that left while
+				 * i_size still matched the server's is applied
+				 * afterwards and shrinks it back.  Moving
+				 * attr_version makes fuse_change_attributes_i()
+				 * drop those replies, which is what
+				 * fuse_write_update_attr() moves it for.
+				 */
+				fi->attr_version =
+					atomic64_inc_return(&fc->attr_version);
+				/*
+				 * And count the claim, for a reply that leaves
+				 * after it: until the bytes are dirtied,
+				 * [orig_size, end) is covered by nothing else
+				 * fuse_attr_cache_mask() can see.
+				 */
+				atomic_inc(&fi->size_extenders);
 				i_size_write(inode, end);
 				extended = true;
 			}
 			spin_unlock(&fi->lock);
 
-			/* Zero the tail of the folio straddling the old EOF. */
+			/*
+			 * Zero the tail of the folio straddling the old EOF.
+			 * Inert while the fuse block size is PAGE_SIZE, which
+			 * it always is, and nothing is recorded for it either
+			 * way: claiming the whole gap as written would hand
+			 * writeback bytes no one wrote.
+			 */
 			if (extended && orig_size < pos)
 				pagecache_isize_extended(inode, orig_size, pos);
 		}
@@ -2159,6 +2966,7 @@ retry:
 					i_size_write(inode, reached);
 				spin_unlock(&fi->lock);
 			}
+			atomic_dec(&fi->size_extenders);
 		}
 
 		if (written < 0) {
@@ -2169,11 +2977,16 @@ retry:
 		written = fuse_perform_write(iocb, from);
 	}
 out:
-	if (wb_guard)
-		percpu_up_read(wb_sem);
+	if (claimed)
+		fuse_write_range_unlock(fi, &wr);
 	fuse_cache_wr_unlock(inode, exclusive);
-	if (written > 0)
+	if (written > 0) {
+		/* The buffered branch above, the only one leaving folios dirty */
+		if (writeback && !through && !(iocb->ki_flags & IOCB_DIRECT))
+			fuse_writeback_kick_stream(iocb, iocb->ki_pos - written,
+						   written, stream);
 		written = generic_write_sync(iocb, written);
+	}
 
 	return written ? written : err;
 }
@@ -2292,6 +3105,7 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 {
 	int write = flags & FUSE_DIO_WRITE;
 	int cuse = flags & FUSE_DIO_CUSE;
+	int shared = flags & FUSE_DIO_SHARED;
 	struct file *file = io->iocb->ki_filp;
 	struct address_space *mapping = file->f_mapping;
 	struct inode *inode = mapping->host;
@@ -2320,12 +3134,33 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 			return res;
 		}
 	}
+
+	/*
+	 * Wait out the writeback this read or write would otherwise race:
+	 * a reply landing after it would put the superseded bytes on the
+	 * server on top of it.
+	 *
+	 * How to wait depends on the lock the caller holds.  fuse_set_nowrite()
+	 * asserts BUG_ON(fi->writectr < 0) and biases a counter the whole inode
+	 * shares, which only an exclusive i_rwsem makes safe; two callers
+	 * holding it shared reach that assertion together and the second one
+	 * dies inside spin_lock(&fi->lock).  A parallel direct write holds it
+	 * shared (fuse_dio_lock(), and the streamed write in
+	 * fuse_cache_write_iter()), so it waits on the folios of its own range
+	 * instead, which is the range this test asked about anyway.  Errors are
+	 * left on the mapping for fsync to collect.
+	 */
 	if (!cuse && filemap_range_has_writeback(mapping, pos, (pos + count - 1))) {
-		if (!write)
+		if (!write) {
 			inode_lock(inode);
-		fuse_sync_writes(inode);
-		if (!write)
+			fuse_sync_writes(inode);
 			inode_unlock(inode);
+		} else if (shared) {
+			filemap_fdatawait_range_keep_errors(mapping, pos,
+							    pos + count - 1);
+		} else {
+			fuse_sync_writes(inode);
+		}
 	}
 
 	if (fopen_direct_io && write) {
@@ -2387,6 +3222,15 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 	if (res > 0)
 		*ppos = pos;
 
+	if (res > 0 && write && fopen_direct_io) {
+		/*
+		 * As in generic_file_direct_write(), invalidate after the
+		 * write, to invalidate read-ahead cache that may have competed
+		 * with the write.
+		 */
+		invalidate_inode_pages2_range(mapping, idx_from, idx_to);
+	}
+
 	return res > 0 ? res : err;
 }
 EXPORT_SYMBOL_GPL(fuse_direct_io);
@@ -2443,7 +3287,8 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 
 			res = fuse_direct_io(&io, from, &iocb->ki_pos,
-					     FUSE_DIO_WRITE);
+					     FUSE_DIO_WRITE |
+					     (exclusive ? 0 : FUSE_DIO_SHARED));
 			fuse_write_update_attr(inode, iocb->ki_pos, res);
 		}
 		if (res > 0 && mapping->nrpages) {
@@ -2462,6 +3307,59 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	return res;
 }
 
+/*
+ * Whether the inode is still latched into direct IO.  The latch is set on a
+ * stream of invalidation notifies and has to come off when the stream stops,
+ * or an inode that was hot once stays uncached for as long as it is open.  The
+ * average behind the latch is folded on arrival and cannot age on its own, so
+ * the age of the last notify is the clock.
+ *
+ * Cleared here the way the mmap revert clears it: no inode lock, none is held
+ * at the top of the IO paths, and the drop is server-free because everything
+ * cached under the latch is clean.
+ */
+static bool fuse_force_dio_active(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool cleared = false;
+
+	if (!fuse_inode_force_dio(inode))
+		return false;
+
+	/*
+	 * Unlocked, and both may change under this: a writer that appears after
+	 * the check leaves the latch cleared, one that goes leaves it on until
+	 * the next IO looks again.  Neither is wrong, and the list is re-read
+	 * under fi->lock before anything is cleared.
+	 */
+	if (!time_after(jiffies,
+			READ_ONCE(fi->notify_stamp) + FUSE_NOTIFY_DIO_COLD) ||
+	    !list_empty_careful(&fi->write_files))
+		return true;
+
+	spin_lock(&fi->lock);
+	if (test_bit(FUSE_I_FORCE_DIO, &fi->state) &&
+	    list_empty(&fi->write_files) &&
+	    time_after(jiffies, fi->notify_stamp + FUSE_NOTIFY_DIO_COLD)) {
+		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
+		clear_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
+		if (fi->iocachectr > 0)
+			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
+		cleared = true;
+	}
+	spin_unlock(&fi->lock);
+
+	/*
+	 * Whatever a read racing the latch left behind, so it cannot be served
+	 * once caching resumes.  Another caller may have cleared the latch
+	 * first, or set it again since; the bit decides, not this one's work.
+	 */
+	if (cleared)
+		fuse_force_dio_drop(inode->i_mapping);
+
+	return fuse_inode_force_dio(inode);
+}
+
 static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
@@ -2475,12 +3373,17 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		return fuse_dax_read_iter(iocb, to);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode)) {
+		ssize_t err = fuse_force_dio_drain(inode);
+
+		if (err)
+			return err;
 		return fuse_direct_read_iter(iocb, to);
-	else if (fuse_file_passthrough(ff))
+	} else if (fuse_file_passthrough(ff)) {
 		return fuse_passthrough_read_iter(iocb, to);
-	else
+	} else {
 		return fuse_cache_read_iter(iocb, to);
+	}
 }
 
 static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
@@ -2496,12 +3399,17 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		return fuse_dax_write_iter(iocb, from);
 
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
-	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
+	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_force_dio_active(inode)) {
+		ssize_t err = fuse_force_dio_drain(inode);
+
+		if (err)
+			return err;
 		return fuse_direct_write_iter(iocb, from);
-	else if (fuse_file_passthrough(ff))
+	} else if (fuse_file_passthrough(ff)) {
 		return fuse_passthrough_write_iter(iocb, from);
-	else
+	} else {
 		return fuse_cache_write_iter(iocb, from);
+	}
 }
 
 static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
@@ -2513,8 +3421,17 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
-	else
-		return filemap_splice_read(in, ppos, pipe, len, flags);
+
+	/*
+	 * Latched: copy through ->read_iter, which reads direct, rather than
+	 * fill a page cache this inode is not allowed to keep.
+	 */
+	if (fuse_force_dio_active(file_inode(in)))
+		return copy_splice_read(in, ppos, pipe, len, flags);
+
+	fuse_read_grant(in, *ppos, len);
+
+	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
 
 static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
@@ -2529,6 +3446,25 @@ static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		return iter_file_splice_write(pipe, out, ppos, len, flags);
 }
 
+/*
+ * The folios and descs of a writeback request come from one allocation,
+ * which kfree(ap->folios) releases.
+ */
+static struct folio **fuse_wb_folios_alloc(unsigned int nfolios, gfp_t flags,
+					   struct fuse_folio_desc **descs)
+{
+	struct folio **folios;
+
+	folios = kzalloc(nfolios * (sizeof(struct folio *) +
+				    sizeof(struct fuse_folio_desc)), flags);
+	if (!folios)
+		return NULL;
+
+	*descs = (void *) (folios + nfolios);
+
+	return folios;
+}
+
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
 {
 	struct fuse_args_pages *ap = &wpa->ia.ap;
@@ -2541,6 +3477,25 @@ static void fuse_writepage_free(struct fuse_writepage_args *wpa)
 	kfree(ap->folios);
 	kfree(wpa);
 }
+
+/*
+ * Ending a folio's writeback is iomap's own accounting, and fuse reports
+ * each queued run's bytes as its request completes.
+ *
+ * For a folio of more than one block, iomap_writeback_init() charges the
+ * whole folio to ifs->write_bytes_pending before any run is queued and
+ * iomap_writeback_folio() takes back what it did not submit once the last
+ * run has been offered, so the count cannot reach zero while a run is
+ * still to come and the completions sum to exactly the folio.
+ *
+ * For a folio of a single block there is no iomap_folio_state and
+ * iomap_finish_folio_write() ends the writeback on every call, but such a
+ * folio is offered as exactly one run: iomap_find_dirty_range() has no
+ * per-block state to walk and returns the whole range at once, and
+ * ->writeback_range never returns short, so iomap_writeback_range() does
+ * not go round again.  One run is one entry in one request, and one call
+ * ends it.  fuse_iomap_writeback_range() asserts that.
+ */
 
 static void fuse_writepage_finish(struct fuse_writepage_args *wpa)
 {
@@ -2654,20 +3609,6 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	if (!fc->writeback_cache)
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODIFY);
 	spin_lock(&fi->lock);
-	if (!error) {
-		struct fuse_write_in *inarg = &wpa->ia.write.in;
-
-		/*
-		 * The server acknowledged this writeback, so data up to the
-		 * end of the request is materialized on the server.  Advance
-		 * the bound before the folios end writeback below, i.e.
-		 * before they can go clean and be reclaimed, so that
-		 * fuse_iomap_read_folio_range() can never zero-fill a
-		 * reclaimed range the server holds data in.
-		 */
-		if ((loff_t) (inarg->offset + inarg->size) > fi->server_size)
-			fi->server_size = inarg->offset + inarg->size;
-	}
 	fi->writectr--;
 	fuse_writepage_finish(wpa);
 	spin_unlock(&fi->lock);
@@ -2685,13 +3626,6 @@ static struct fuse_file *__fuse_write_file_get(struct fuse_inode *fi)
 		fuse_file_get(ff);
 	spin_unlock(&fi->lock);
 
-	return ff;
-}
-
-static struct fuse_file *fuse_write_file_get(struct fuse_inode *fi)
-{
-	struct fuse_file *ff = __fuse_write_file_get(fi);
-	WARN_ON(!ff);
 	return ff;
 }
 
@@ -2718,7 +3652,7 @@ static struct fuse_writepage_args *fuse_writepage_args_alloc(void)
 	if (wpa) {
 		ap = &wpa->ia.ap;
 		ap->num_folios = 0;
-		ap->folios = fuse_folios_alloc(1, GFP_NOFS, &ap->descs);
+		ap->folios = fuse_wb_folios_alloc(1, GFP_NOFS, &ap->descs);
 		if (!ap->folios) {
 			kfree(wpa);
 			wpa = NULL;
@@ -2743,7 +3677,7 @@ static void fuse_writepage_add_to_bucket(struct fuse_conn *fc,
 }
 
 static void fuse_writepage_args_page_fill(struct fuse_writepage_args *wpa, struct folio *folio,
-					  uint32_t folio_index, loff_t offset, unsigned len)
+					  uint32_t folio_index, loff_t offset, unsigned int len)
 {
 	struct fuse_args_pages *ap = &wpa->ia.ap;
 
@@ -2783,11 +3717,41 @@ struct fuse_fill_wb_data {
 	struct fuse_file *ff;
 	unsigned int max_folios;
 	/*
+	 * The folio currently being split into runs, and whether any run of
+	 * it has already been queued.  Only a folio iomap tracks per block
+	 * can be offered as more than one run; see fuse_writepage_finish().
+	 */
+	struct folio *wb_folio;
+	bool wb_queued;
+	/*
 	 * nr_bytes won't overflow since fuse_folios_need_send() caps
 	 * wb requests to never exceed fc->max_pages (which has an upper bound
 	 * of U16_MAX).
 	 */
 	unsigned int nr_bytes;
+	/*
+	 * The runs this pass could not send because their grant had gone.
+	 * Taken back in fuse_iomap_writeback_submit(), where no folio is
+	 * held, for the pass that follows; see fuse_iomap_writeback_range().
+	 */
+	u64 regrant_start;
+	u64 regrant_end;
+	/* fuse_iomap_writeback_submit() took that range back */
+	bool regranted;
+	/*
+	 * Reference to a folio whose run was skipped and kept under writeback
+	 * for redirty_len bytes until it can be put back on the dirty list;
+	 * see fuse_writeback_redirty().
+	 */
+	struct folio *redirty;
+	unsigned int redirty_len;
+	/*
+	 * An error a run hit that was deferred rather than returned, so its
+	 * bytes stayed put: no writer handle, a failed regrant (in the range
+	 * callback or in the submit), or no memory.  Reported from
+	 * fuse_iomap_writeback_submit().
+	 */
+	int defer_err;
 };
 
 static bool fuse_pages_realloc(struct fuse_fill_wb_data *data,
@@ -2802,7 +3766,7 @@ static bool fuse_pages_realloc(struct fuse_fill_wb_data *data,
 				    max_pages);
 	WARN_ON(nfolios <= data->max_folios);
 
-	folios = fuse_folios_alloc(nfolios, GFP_NOFS, &descs);
+	folios = fuse_wb_folios_alloc(nfolios, GFP_NOFS, &descs);
 	if (!folios)
 		return false;
 
@@ -2857,6 +3821,122 @@ static bool fuse_folios_need_send(struct fuse_conn *fc, loff_t pos,
 	return false;
 }
 
+/*
+ * A server that asked for an alignment wants its writes to start on it.  Close
+ * the run at an aligned position when the next aligned run cannot be reached,
+ * either because writeback ends before it or because it would not fit.
+ */
+static bool fuse_writeback_reached_alignment(struct fuse_conn *fc, loff_t pos,
+					     unsigned int bytes,
+					     struct writeback_control *wbc)
+{
+	unsigned int total_pages = (bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	pgoff_t page_index = pos >> PAGE_SHIFT;
+	pgoff_t end_page_index;
+
+	if (!fc->alignment_pages)
+		return false;
+
+	if (page_index % fc->alignment_pages)
+		return false;
+
+	/*
+	 * fuse_launder_folio() has no writeback_control, and a folio of more
+	 * than one run reaches here from it.
+	 */
+	if (!wbc)
+		return false;
+
+	/*
+	 * A cyclic pass leaves range_end at zero and runs to the end of the
+	 * mapping instead, so reading it there makes every aligned index its
+	 * own request.
+	 */
+	end_page_index = wbc->range_cyclic ?
+		(pgoff_t) -1 :
+		(pgoff_t) ((wbc->range_end + PAGE_SIZE - 1) >> PAGE_SHIFT);
+	if (page_index + fc->alignment_pages > end_page_index)
+		return true;
+
+	return total_pages + fc->alignment_pages > fc->max_pages;
+}
+
+/*
+ * Put a folio writeback could not send back on the dirty list.
+ *
+ * iomap takes the dirty flag off a folio before it offers it to
+ * ->writeback_range, and a run reporting an error, or reporting a hole
+ * because the grant has gone, has thrown its bytes away unless they are put
+ * back.
+ *
+ * Not from inside the callback, though.  iomap_writeback_folio() runs
+ * iomap_clear_range_dirty() over the whole folio once that has returned, so
+ * a range put back there is wiped again.  For a folio one block wide that
+ * call does nothing and it would not matter, but a large folio carries an
+ * iomap_folio_state, and the folio would then be left with the dirty flag
+ * and no dirty block under it: the next pass finds nothing to write and the
+ * folio goes clean with its bytes never sent.
+ *
+ * So hold the folio and dirty it once iomap has let go of it, which on the
+ * ->writepages path is the next call or the submit, and in
+ * fuse_launder_folio() is the submit it makes itself.
+ *
+ * And keep it under writeback until then.  Once iomap_writeback_folio()
+ * has cleared the folio and iomap_writepages() has unlocked it, a folio
+ * that is not dirty and not under writeback is anyone's: reclaim cannot
+ * take it while the reference is held, but invalidate_inode_pages2_range()
+ * does not look at references, and a revoke's invalidation landing in that
+ * window removed the folio with its bytes never sent.  The run is reported
+ * as handled rather than as a hole, so iomap counts its bytes submitted
+ * and leaves them charged on the folio, and they are given back only after
+ * the folio is dirty again.  A folio under writeback is neither reclaimed nor invalidated, so
+ * there is no window; the revoke waits for it, as it would for a send.
+ *
+ * Only while there is a connection left to take the bytes.  After an abort
+ * every send fails, and a folio redirtied for a retry that can no longer
+ * happen would keep sync() going forever.
+ */
+static void fuse_writeback_redirty_done(struct fuse_conn *fc,
+					struct fuse_fill_wb_data *data,
+					struct writeback_control *wbc)
+{
+	struct folio *folio = data->redirty;
+	unsigned int len = data->redirty_len;
+
+	if (!folio)
+		return;
+	data->redirty = NULL;
+	data->redirty_len = 0;
+
+	if (READ_ONCE(fc->connected)) {
+		folio_mark_dirty(folio);
+		if (wbc)
+			wbc->pages_skipped += folio_nr_pages(folio);
+	}
+	/* Dirty again (or abandoned), so the writeback can end now */
+	iomap_finish_folio_write(folio->mapping->host, folio, len);
+	folio_put(folio);
+}
+
+/*
+ * Remember @folio for fuse_writeback_redirty_done(), with the run
+ * [@pos, @pos + @len) of it counted as pending writeback.  The caller
+ * reports the run to iomap as handled (@len, not a hole), so iomap leaves
+ * the folio under writeback for it.
+ */
+static void fuse_writeback_redirty(struct fuse_conn *fc,
+				   struct fuse_fill_wb_data *data,
+				   struct writeback_control *wbc,
+				   struct folio *folio, unsigned int len)
+{
+	if (data->redirty != folio) {
+		fuse_writeback_redirty_done(fc, data, wbc);
+		folio_get(folio);
+		data->redirty = folio;
+	}
+	data->redirty_len += len;
+}
+
 static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 					  struct folio *folio, u64 pos,
 					  unsigned len, u64 end_pos)
@@ -2867,15 +3947,127 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	struct inode *inode = wpc->inode;
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	loff_t offset = offset_in_folio(folio, pos);
+	struct fuse_dlm_span pin;
+	bool pinned = false;
+	loff_t offset;
 
 	WARN_ON_ONCE(!data);
 
-	if (!data->ff) {
-		data->ff = fuse_write_file_get(fi);
-		if (!data->ff)
-			return -EIO;
+	/*
+	 * A folio iomap has not asked about before: the one before it has all
+	 * of its runs queued.
+	 */
+	if (data->wb_folio != folio) {
+		data->wb_folio = folio;
+		data->wb_queued = false;
+		/*
+		 * iomap has unlocked whatever it offered before this, so a
+		 * folio held from then can go back on the dirty list now.
+		 */
+		fuse_writeback_redirty_done(fc, data, wpc->wbc);
 	}
+
+	/*
+	 * Every run that cannot be sent is deferred the same way, whatever
+	 * the reason: the folio stays under writeback for it and is dirtied
+	 * again once iomap has let go of it (fuse_writeback_redirty()), and
+	 * an error is kept for the submit to report rather than returned
+	 * here, where iomap would end the folio's writeback with the bytes
+	 * still to send and nothing keeping them.
+	 */
+	wpc->iomap.type = IOMAP_MAPPED;
+
+	if (!data->ff) {
+		data->ff = __fuse_write_file_get(fi);
+		if (!data->ff) {
+			/*
+			 * No file left open for writing, which
+			 * fuse_open()'s invalidate reaches through
+			 * fuse_launder_folio() once the last writer has
+			 * closed.  The bytes are still the newest there
+			 * are, so keep them: dropping them here loses a
+			 * write that fsync and close both reported done.
+			 */
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
+			if (!data->defer_err)
+				data->defer_err = -EIO;
+			return len;
+		}
+	}
+
+	if (fc->dlm && fc->writeback_cache) {
+		/*
+		 * The revoke handler flushing the range it is taking
+		 * away.  That lock is still this client's until the
+		 * handler returns, so send without asking: the record has
+		 * gone already and asking would be a round trip for the
+		 * very range being revoked.  Only for that range, since
+		 * the latched path launders the whole mapping and the
+		 * rest of it may be covered by nothing.
+		 */
+		if (fuse_in_notify_range(pos, len))
+			goto queue;
+
+		/*
+		 * The folio is locked and under writeback here, so a grant
+		 * this run does not already hold must not be asked for:
+		 * Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-
+		 * reason.txt states the rule the read path is built around,
+		 * that no cluster lock may be taken while a page lock is
+		 * held.  read_folio() has AOP_TRUNCATED_PAGE to unlock and
+		 * retry with; ->writeback_range has nothing of the sort.
+		 *
+		 * Defer the run instead.  The folio stays under writeback
+		 * and goes back on the dirty list once iomap has let go of
+		 * it, the range is remembered for
+		 * fuse_iomap_writeback_submit() to take back with no folio
+		 * held, and the pass that follows sends it.  Nothing is lost
+		 * and no error is recorded for a later fsync to report.
+		 *
+		 * A refused pin is a revoke of this range draining, and
+		 * leaves the run in the same place for the same reason.  A
+		 * revoke elsewhere in the file does not refuse it.
+		 */
+		pinned = fuse_dlm_trypin_held(fi, &pin, pos, len,
+					      FUSE_PAGE_LOCK_WRITE);
+		if (!pinned) {
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
+			if (data->regrant_end <= data->regrant_start) {
+				data->regrant_start = pos;
+				data->regrant_end = pos + len;
+			} else {
+				u64 s = min(data->regrant_start, pos);
+				u64 e = max(data->regrant_end, pos + len);
+
+				/*
+				 * One shard is as far as a single request is
+				 * worth taking back.  A pass sweeping a large
+				 * file skips runs a long way apart, and the
+				 * span between them says nothing about what
+				 * is wanted; the runs left out stay dirty and
+				 * a later pass asks for them.
+				 */
+				if (e - s <= FUSE_DLM_SHARD_SIZE) {
+					data->regrant_start = s;
+					data->regrant_end = e;
+				}
+			}
+			return len;
+		}
+
+		/*
+		 * Confirmed and pinned, so the run goes out under a grant
+		 * that is held now and cannot be taken away before the
+		 * bytes are under writeback: a revoke of the range drains
+		 * the pins before fuse_dlm_unlock_range() removes anything,
+		 * and one already draining would have refused the pin.
+		 * Asking the record a second time here would answer the
+		 * same and cost a round of the cache lock per folio.
+		 */
+	}
+queue:
+
+	offset = offset_in_folio(folio, pos);
 
 	if (wpa) {
 		bool send = fuse_folios_need_send(fc, pos, len, ap,
@@ -2890,6 +4082,10 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 				!fuse_pages_realloc(data, fc->max_pages);
 		}
 
+		if (!send)
+			send = fuse_writeback_reached_alignment(fc, pos,
+					data->nr_bytes + len, wpc->wbc);
+
 		if (send) {
 			fuse_writepages_send(inode, data);
 			data->wpa = NULL;
@@ -2899,15 +4095,38 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 
 	if (data->wpa == NULL) {
 		wpa = fuse_writepage_args_setup(folio, offset, data->ff);
-		if (!wpa)
-			return -ENOMEM;
+		if (!wpa) {
+			fuse_writeback_redirty(fc, data, wpc->wbc, folio, len);
+			if (pinned)
+				fuse_dlm_unpin(fi);
+			if (!data->defer_err)
+				data->defer_err = -ENOMEM;
+			return len;
+		}
 		fuse_file_get(wpa->ia.ff);
 		data->max_folios = 1;
 		ap = &wpa->ia.ap;
 	}
 
-	fuse_writepage_args_page_fill(wpa, folio, ap->num_folios,
-				      offset, len);
+	/*
+	 * fuse_writepage_finish() reports this run's bytes when the request
+	 * completes.  A folio of a single block carries no iomap_folio_state
+	 * and that report ends its writeback outright, which is only correct
+	 * because iomap offers such a folio as exactly one run.  Nothing
+	 * above can make it offer a second, but the accounting depends on it.
+	 */
+	WARN_ON_ONCE(data->wb_queued && i_blocks_per_folio(inode, folio) == 1);
+	data->wb_queued = true;
+
+	/*
+	 * Under writeback now, so the flush a revoke runs before it takes
+	 * the grant away waits for these bytes.  Nothing further is needed
+	 * to keep them in front of the handover.
+	 */
+	if (pinned)
+		fuse_dlm_unpin(fi);
+
+	fuse_writepage_args_page_fill(wpa, folio, ap->num_folios, offset, len);
 	data->nr_bytes += len;
 
 	ap->num_folios++;
@@ -2924,13 +4143,56 @@ static int fuse_iomap_writeback_submit(struct iomap_writepage_ctx *wpc,
 
 	WARN_ON_ONCE(!data);
 
+	/* No more runs are coming for the folio last seen */
+	data->wb_folio = NULL;
+	data->wb_queued = false;
+	fuse_writeback_redirty_done(get_fuse_conn(wpc->inode), data, wpc->wbc);
+
 	if (data->wpa) {
 		WARN_ON(!data->wpa->ia.ap.num_folios);
 		fuse_writepages_send(wpc->inode, data);
 	}
 
+	/*
+	 * Take back what the runs above had to skip, so the pass that
+	 * follows finds the grant and sends the folios they left dirty.
+	 *
+	 * Only on the ->writepages path, which is what @wbc marks.
+	 * fuse_launder_folio() reaches here with the folio still locked by
+	 * folio_unmap_invalidate(), which is the ordering this is avoiding,
+	 * and a revoke handler would ask for the very range it is revoking.
+	 * In both the skip simply stands and writeback picks it up.
+	 */
+	if (wpc->wbc && data->ff && data->regrant_end > data->regrant_start &&
+	    !fuse_in_notify_ctx()) {
+		int err = fuse_dlm_regrant_range(data->ff, wpc->inode,
+						 data->regrant_start,
+						 data->regrant_end - 1);
+
+		/*
+		 * Capture a deferred err so that a sync writeback knows that a
+		 * grant is not coming rather than continuing to loop waiting for
+		 * it.  Otherwise the runs should stay dirty for a later pass.
+		 */
+		if (err < 0 && err != -ENOSYS) {
+			if (!data->defer_err)
+				data->defer_err = err;
+		} else {
+			data->regranted = true;
+		}
+	}
+
 	if (data->ff)
 		fuse_file_put(data->ff, false);
+
+	/*
+	 * A run deferred with an error keeps its bytes, so report the err the
+	 * same way a failed send would, so that fsync and close see it.
+	 */
+	if (data->defer_err && !error) {
+		error = data->defer_err;
+		mapping_set_error(wpc->inode->i_mapping, error);
+	}
 
 	return error;
 }
@@ -2945,14 +4207,7 @@ static int fuse_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	struct fuse_fill_wb_data data = {};
-	struct iomap_writepage_ctx wpc = {
-		.inode = inode,
-		.iomap.type = IOMAP_MAPPED,
-		.wbc = wbc,
-		.ops = &fuse_writeback_ops,
-		.wb_ctx	= &data,
-	};
+	int err;
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -2961,7 +4216,51 @@ static int fuse_writepages(struct address_space *mapping,
 	    fc->num_background >= fc->congestion_threshold)
 		return 0;
 
-	return iomap_writepages(&wpc);
+	/*
+	 * A run whose grant had gone is skipped and its range taken back in
+	 * fuse_iomap_writeback_submit(), which leaves the folio dirty for a
+	 * later pass.  For a data integrity writeback there is no later
+	 * pass: fsync() and close() would report the bytes written while
+	 * they are still only in the page cache.  Go round again, now that
+	 * the grant is held, until nothing is left deferred.
+	 *
+	 * Without a cap on the passes: each one is paced by the regrant,
+	 * which the server answers once the revoke that refused the runs is
+	 * done, and a pass whose regrant fails reports that instead of
+	 * going round again.  A cap returned success with runs still dirty,
+	 * and a close that succeeded on that left the folios behind with no
+	 * handle to send them from.
+	 *
+	 * Bounded by the regrant rather than by a count, so a fatal signal
+	 * ends it as well: a grant taken away as often as it is given keeps
+	 * the loop going, and close() has to stay killable through it.
+	 */
+	for (;;) {
+		struct fuse_fill_wb_data data = {};
+		struct iomap_writepage_ctx wpc = {
+			.inode = inode,
+			.iomap.type = IOMAP_MAPPED,
+			.wbc = wbc,
+			.ops = &fuse_writeback_ops,
+			.wb_ctx	= &data,
+		};
+
+		err = iomap_writepages(&wpc);
+		/*
+		 * Only where the submit took the grant back.  A revoke
+		 * handler driving this is not allowed to, so the runs it
+		 * skipped would be skipped again by every pass.
+		 */
+		if (err || wbc->sync_mode != WB_SYNC_ALL || !data.regranted)
+			break;
+		if (fatal_signal_pending(current)) {
+			err = -EINTR;
+			break;
+		}
+		cond_resched();
+	}
+
+	return err;
 }
 
 static int fuse_launder_folio(struct folio *folio)
@@ -3048,6 +4347,7 @@ static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t l
 		fuse_abort_conn(fc);
 		err = -EINVAL;
 	}
+
 	return err;
 }
 /*
@@ -3073,9 +4373,13 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	struct fuse_mount *fm = get_fuse_mount(inode);
 
 	if (fm->fc->dlm) {
-		loff_t pos = vmf->pgoff << PAGE_SHIFT;
-		size_t length = PAGE_SIZE;
-		int err = fuse_get_page_mkwrite_lock(file, pos, length);
+		/*
+		 * The whole folio is dirtied on the way out of this fault
+		 * (fault_dirty_shared_page()), so the lock has to cover the
+		 * folio, not the page that faulted.
+		 */
+		int err = fuse_get_page_mkwrite_lock(file, folio_pos(folio),
+						     folio_size(folio));
 		if (err < 0) {
 			return vmf_error(err);
 		}
@@ -3092,9 +4396,22 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	return VM_FAULT_LOCKED;
 }
 
+/*
+ * A read fault fills the page cache through ->read_folio and
+ * ->readahead, which run with the folios locked.  Ask for the grant they
+ * fill under before filemap_fault() locks any of them.
+ */
+static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
+{
+	fuse_read_grant(vmf->vma->vm_file, (loff_t)vmf->pgoff << PAGE_SHIFT,
+			PAGE_SIZE);
+
+	return filemap_fault(vmf);
+}
+
 static const struct vm_operations_struct fuse_file_vm_ops = {
 	.close		= fuse_vma_close,
-	.fault		= filemap_fault,
+	.fault		= fuse_filemap_fault,
 	.map_pages	= filemap_map_pages,
 	.page_mkwrite	= fuse_page_mkwrite,
 };
@@ -3123,7 +4440,7 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	/*
 	 * If the inode was latched into forced direct IO after a remote-modify
 	 * notification, a mapping needs the page cache, so revert to caching
-	 * mode.  Revert without the inode lock or wb_inval_rwsem: ->mmap runs
+	 * mode.  Revert without the inode lock: ->mmap runs
 	 * under mmap_lock and the buffered write path holds both across a fault
 	 * on the user buffer (which takes mmap_lock), so taking either here
 	 * would invert lock order (ABBA).  Clearing the latch and dropping the
@@ -3137,10 +4454,11 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 		spin_lock(&fi->lock);
 		clear_bit(FUSE_I_FORCE_DIO, &fi->state);
+		clear_bit(FUSE_I_FORCE_DIO_DRAINED, &fi->state);
 		if (fi->iocachectr > 0)
 			set_bit(FUSE_I_CACHE_IO_MODE, &fi->state);
 		spin_unlock(&fi->lock);
-		invalidate_inode_pages2(file->f_mapping);
+		fuse_force_dio_drop(file->f_mapping);
 	}
 
 	/*
@@ -3641,7 +4959,8 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
+		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE |
+				     (exclusive ? 0 : FUSE_DIO_SHARED));
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 	} else {
 		ret = __fuse_direct_read(io, iter, &pos);
@@ -3935,6 +5254,31 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
 	return ret;
 }
 
+/*
+ * POSIX_FADV_WILLNEED, and readahead(2) with it, populate the page cache
+ * through ->readahead, which runs with the folios locked.  Ask for the
+ * grant that fill needs while nothing is held; a window no grant covers
+ * is given back unfilled.
+ *
+ * Report a grant that could not be taken rather than populate anyway,
+ * which would fill nothing: every folio of the window is declined and
+ * dropped again.  A server without DLM answers -ENOSYS and has cleared
+ * fc->dlm, which is not a failure, and neither is a grant the server gave
+ * and the client could not record.
+ */
+static int fuse_fadvise(struct file *file, loff_t offset, loff_t len,
+			int advice)
+{
+	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0) {
+		int err = fuse_read_grant(file, offset, len);
+
+		if (err < 0 && err != -ENOSYS)
+			return err;
+	}
+
+	return generic_fadvise(file, offset, len, advice);
+}
+
 static const struct file_operations fuse_file_operations = {
 	.llseek		= fuse_file_llseek,
 	.read_iter	= fuse_file_read_iter,
@@ -3954,6 +5298,7 @@ static const struct file_operations fuse_file_operations = {
 	.poll		= fuse_file_poll,
 	.fallocate	= fuse_file_fallocate,
 	.copy_file_range = fuse_copy_file_range,
+	.fadvise	= fuse_fadvise,
 	.setlease	= generic_setlease,
 };
 
@@ -3986,28 +5331,20 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fuse_dlm_cache_init(fi);
 	fi->writectr = 0;
 	fi->iocachectr = 0;
-	fi->server_size = 0;
 	init_waitqueue_head(&fi->page_waitq);
 	init_waitqueue_head(&fi->direct_io_waitq);
-	/*
-	 * Coherency gate for the forced-direct-IO feature; only writeback+dlm
-	 * regular files need it.  A percpu_rw_semaphore embeds per-CPU state,
-	 * so allocate it out of line and only when the mount can use it rather
-	 * than paying it on every inode.  On failure leave it NULL: the gate
-	 * stays inactive (best-effort invalidate) and the inode is still usable.
-	 */
-	fi->wb_inval_rwsem = NULL;
-	if (fc->writeback_cache && fc->dlm) {
-		struct percpu_rw_semaphore *sem = kmalloc(sizeof(*sem), GFP_KERNEL);
-
-		if (sem && percpu_init_rwsem(sem)) {
-			kfree(sem);
-			sem = NULL;
-		}
-		fi->wb_inval_rwsem = sem;
-	}
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
+	atomic_set(&fi->size_extenders, 0);
+	spin_lock_init(&fi->wr_lock);
+	INIT_LIST_HEAD(&fi->wr_ranges);
+	init_waitqueue_head(&fi->wr_wq);
+	fi->write_size_ewma = 0;
+	fi->write_stream_run = 0;
+	fi->write_stream_next = 0;
+	fi->write_stream_start = 0;
+	fi->read_size_ewma = 0;
+	fi->read_stream_run = 0;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
