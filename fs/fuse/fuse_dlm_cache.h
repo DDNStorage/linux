@@ -287,9 +287,13 @@ void fuse_dlm_fill_begin(struct fuse_inode *fi, struct fuse_dlm_range *fill,
 bool fuse_dlm_fill_commit(struct fuse_inode *fi, struct fuse_dlm_range *fill);
 void fuse_dlm_fill_end(struct fuse_inode *fi);
 
-/* Hold [start, end] again so writeback can send what it found revoked */
+/*
+ * Hold [start, end] again so writeback can send what it found revoked.
+ * @wait is for a caller that must have the range: one that can put the
+ * folios back passes false and takes -EAGAIN for a contended range.
+ */
 int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,
-			   uint64_t start, uint64_t end);
+			   uint64_t start, uint64_t end, bool wait);
 
 
 /* This is the interface to the filesystem */

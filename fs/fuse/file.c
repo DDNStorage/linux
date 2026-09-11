@@ -4441,6 +4441,12 @@ static int fuse_writepages(struct address_space *mapping,
 	 * Not from a revoke handler: it would ask for the very range it is
 	 * revoking, so the folios it skipped stay dirty for an ordinary
 	 * writeback.
+	 *
+	 * Without waiting for a contended range, under I_SYNC as this is:
+	 * a range revoked as fast as it is granted would park this pass
+	 * with every other flush of the inode behind it, and a background
+	 * one runs on a kworker, which gets neither of the exits that wait
+	 * ends on.  fuse_writeback_deferred() waits, with no I_SYNC held.
 	 */
 	if (data.regrant_end > data.regrant_start) {
 		fuse_writeback_defer_record(fi, data.regrant_start,
@@ -4449,7 +4455,8 @@ static int fuse_writepages(struct address_space *mapping,
 		if (data.ff && !fuse_in_notify_ctx()) {
 			int rc = fuse_dlm_regrant_range(data.ff, inode,
 							data.regrant_start,
-							data.regrant_end - 1);
+							data.regrant_end - 1,
+							false);
 
 			/*
 			 * A grant that is not coming is reported, so the
@@ -4460,8 +4467,15 @@ static int fuse_writepages(struct address_space *mapping,
 			 * the folios again for as long as the allocation
 			 * keeps failing.  Report it as the read side does;
 			 * see fuse_read_folio_retry().
+			 *
+			 * -EAGAIN is neither: it is this pass declining to
+			 * wait a contended range out, and the folios it left
+			 * dirty are what a background pass leaves behind in
+			 * any case.  Nothing to report and nothing regranted.
 			 */
-			if (rc < 0 && rc != -ENOSYS) {
+			if (rc == -EAGAIN) {
+				/* Contended, and this pass does not wait */
+			} else if (rc < 0 && rc != -ENOSYS) {
 				if (!data.defer_err)
 					data.defer_err = rc;
 			} else if (rc > 0) {
@@ -4535,7 +4549,8 @@ int fuse_writeback_deferred(struct inode *inode, loff_t start, loff_t end)
 		if (!ff)
 			return -EIO;
 
-		err = fuse_dlm_regrant_range(ff, inode, dstart, dend - 1);
+		err = fuse_dlm_regrant_range(ff, inode, dstart, dend - 1,
+					     true);
 		fuse_file_put(ff, false);
 		if (err > 0)
 			err = -ENOMEM;
