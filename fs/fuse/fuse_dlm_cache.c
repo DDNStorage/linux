@@ -1133,11 +1133,11 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 	}
 }
 
-int fuse_get_dlm_lock(struct file *file, loff_t offset,
-		      size_t length, enum fuse_page_lock_mode mode)
+int fuse_get_dlm_lock(struct file *file, loff_t offset, size_t length,
+		      enum fuse_page_lock_mode mode, bool wait)
 {
 	return __fuse_get_dlm_lock(file->private_data, file_inode(file),
-				   offset, length, mode, true);
+				   offset, length, mode, wait);
 }
 
 /**

@@ -1200,9 +1200,19 @@ static unsigned int fuse_readahead_unit(struct fuse_conn *fc,
  * before.
  *
  * Return: what fuse_get_dlm_lock() returned, 0 when there is nothing to
- * ask for or the need is already held.
+ * ask for or the need is already held.  A caller filling through the page
+ * cache can drop it: the fill confirms the grant itself and declines what
+ * this did not take, so the failure arrives there with a folio to report
+ * it on.  The two that cannot fall back on that act on it instead --
+ * fuse_read_folio_retry(), which would come straight back here, and
+ * fuse_fadvise(), which has nothing left to populate.
+ *
+ * @wait keeps asking while the range stays contended.  A fault clears it:
+ * it holds mmap_lock over this and must not sit on an unbounded number of
+ * round trips there.
  */
-static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
+static int fuse_read_grant(struct file *file, loff_t pos, size_t count,
+			   bool wait)
 {
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1252,7 +1262,8 @@ static int fuse_read_grant(struct file *file, loff_t pos, size_t count)
 	if (want < size)
 		want += min(ahead, size - want);
 
-	return fuse_get_dlm_lock(file, pos, want - pos, FUSE_PAGE_LOCK_READ);
+	return fuse_get_dlm_lock(file, pos, want - pos, FUSE_PAGE_LOCK_READ,
+				 wait);
 }
 
 /**
@@ -1284,7 +1295,7 @@ static int fuse_read_folio_retry(struct file *file, struct folio *folio,
 	fuse_dlm_pin(fi, &pin, pos, len);
 	fuse_dlm_unpin(fi);
 
-	err = fuse_read_grant(file, pos, len);
+	err = fuse_read_grant(file, pos, len, true);
 	if (err == -ENOSYS)
 		return AOP_TRUNCATED_PAGE;
 	if (err < 0)
@@ -1953,7 +1964,7 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * cache, and what it reads is the server's to order.
 	 */
 	if (!(iocb->ki_flags & IOCB_DIRECT))
-		fuse_read_grant(file, iocb->ki_pos, count);
+		fuse_read_grant(file, iocb->ki_pos, count, true);
 
 	/*
 	 * A NOTIFY invalidate racing this read drops the folios it
@@ -2462,7 +2473,8 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
  */
 static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 {
-	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE,
+				    true);
 
 	return (err < 0 && err != -ENOSYS) ? err : 0;
 }
@@ -2508,7 +2520,8 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 		if (fatal_signal_pending(current))
 			return -EINTR;
 
-		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
+		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE,
+					true);
 		if (err < 0 && err != -ENOSYS)
 			return err;
 		if (err > 0) {
@@ -3525,7 +3538,7 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	if (fuse_force_dio_active(file_inode(in)))
 		return copy_splice_read(in, ppos, pipe, len, flags);
 
-	fuse_read_grant(in, *ppos, len);
+	fuse_read_grant(in, *ppos, len, true);
 
 	return filemap_splice_read(in, ppos, pipe, len, flags);
 }
@@ -4839,11 +4852,25 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
  * A read fault fills the page cache through ->read_folio and
  * ->readahead, which run with the pages locked.  Ask for the grant they
  * fill under before filemap_fault() locks any of them.
+ *
+ * Without waiting for a contended range.  This runs with mmap_lock held,
+ * which filemap_fault() drops for its own IO and cannot drop for this,
+ * and every mmap, munmap and brk in the process queues behind it -- and
+ * behind them, the rwsem being fair, every later faulter.  One round trip
+ * is what the grant is worth here.
+ *
+ * A NOWAIT fault takes none: it may not block at all.
+ *
+ * The result is dropped either way.  Without the grant the fill declines
+ * and comes back through fuse_read_folio_retry() with no page held, which
+ * is where a fault that could not take it belongs.
  */
 static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 {
-	fuse_read_grant(vmf->vma->vm_file, (loff_t)vmf->pgoff << PAGE_SHIFT,
-			PAGE_SIZE);
+	if (!(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
+		fuse_read_grant(vmf->vma->vm_file,
+				(loff_t)vmf->pgoff << PAGE_SHIFT, PAGE_SIZE,
+				false);
 
 	return filemap_fault(vmf);
 }
@@ -5698,12 +5725,22 @@ int fuse_migrate_folio(struct address_space *mapping, struct folio *dst,
  * through ->readahead, which runs with the pages locked.  Ask for the
  * grant that fill needs while nothing is held; a window no grant covers
  * is given back unfilled.
+ *
+ * Report a grant that could not be taken rather than populate anyway,
+ * which would fill nothing: every folio of the window is declined and
+ * dropped again.  A server without DLM answers -ENOSYS and has cleared
+ * fc->dlm, which is not a failure, and neither is a grant the server gave
+ * and the client could not record.
  */
 static int fuse_fadvise(struct file *file, loff_t offset, loff_t len,
 			int advice)
 {
-	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0)
-		fuse_read_grant(file, offset, len);
+	if (advice == POSIX_FADV_WILLNEED && offset >= 0 && len > 0) {
+		int err = fuse_read_grant(file, offset, len, true);
+
+		if (err < 0 && err != -ENOSYS)
+			return err;
+	}
 
 	return generic_fadvise(file, offset, len, advice);
 }

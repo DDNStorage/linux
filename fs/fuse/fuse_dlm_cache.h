@@ -296,8 +296,13 @@ int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,
 			   uint64_t start, uint64_t end, bool wait);
 
 
-/* This is the interface to the filesystem */
-int fuse_get_dlm_lock(struct file *file, loff_t offset,
-		      size_t length, enum fuse_page_lock_mode mode);
+/*
+ * This is the interface to the filesystem.  @wait keeps asking while the
+ * range stays contended, which every caller that has to have the range
+ * does; one that must not block for an unbounded time passes false and
+ * takes -EAGAIN instead.
+ */
+int fuse_get_dlm_lock(struct file *file, loff_t offset, size_t length,
+		      enum fuse_page_lock_mode mode, bool wait);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */
