@@ -89,12 +89,35 @@ static inline bool fuse_in_notify_ctx(void)
 	return fuse_notify_ctx();
 }
 
+/*
+ * The bounds of the revoke @ctx is running, page aligned outward: what it
+ * takes away is whole pages, every grant being page rounded.
+ *
+ * Both tests built on a revoke's range use these, or they disagree at an
+ * unaligned edge: a folio the byte bounds put outside the revoke and the
+ * page bounds put inside is one that fuse_in_notify_range() sends the long
+ * way round while fuse_dlm_trypin() treats it as this handler's own.
+ */
+static inline void fuse_notify_ctx_pages(const struct fuse_notify_ctx *ctx,
+					 u64 *start, u64 *end)
+{
+	*start = (u64)ctx->start & PAGE_MASK;
+	*end = ctx->end >= LLONG_MAX ? U64_MAX :
+	       ((u64)ctx->end | (PAGE_SIZE - 1));
+}
+
 /* Is [@pos, @pos + @len) the range the revoke in progress is taking away? */
 static inline bool fuse_in_notify_range(loff_t pos, unsigned int len)
 {
 	struct fuse_notify_ctx *ctx = fuse_notify_ctx();
+	u64 start, end;
 
-	return ctx && pos >= ctx->start && pos + len - 1 <= ctx->end;
+	if (!ctx)
+		return false;
+
+	fuse_notify_ctx_pages(ctx, &start, &end);
+
+	return (u64)pos >= start && (u64)pos + len - 1 <= end;
 }
 
 /** Default max number of pages that can be used in a single read request */

@@ -160,13 +160,15 @@ static void fuse_dlm_span_set(struct fuse_dlm_span *span, loff_t offset,
  * Is @span inside the fence the revoke handler running on this task
  * published?
  *
- * Only there is a pin both unnecessary and unsafe: the lock over that
- * range is still this client's until the handler returns, and the fence
- * the pin would wait on is the handler's own.  Outside it the handler is
- * an ordinary writer with no claim on the range, and answering as if it
- * held a pin would let a revoke of that other range drain without
- * waiting for bytes on their way out.  The latched path launders the
- * whole mapping from inside a fence over one range, so that is reached.
+ * Only there must a pin not wait: the lock over that range is still this
+ * client's until the handler returns, and the fence it would wait on is
+ * the handler's own.  It is published all the same, so the unpin has one
+ * to find and a second revoke arriving over the range waits for the page
+ * cache work this handler is doing.  Outside it the handler is an
+ * ordinary writer with no claim on the range, and passing it through
+ * would let a revoke of that other range drain without waiting for bytes
+ * on their way out.  The latched path launders the whole mapping from
+ * inside a fence over one range, so that is reached.
  *
  * Built the way fuse_dlm_revoke_begin() builds the fence, so this
  * answers what the fence list would.
@@ -174,14 +176,13 @@ static void fuse_dlm_span_set(struct fuse_dlm_span *span, loff_t offset,
 static bool fuse_dlm_in_own_fence(const struct fuse_dlm_span *span)
 {
 	struct fuse_notify_ctx *ctx = fuse_notify_ctx();
-	uint64_t start, end;
+	u64 start, end;
 
 	if (!ctx)
 		return false;
 
-	start = (uint64_t) ctx->start & PAGE_MASK;
-	end = ctx->end >= LLONG_MAX ? U64_MAX :
-	      ((uint64_t) ctx->end | (PAGE_SIZE - 1));
+	/* The same bounds fuse_in_notify_range() answers from */
+	fuse_notify_ctx_pages(ctx, &start, &end);
 
 	return span->start >= start && span->end <= end;
 }
@@ -243,16 +244,20 @@ static bool fuse_dlm_trypin(struct fuse_inode *inode,
 
 	fuse_dlm_span_set(pin, offset, length, current);
 
+	spin_lock(&cache->pin_lock);
 	/*
 	 * The revoke handler driving this inode's page cache, over the
-	 * range it is taking away.  Anywhere else it pins like any other
-	 * writer; see fuse_dlm_in_own_fence().
+	 * range it is taking away: its own fence must not hold it up.
+	 * Anywhere else it pins like any other writer; see
+	 * fuse_dlm_in_own_fence().
+	 *
+	 * Published all the same.  fuse_dlm_unpin() finds a pin by task and
+	 * would otherwise drop an outer one this task holds, and a second
+	 * revoke arriving over the range has to wait for the page cache work
+	 * this one is doing.
 	 */
-	if (fuse_dlm_in_own_fence(pin))
-		return true;
-
-	spin_lock(&cache->pin_lock);
-	fenced = fuse_dlm_overlaps_locked(&cache->fences, pin->start,
+	fenced = !fuse_dlm_in_own_fence(pin) &&
+		 fuse_dlm_overlaps_locked(&cache->fences, pin->start,
 					  pin->end);
 	/*
 	 * At the head, so fuse_dlm_unpin() drops the innermost pin of a
