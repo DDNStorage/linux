@@ -1559,13 +1559,63 @@ err:
 	return err;
 }
 
+/*
+ * A FUSE_NOTIFY_DELETE waiting to run.  @name points into @namebuf, so the
+ * two are freed together.
+ */
+struct fuse_delete_work {
+	struct work_struct work;
+	struct fuse_conn *fc;
+	u64 parent;
+	u64 child;
+	struct qstr name;
+	char namebuf[];
+};
+
+/*
+ * fuse_reverse_inval_entry() takes i_rwsem on the parent and, for a delete,
+ * on the child as well.  A server that deletes from inside a handler it has
+ * not answered yet then blocks against its own reply: an ftruncate holds the
+ * child's i_rwsem until its SETATTR is answered, and the server answers only
+ * once this notify returns.  Nothing breaks that, however many threads the
+ * server has.
+ *
+ * So run it from here instead of from the notify.  The wait for i_rwsem then
+ * outlives the request that holds it, on a workqueue thread rather than on
+ * the server's, and the request it was waiting for can complete and let go.
+ *
+ * It can still wait a long time, and a stuck inode holds a workqueue thread
+ * and a reference on the parent for as long as it does.  That is the trade:
+ * a thread spent, rather than the two sides of a deadlock.
+ *
+ * Deletes are not ordered against each other here.  One arriving late cannot
+ * remove an entry that has since been looked up again, because
+ * fuse_reverse_inval_entry() matches the child nodeid before it deletes.
+ */
+static void fuse_delete_worker(struct work_struct *work)
+{
+	struct fuse_delete_work *fdw =
+		container_of(work, struct fuse_delete_work, work);
+	struct fuse_conn *fc = fdw->fc;
+
+	down_read(&fc->killsb);
+	/* Torn down while this was queued: there is nothing left to tell */
+	if (READ_ONCE(fc->connected))
+		fuse_reverse_inval_entry(fc, fdw->parent, fdw->child,
+					 &fdw->name, 0);
+	up_read(&fc->killsb);
+
+	kfree(fdw);
+	fuse_conn_put(fc);
+	module_put(THIS_MODULE);
+}
+
 static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
 			      struct fuse_copy_state *cs)
 {
 	struct fuse_notify_delete_out outarg;
+	struct fuse_delete_work *fdw = NULL;
 	int err;
-	char *buf = NULL;
-	struct qstr name;
 
 	err = -EINVAL;
 	if (size < sizeof(outarg))
@@ -1584,26 +1634,41 @@ static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
 		goto err;
 
 	err = -ENOMEM;
-	buf = kzalloc(outarg.namelen + 1, GFP_KERNEL);
-	if (!buf)
+	fdw = kzalloc(struct_size(fdw, namebuf, outarg.namelen + 1),
+		      GFP_KERNEL);
+	if (!fdw)
 		goto err;
 
-	name.name = buf;
-	name.len = outarg.namelen;
-	err = fuse_copy_one(cs, buf, outarg.namelen + 1);
+	err = fuse_copy_one(cs, fdw->namebuf, outarg.namelen + 1);
 	if (err)
 		goto err;
 	fuse_copy_finish(cs);
-	buf[outarg.namelen] = 0;
+	fdw->namebuf[outarg.namelen] = 0;
 
-	down_read(&fc->killsb);
-	err = fuse_reverse_inval_entry(fc, outarg.parent, outarg.child, &name, 0);
-	up_read(&fc->killsb);
-	kfree(buf);
-	return err;
+	/*
+	 * Handed to the worker, which answers for the connection reference,
+	 * the module reference and the allocation.  The notify is done; see
+	 * fuse_delete_worker() for what the server gives up by not waiting.
+	 *
+	 * The module reference is what keeps the worker's own text mapped:
+	 * nothing flushes the queue at teardown, and the connection
+	 * reference below keeps the connection alive but not the code that
+	 * runs on it, so an item still queued over an unmount would be
+	 * called into freed text by a later rmmod.
+	 */
+	__module_get(THIS_MODULE);
+	fdw->fc = fuse_conn_get(fc);
+	fdw->parent = outarg.parent;
+	fdw->child = outarg.child;
+	fdw->name.name = fdw->namebuf;
+	fdw->name.len = outarg.namelen;
+	INIT_WORK(&fdw->work, fuse_delete_worker);
+	queue_work(system_unbound_wq, &fdw->work);
+
+	return 0;
 
 err:
-	kfree(buf);
+	kfree(fdw);
 	fuse_copy_finish(cs);
 	return err;
 }
