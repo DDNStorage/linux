@@ -2164,8 +2164,7 @@ static inline unsigned int fuse_wr_pages(loff_t pos, size_t len,
 		     max_pages);
 }
 
-static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
-				  bool cache)
+static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 {
 	struct address_space *mapping = iocb->ki_filp->f_mapping;
 	struct inode *inode = mapping->host;
@@ -2195,14 +2194,6 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
 		if (count <= 0) {
 			err = count;
 		} else {
-			/*
-			 * On behalf of a buffered write whose bytes bypass
-			 * the page cache (DLM unaligned edges): the server
-			 * must classify them like the writeback they
-			 * replace.
-			 */
-			if (cache)
-				ia.write.in.write_flags |= FUSE_WRITE_CACHE;
 			err = fuse_send_write_pages(&ia, iocb, inode,
 						    pos, count);
 			if (!err) {
@@ -2416,116 +2407,115 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 }
 
 /*
- * Write @len bytes of @from at the current iocb position, either straight
- * through to the server (@through, for an unaligned edge) or into the page
- * cache (@through == false, for the aligned interior).  Both primitives
- * consume @len bytes from @from and advance iocb->ki_pos; the iterator is
- * temporarily capped to @len so the unconsumed tail stays available for the
- * next chunk.  Returns bytes written (< @len means a short write, the caller
- * stops) or a negative error.
+ * Is any folio of [@start, @end] under writeback?
  *
- * The grant over the chunk is confirmed and pinned across both, so the
- * bytes cannot become the server's under a revoke that has already been
- * answered.  For the cached interior that is one pin for the whole chunk:
- * ->write_begin and ->write_end have nowhere to keep a node that spans the
- * pair, and generic_perform_write() runs between them.  For the edges the
- * bytes never enter the page cache at all, so a revoke cannot find them by
- * flushing it and the pin has to cover the FUSE_WRITE itself, which is the
- * reply the revoke already waits for when the same bytes go through
- * writeback.
+ * Tag guided, so a range with nothing in flight costs one lookup.  The page
+ * cache has no predicate for this of its own: filemap_range_has_writeback()
+ * and filemap_range_needs_writeback() both answer true for a folio that is
+ * merely dirty, which is the ordinary state of a region being written, so a
+ * loop on either would never end.
  */
-static ssize_t fuse_dlm_write_chunk(struct kiocb *iocb, struct iov_iter *from,
-				    size_t len, bool through)
+static bool fuse_range_under_writeback(struct address_space *mapping,
+				       loff_t start, loff_t end)
 {
-	struct file *file = iocb->ki_filp;
-	struct fuse_dlm_span pin;
-	size_t hidden;
-	ssize_t res;
+	XA_STATE(xas, &mapping->i_pages, start >> PAGE_SHIFT);
+	pgoff_t max = end >> PAGE_SHIFT;
+	struct folio *folio;
+	bool under = false;
 
-	if (!len)
-		return 0;
+	if (end < start)
+		return false;
 
-	res = fuse_dlm_pin_write(file, &pin, iocb->ki_pos, len);
-	if (res)
-		return res;
+	rcu_read_lock();
+	xas_for_each_marked(&xas, folio, max, PAGECACHE_TAG_WRITEBACK) {
+		if (xas_retry(&xas, folio))
+			continue;
+		under = true;
+		break;
+	}
+	rcu_read_unlock();
 
-	/* Cap the iterator to this chunk, keeping the tail for later chunks. */
-	hidden = iov_iter_count(from) - len;
-	iov_iter_truncate(from, len);
-	res = through ? fuse_perform_write(iocb, from, true)
-		      : generic_perform_write(iocb, from);
-	/* Restore from the iterator's own residue, so short writes/errors
-	 * (which leave it partly advanced) reexpand to the exact remainder. */
-	iov_iter_reexpand(from, iov_iter_count(from) + hidden);
-
-	fuse_dlm_unpin(get_fuse_inode(file_inode(file)));
-
-	return res;
+	return under;
 }
 
 /*
- * Buffered write under DLM.  A partial folio dirtied for writeback would
- * have to be completed by reading the untouched remainder back from the
- * server, and for a write past the server EOF that READ can only return
- * zero bytes: a wasted round trip per unaligned edge.  So cache only the
- * page-aligned interior, whole folios need no read-modify-write, and
- * route the unaligned head and tail straight through to the server.  The
- * writethrough path writes just those bytes and leaves the folio
- * non-uptodate, doing no read, and each edge lands as an independent
- * FUSE_WRITE carrying FUSE_WRITE_CACHE like the writeback it replaces,
- * so writers sharing a boundary folio accumulate their bytes on the
- * server.  Aligned writes take the interior path whole; a
- * sub-page write with no aligned interior goes fully through.
+ * Buffered write under DLM.
+ *
+ * The grant over the whole region the write covers is confirmed and pinned
+ * once, for as long as the copy takes, so none of these bytes can become
+ * the server's under a revoke that has already been answered.  One write(2)
+ * is one operation against the cluster and holds the region for it.
+ *
+ * A pin is a range and a notify is matched against it a page at a time, so
+ * what it holds up is a revoke of these bytes and nothing else: writes on
+ * other regions of this inode pin their own and run beside it, and a notify
+ * landing elsewhere in the file does not see this write at all.  What keeps
+ * two writes over the same bytes apart is fuse_write_range_lock(), which is
+ * a range as well.
+ *
+ * The unaligned head and tail are cached like the rest.  A partly covered
+ * page is completed by reading the remainder back from the server, which is
+ * served under the write grant this holds: it is page rounded and
+ * exclusive, and a revoke drops the folio with it, so the page cannot reach
+ * the server stale.  The read goes out on the handle being written, which
+ * the server has to serve on a write-only open.
  */
 static ssize_t fuse_dlm_buffered_write(struct kiocb *iocb,
 				       struct iov_iter *from)
 {
+	struct file *file = iocb->ki_filp;
+	struct address_space *mapping = file->f_mapping;
+	struct fuse_inode *fi = get_fuse_inode(file_inode(file));
 	loff_t pos = iocb->ki_pos;
-	loff_t end = pos + iov_iter_count(from);
-	loff_t mid_start = round_up(pos, PAGE_SIZE);
-	loff_t mid_end = round_down(end, PAGE_SIZE);
-	ssize_t res, total = 0;
+	size_t count = iov_iter_count(from);
+	loff_t end = pos + count - 1;
+	struct fuse_dlm_span pin;
+	ssize_t res;
 
-	/* No whole folio inside the write: nothing cacheable, all through. */
-	if (mid_end <= mid_start)
-		return fuse_dlm_write_chunk(iocb, from,
-					    iov_iter_count(from), true);
+	for (;;) {
+		/*
+		 * Ahead of the pin.  ->write_begin() waits for the writeback
+		 * of each folio it hands out, and that wait is for the
+		 * FUSE_WRITE reply which ends it; a revoke of this region
+		 * drains the pins before it takes anything away, so under the
+		 * pin a server that is slow to answer -- one whose reply
+		 * threads are starved of CPU is enough -- puts every revoke
+		 * of the region, and behind the fence every other writer over
+		 * it, behind that one reply.
+		 *
+		 * Waiting only: the bytes here are about to be overwritten,
+		 * so starting writeback over them would send what this write
+		 * replaces.  Errors are left where they are for the fsync
+		 * that collects them.
+		 */
+		filemap_fdatawait_range_keep_errors(mapping, pos, end);
 
-	/* Unaligned head [pos, mid_start): through. */
-	res = fuse_dlm_write_chunk(iocb, from, mid_start - pos, true);
-	if (res < 0)
-		return total ? total : res;
-	total += res;
-	if (res < mid_start - pos)
-		return total;
+		res = fuse_dlm_pin_write(file, &pin, pos, count);
+		if (res)
+			return res;
 
-	/*
-	 * Aligned interior [mid_start, mid_end): cached whole folios, taken
-	 * one shard at a time.  fuse_dlm_write_chunk() pins the grant for
-	 * the length of a chunk and a revoke of the range waits for that,
-	 * so the chunk is what bounds how long a large write holds a notify
-	 * up.
-	 */
-	while (mid_start < mid_end) {
-		size_t chunk = min_t(loff_t, mid_end - mid_start,
-				     FUSE_DLM_SHARD_SIZE);
+		if (!fuse_range_under_writeback(mapping, pos, end))
+			break;
 
-		res = fuse_dlm_write_chunk(iocb, from, chunk, false);
-		if (res < 0)
-			return total ? total : res;
-		total += res;
-		if (res < chunk)
-			return total;
-		mid_start += chunk;
+		/*
+		 * Writeback started again while the pin was being taken.  Go
+		 * round and wait for that one with the pin dropped rather
+		 * than hold it over the reply after all.  It converges: each
+		 * pass waits the run out, and nothing dirties the region
+		 * behind this write, which holds it through
+		 * fuse_write_range_lock().
+		 */
+		fuse_dlm_unpin(fi);
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
 	}
 
-	/* Unaligned tail [mid_end, end): through. */
-	res = fuse_dlm_write_chunk(iocb, from, end - mid_end, true);
-	if (res < 0)
-		return total ? total : res;
-	total += res;
+	res = generic_perform_write(iocb, from);
 
-	return total;
+	fuse_dlm_unpin(fi);
+
+	return res;
 }
 
 /*
@@ -2920,11 +2910,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					(iocb->ki_pos - 1) >> PAGE_SHIFT);
 		} else {
 			/*
-			 * Under DLM the unaligned edges go through to the
-			 * server instead of being completed by a
-			 * read-modify-write READ (see
-			 * fuse_dlm_buffered_write()); only whole folios are
-			 * cached for writeback.
+			 * Under DLM the whole region the write covers is
+			 * pinned for the length of the copy; see
+			 * fuse_dlm_buffered_write().
 			 */
 			if (fc->dlm)
 				written = fuse_dlm_buffered_write(iocb, from);
@@ -2987,9 +2975,9 @@ writethrough:
 		if (written < 0 || !iov_iter_count(from))
 			goto out;
 		written = direct_write_fallback(iocb, from, written,
-				fuse_perform_write(iocb, from, false));
+				fuse_perform_write(iocb, from));
 	} else {
-		written = fuse_perform_write(iocb, from, false);
+		written = fuse_perform_write(iocb, from);
 	}
 out:
 	inode_unlock(inode);
@@ -4128,12 +4116,12 @@ static int fuse_writepages_fill(struct folio *folio,
 	}
 
 	/*
-	 * Everything dirty here was written whole by this client: the
-	 * unaligned edges of a cached write go to the server directly and
-	 * the interior covers whole pages, so nothing partly written is
-	 * ever dirtied.  There is nothing to classify, only the grant to
-	 * make sure of: a revoke may have arrived since the write, and
-	 * these bytes must not go out from under one.
+	 * Everything dirty here is a whole page this client is entitled to
+	 * send: a partly covered one was completed by a read back served
+	 * under the same write grant (fuse_write_begin()), so there is
+	 * nothing to classify, only the grant to make sure of.  A revoke
+	 * may have arrived since the write, and these bytes must not go out
+	 * from under one.
 	 *
 	 * fuse_dlm_regrant_range() takes the range back when it has gone,
 	 * and walks the record once under the lock held for read when it
