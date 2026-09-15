@@ -1292,7 +1292,9 @@ static int fuse_read_folio_retry(struct file *file, struct folio *folio,
 	folio_unlock(folio);
 
 	/* Wait the revoke out; what it leaves behind is asked for below */
-	fuse_dlm_pin(fi, &pin, pos, len);
+	err = fuse_dlm_pin(fi, &pin, pos, len);
+	if (err)
+		return err;
 	fuse_dlm_unpin(fi);
 
 	err = fuse_read_grant(file, pos, len, true);
@@ -2387,11 +2389,20 @@ static bool fuse_write_range_blocked(struct fuse_inode *fi,
  * this client against the cluster, not the tasks against each other.  No
  * revoke path takes this, so it may be held across a folio lock, a
  * read-modify-write and a grant request alike.
+ *
+ * Killable, because what is waited for is not bounded: the writer ahead
+ * may itself be parked on DLM round trips for as long as its range stays
+ * contended, and a task sitting here holds i_rwsem.
+ *
+ * Return: 0 with the bytes held, -EINTR if the wait was killed, in which
+ * case nothing is published and there is no unlock to pair.
  */
-static void fuse_write_range_lock(struct fuse_inode *fi,
-				  struct fuse_write_range *r, loff_t pos,
-				  size_t count)
+static int fuse_write_range_lock(struct fuse_inode *fi,
+				 struct fuse_write_range *r, loff_t pos,
+				 size_t count)
 {
+	int err = 0;
+
 	r->start = pos;
 	r->end = pos + count - 1;
 
@@ -2404,10 +2415,26 @@ static void fuse_write_range_lock(struct fuse_inode *fi,
 	list_add_tail(&r->list, &fi->wr_ranges);
 	while (fuse_write_range_blocked_locked(fi, r)) {
 		spin_unlock(&fi->wr_lock);
-		wait_event(fi->wr_wq, !fuse_write_range_blocked(fi, r));
+		err = wait_event_killable(fi->wr_wq,
+					  !fuse_write_range_blocked(fi, r));
 		spin_lock(&fi->wr_lock);
+		if (err) {
+			/*
+			 * Taken back off the list here rather than by an
+			 * unlock the caller no longer owes, and the writers
+			 * behind it woken: one of them may have been waiting
+			 * for this entry alone.
+			 */
+			list_del(&r->list);
+			spin_unlock(&fi->wr_lock);
+			wake_up_all(&fi->wr_wq);
+
+			return -EINTR;
+		}
 	}
 	spin_unlock(&fi->wr_lock);
+
+	return 0;
 }
 
 /**
@@ -2507,7 +2534,9 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 	int err;
 
 	for (;;) {
-		fuse_dlm_pin(fi, pin, pos, len);
+		err = fuse_dlm_pin(fi, pin, pos, len);
+		if (err)
+			return err;
 		/*
 		 * A server that turned out to have no DLM leaves nothing to
 		 * confirm, and the pin still pairs with the caller's unpin.
@@ -2530,8 +2559,7 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 			 * confirmation above to find.  The range is covered
 			 * cluster-wide; pin and proceed.
 			 */
-			fuse_dlm_pin(fi, pin, pos, len);
-			return 0;
+			return fuse_dlm_pin(fi, pin, pos, len);
 		}
 	}
 }
@@ -2972,7 +3000,18 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * generic_write_checks() has settled what the write covers.
 		 */
 		if (!exclusive) {
-			fuse_write_range_lock(fi, &wr, iocb->ki_pos, written);
+			err = fuse_write_range_lock(fi, &wr, iocb->ki_pos,
+						    written);
+			if (err) {
+				/*
+				 * Killed before anything was copied, and
+				 * `written` still holds the count
+				 * generic_write_checks() settled, which
+				 * wb_out would report as bytes written.
+				 */
+				written = err;
+				goto wb_out;
+			}
 			claimed = true;
 		}
 

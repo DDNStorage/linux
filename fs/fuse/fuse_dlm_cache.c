@@ -275,17 +275,31 @@ static bool fuse_dlm_trypin(struct fuse_inode *inode,
  * Must not be called with a folio held: the revoke waited for here drops
  * that same page cache once it has drained.  A revoke elsewhere in the
  * file is not waited for.
+ *
+ * Killable, since there is no bound on it: every revoke over the range
+ * republishes a fence, so a notify storm can keep a waiter here for as
+ * long as it lasts, and fuse_read_folio_retry() reaches it from a fault
+ * with mmap_lock held.  The callers that promise a killed task gets out
+ * pass the error on.
+ *
+ * Return: 0 with the range pinned, -EINTR if the wait was killed.
  */
-void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-		  loff_t offset, size_t length)
+int fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		 loff_t offset, size_t length)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 
 	/* A refusal leaves @pin holding the range it was refused over */
-	while (!fuse_dlm_trypin(inode, pin, offset, length))
-		wait_event(cache->pin_wq,
-			   !fuse_dlm_overlaps(cache, &cache->fences,
-					      pin->start, pin->end));
+	while (!fuse_dlm_trypin(inode, pin, offset, length)) {
+		if (wait_event_killable(cache->pin_wq,
+					!fuse_dlm_overlaps(cache,
+							   &cache->fences,
+							   pin->start,
+							   pin->end)))
+			return -EINTR;
+	}
+
+	return 0;
 }
 
 /**

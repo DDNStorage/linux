@@ -230,7 +230,7 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
  * until fuse_dlm_unpin(), which drops the pin this task last took.  @pin
  * is caller-owned storage, live until then.  fuse_dlm_pin() waits out a
  * revoke overlapping that range and must not be called with a folio
- * held.
+ * held; the wait is killable and it reports -EINTR.
  *
  * A pin must not be held across a request the server answers, since a
  * revoke waits its pins out and the server can be sitting in a handler
@@ -238,8 +238,8 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
  * holds one over its FUSE_WRITE because those bytes are in no page cache
  * and a revoke has no other way to find them.
  */
-void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-		  loff_t offset, size_t length);
+int fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+		 loff_t offset, size_t length);
 void fuse_dlm_unpin(struct fuse_inode *inode);
 
 /*
