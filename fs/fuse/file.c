@@ -4012,9 +4012,15 @@ static int fuse_writepage_locked(struct folio *folio)
 			return 0;
 		}
 
-		error = fuse_dlm_regrant_range(ff, inode, pos, pos + len - 1);
-		if (error < 0 && error != -ENOSYS)
-			goto err_writepage_args;
+		/*
+		 * Confirmed and pinned, so the folio goes out under a grant
+		 * that is held now and cannot be taken away before the bytes
+		 * are under writeback: a revoke of the range drains the pins
+		 * before fuse_dlm_unlock_range() removes anything, and one
+		 * already draining would have refused the pin.  Asking the
+		 * record a second time here would answer the same and cost a
+		 * round of the cache lock per folio.
+		 */
 	}
 queue:
 
@@ -4212,14 +4218,6 @@ static int fuse_writepages_fill(struct folio *folio,
 	 * nothing to classify, only the grant to make sure of.  A revoke
 	 * may have arrived since the write, and these bytes must not go out
 	 * from under one.
-	 *
-	 * fuse_dlm_regrant_range() takes the range back when it has gone,
-	 * and walks the record once under the lock held for read when it
-	 * has not.  On failure the folio goes back on the dirty list, so
-	 * the next writeback tries again: write_cache_pages() cleared it
-	 * before calling here and does not put it back itself, and these
-	 * bytes are not on the server.  A server with no DLM answers
-	 * -ENOSYS, which is not a failure.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
 		loff_t pos = folio_pos(folio);
@@ -4288,21 +4286,14 @@ static int fuse_writepages_fill(struct folio *folio,
 		}
 
 		/*
-		 * Held, and pinned so it stays held: this walks the record
-		 * and sends nothing.  It stays a call rather than the check
-		 * above so a grant that arrives between them is still used.
+		 * Confirmed and pinned, so the folio goes out under a grant
+		 * that is held now and cannot be taken away before the bytes
+		 * are under writeback: a revoke of the range drains the pins
+		 * before fuse_dlm_unlock_range() removes anything, and one
+		 * already draining would have refused the pin.  Asking the
+		 * record a second time here would answer the same and cost a
+		 * round of the cache lock per folio.
 		 */
-		err = fuse_dlm_regrant_range(data->ff, inode, pos,
-					     pos + len - 1);
-		if (err < 0 && err != -ENOSYS) {
-			fuse_writeback_redirty(fc, wbc, folio);
-			fuse_dlm_unpin(fi);
-			if (!data->defer_err)
-				data->defer_err = err;
-			err = 0;
-			goto out_unlock;
-		}
-		err = 0;
 	}
 queue:
 
