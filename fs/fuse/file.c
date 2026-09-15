@@ -616,8 +616,10 @@ static int fuse_release(struct inode *inode, struct file *file)
 	 * Dirty pages might remain despite write_inode_now() call from
 	 * fuse_flush() due to writes racing with the close.
 	 */
-	if (fc->writeback_cache)
+	if (fc->writeback_cache) {
 		write_inode_now(inode, 1);
+		fuse_writeback_deferred(inode, 0, LLONG_MAX);
+	}
 
 	fuse_release_common(file, false);
 
@@ -697,6 +699,10 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	if (err)
 		return err;
 
+	err = fuse_writeback_deferred(inode, 0, LLONG_MAX);
+	if (err)
+		return err;
+
 	err = filemap_check_errors(file->f_mapping);
 	if (err)
 		return err;
@@ -773,13 +779,14 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 
 	/*
 	 * Get the sending out of the way before the lock.  It is the long
-	 * part: a pass takes back every grant it finds gone, a cluster round
+	 * part: every grant a pass finds gone is taken back, a cluster round
 	 * trip each, and cached writers hold i_rwsem shared
 	 * (fuse_cache_wr_exclusive_lock()) and would all wait behind it.
 	 * Errors are left to the pass below, which collects them from the
 	 * mapping.
 	 */
 	filemap_fdatawrite_range(file->f_mapping, start, end);
+	fuse_writeback_deferred(inode, start, end);
 
 	inode_lock(inode);
 
@@ -789,6 +796,10 @@ static int fuse_fsync(struct file *file, loff_t start, loff_t end,
 	 * request.
 	 */
 	err = file_write_and_wait_range(file, start, end);
+	if (err)
+		goto out;
+
+	err = fuse_writeback_deferred(inode, start, end);
 	if (err)
 		goto out;
 
@@ -3980,13 +3991,6 @@ err:
 	return error;
 }
 
-/*
- * How many times a data integrity writeback goes round for folios it had to
- * skip.  Each pass takes the grants the one before it deferred, so one more
- * is normally enough; the cap is there because a revoke can take them again.
- */
-#define FUSE_WB_DEFER_PASSES 4
-
 struct fuse_fill_wb_data {
 	struct fuse_writepage_args *wpa;
 	struct fuse_file *ff;
@@ -4267,12 +4271,38 @@ out_unlock:
 	return err;
 }
 
+/*
+ * Remember [@start, @end) on the inode for fuse_writeback_deferred() to
+ * take back.  Merged with what is there up to a shard, the way a pass
+ * merges the folios it skips: the folios left out stay dirty and the scan
+ * that follows records them again.
+ */
+static void fuse_writeback_defer_record(struct fuse_inode *fi, u64 start,
+					u64 end)
+{
+	spin_lock(&fi->lock);
+	if (fi->wb_defer_end <= fi->wb_defer_start) {
+		fi->wb_defer_start = start;
+		fi->wb_defer_end = end;
+	} else {
+		u64 st = min(fi->wb_defer_start, start);
+		u64 en = max(fi->wb_defer_end, end);
+
+		if (en - st <= FUSE_DLM_SHARD_SIZE) {
+			fi->wb_defer_start = st;
+			fi->wb_defer_end = en;
+		}
+	}
+	spin_unlock(&fi->lock);
+}
+
 static int fuse_writepages(struct address_space *mapping,
 			   struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
+	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	unsigned int tries = FUSE_WB_DEFER_PASSES;
+	struct fuse_fill_wb_data data = { .inode = inode };
 	int err;
 
 	err = -EIO;
@@ -4283,53 +4313,43 @@ static int fuse_writepages(struct address_space *mapping,
 	    fc->num_background >= fc->congestion_threshold)
 		return 0;
 
+	err = write_cache_pages(mapping, wbc, fuse_writepages_fill, &data);
+	if (data.wpa) {
+		WARN_ON(!data.wpa->ia.ap.num_pages);
+		fuse_writepages_send(&data);
+	}
+
 	/*
-	 * A folio whose grant had gone is skipped and its range taken back
-	 * below, which leaves the folio dirty for a later pass.  For a data
-	 * integrity writeback there is no later pass: fsync() and close()
-	 * would report the bytes written while they are still only in the
-	 * page cache.  Go round again, now that the grant is held, until
-	 * nothing is left deferred.
+	 * A folio whose grant had gone is skipped and left dirty.  One pass
+	 * whatever the caller asked for: this runs under I_SYNC, behind
+	 * which every other flush of the inode waits with nothing to end
+	 * the wait, so nothing here goes round again or waits on the
+	 * cluster.  The range is recorded for fuse_writeback_deferred(),
+	 * which the data integrity callers run afterwards with no I_SYNC
+	 * held, and taken back once here, with no folio held, so the next
+	 * pass of any kind finds the grant.
+	 *
+	 * Not from a revoke handler: it would ask for the very range it is
+	 * revoking, so the folios it skipped stay dirty for an ordinary
+	 * writeback.
 	 */
-	do {
-		struct fuse_fill_wb_data data = { .inode = inode };
-		bool regranted = false;
+	if (data.regrant_end > data.regrant_start) {
+		fuse_writeback_defer_record(fi, data.regrant_start,
+					    data.regrant_end);
 
-		err = write_cache_pages(mapping, wbc, fuse_writepages_fill,
-					&data);
-		if (data.wpa) {
-			WARN_ON(!data.wpa->ia.ap.num_pages);
-			fuse_writepages_send(&data);
-		}
-
-		/*
-		 * Take back what the folios above had to skip, so the pass
-		 * that follows finds the grant and sends the folios they left
-		 * dirty.  With no folio held, which is the whole point.
-		 *
-		 * Not from a revoke handler: it would ask for the very range
-		 * it is revoking, so the folios it skipped stay dirty for an
-		 * ordinary writeback, and every pass here would skip them
-		 * again.
-		 */
-		if (data.ff && data.regrant_end > data.regrant_start &&
-		    !fuse_in_notify_ctx()) {
+		if (data.ff && !fuse_in_notify_ctx()) {
 			int rc = fuse_dlm_regrant_range(data.ff, inode,
 							data.regrant_start,
 							data.regrant_end - 1);
 
 			/*
-			 * Capture a deferred err so that a sync writeback
-			 * knows that a grant is not coming rather than
-			 * continuing to loop waiting for it.  Otherwise the
-			 * folios should stay dirty for a later pass.
-			 *
-			 * A grant the server gave and this client could not
-			 * record is one of those.  It is invisible to
-			 * fuse_dlm_lock_is_held(), so the pass that follows
-			 * defers every folio again and comes straight back
-			 * here, for as long as the allocation keeps failing.
-			 * Report it as the read side does rather than spin;
+			 * A grant that is not coming is reported, so the
+			 * callers do not keep asking for it.  A grant the
+			 * server gave and this client could not record is
+			 * one of those: it is invisible to
+			 * fuse_dlm_lock_is_held(), so every pass would defer
+			 * the folios again for as long as the allocation
+			 * keeps failing.  Report it as the read side does;
 			 * see fuse_read_folio_retry().
 			 */
 			if (rc < 0 && rc != -ENOSYS) {
@@ -4338,30 +4358,90 @@ static int fuse_writepages(struct address_space *mapping,
 			} else if (rc > 0) {
 				if (!data.defer_err)
 					data.defer_err = -ENOMEM;
-			} else {
-				regranted = true;
 			}
 		}
+	}
 
-		if (data.ff)
-			fuse_file_put(data.ff, false);
+	if (data.ff)
+		fuse_file_put(data.ff, false);
 
-		/*
-		 * A folio deferred with an error keeps its bytes, so report
-		 * the err the same way a failed send would, so that fsync and
-		 * close see it.
-		 */
-		if (data.defer_err && !err) {
-			err = data.defer_err;
-			mapping_set_error(mapping, err);
-		}
-
-		if (err || wbc->sync_mode != WB_SYNC_ALL || !regranted)
-			break;
-	} while (--tries);
+	/*
+	 * A folio deferred with an error keeps its bytes, so report the err
+	 * the same way a failed send would, so that fsync and close see it.
+	 */
+	if (data.defer_err && !err) {
+		err = data.defer_err;
+		mapping_set_error(mapping, err);
+	}
 
 out:
 	return err;
+}
+
+/**
+ * fuse_writeback_deferred - send the folios a writeback pass had to skip
+ * @inode: the inode written back
+ * @start: first byte of the range the caller is writing back
+ * @end: last byte of it
+ *
+ * For a data integrity writeback, once its pass has run and been waited
+ * for.  A pass skips a folio whose grant had gone and leaves it dirty, so
+ * on its own it would have fsync() and close() report bytes written that
+ * are still only in the page cache.  Take the range back and scan again,
+ * until a pass skips nothing.
+ *
+ * Here rather than in fuse_writepages(): ->writepages runs under I_SYNC,
+ * behind which every other flush of the inode waits with nothing to end
+ * the wait, and a range taken away as often as it is given keeps this
+ * going for as long as the contention lasts.  Nothing here holds I_SYNC,
+ * so a caller kept here holds up only itself, and a fatal signal ends it.
+ *
+ * Return: 0 once nothing is left deferred, an error otherwise.  The folios
+ * behind an error stay dirty.
+ */
+int fuse_writeback_deferred(struct inode *inode, loff_t start, loff_t end)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	int err;
+
+	if (!fc->dlm || !fc->writeback_cache)
+		return 0;
+
+	for (;;) {
+		struct fuse_file *ff;
+		u64 dstart, dend;
+
+		spin_lock(&fi->lock);
+		dstart = fi->wb_defer_start;
+		dend = fi->wb_defer_end;
+		fi->wb_defer_start = 0;
+		fi->wb_defer_end = 0;
+		spin_unlock(&fi->lock);
+		if (dend <= dstart)
+			return 0;
+
+		/* No file open for writing, so nothing can send them */
+		ff = __fuse_write_file_get(fi);
+		if (!ff)
+			return -EIO;
+
+		err = fuse_dlm_regrant_range(ff, inode, dstart, dend - 1);
+		fuse_file_put(ff, false);
+		if (err > 0)
+			err = -ENOMEM;
+		if (err && err != -ENOSYS) {
+			mapping_set_error(inode->i_mapping, err);
+			return err;
+		}
+
+		err = filemap_write_and_wait_range(inode->i_mapping, start,
+						   end);
+		if (err)
+			return err;
+		if (fatal_signal_pending(current))
+			return -EINTR;
+	}
 }
 
 /*
@@ -4526,9 +4606,12 @@ static int fuse_launder_folio(struct folio *folio)
  */
 static void fuse_vma_close(struct vm_area_struct *vma)
 {
+	struct inode *inode = vma->vm_file->f_mapping->host;
 	int err;
 
-	err = write_inode_now(vma->vm_file->f_mapping->host, 1);
+	err = write_inode_now(inode, 1);
+	if (!err)
+		err = fuse_writeback_deferred(inode, 0, LLONG_MAX);
 	mapping_set_error(vma->vm_file->f_mapping, err);
 }
 
@@ -5242,6 +5325,8 @@ static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
 	int err = filemap_write_and_wait_range(inode->i_mapping, start, LLONG_MAX);
 
 	if (!err)
+		err = fuse_writeback_deferred(inode, start, LLONG_MAX);
+	if (!err)
 		fuse_sync_writes(inode);
 
 	return err;
@@ -5559,6 +5644,8 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->read_stream_run = 0;
 	atomic_set(&fi->size_extenders, 0);
 	fi->wb_crop = 0;
+	fi->wb_defer_start = 0;
+	fi->wb_defer_end = 0;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);

@@ -369,6 +369,16 @@ struct fuse_inode {
 			 * writeback-cache regular files only.
 			 */
 			loff_t wb_crop;
+
+			/*
+			 * The range a writeback pass had to leave dirty
+			 * because the grant over it had gone, for
+			 * fuse_writeback_deferred() to take back and scan
+			 * for again with no I_SYNC held.  End exclusive,
+			 * empty when end <= start.  Protected by fi->lock
+			 */
+			u64 wb_defer_start;
+			u64 wb_defer_end;
 		};
 
 		/* readdir cache (directory only) */
@@ -1661,6 +1671,7 @@ void fuse_set_nowrite(struct inode *inode);
 void fuse_release_nowrite(struct inode *inode);
 bool fuse_writeback_hold(struct inode *inode);
 void fuse_writeback_unhold(struct inode *inode);
+int fuse_writeback_deferred(struct inode *inode, loff_t start, loff_t end);
 
 void fuse_inode_wire_begin(struct inode *inode);
 void fuse_inode_wire_end(struct inode *inode);

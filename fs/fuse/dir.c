@@ -2143,6 +2143,10 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		if (err)
 			return err;
 
+		err = fuse_writeback_deferred(inode, 0, LLONG_MAX);
+		if (err)
+			return err;
+
 		fuse_set_nowrite(inode);
 		fuse_release_nowrite(inode);
 	}
