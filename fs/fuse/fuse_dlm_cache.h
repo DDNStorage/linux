@@ -230,19 +230,29 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
  * until fuse_dlm_unpin(), which drops the pin this task last took.  @pin
  * is caller-owned storage, live until then.  fuse_dlm_pin() waits out a
  * revoke overlapping that range and must not be called with a folio
- * held; fuse_dlm_trypin() never sleeps and fails instead.
+ * held.
  *
  * A pin must not be held across a request the server answers, since a
  * revoke waits its pins out and the server can be sitting in a handler
- * it has not answered.  The writethrough write is the one exception, and
+ * it has not answered.  The streamed write is the one exception, and
  * holds one over its FUSE_WRITE because those bytes are in no page cache
  * and a revoke has no other way to find them.
  */
 void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 		  loff_t offset, size_t length);
-bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-		     loff_t offset, size_t length);
 void fuse_dlm_unpin(struct fuse_inode *inode);
+
+/*
+ * Pin a range and confirm the grant over it as one step, which is the
+ * order every IO site needs: pin first, confirm second, publish nothing
+ * if either fails.  False means the caller may not touch the page cache
+ * over that range yet, whether because a revoke is draining or because
+ * no grant covers it.  Never sleeps, so a caller holding a folio may
+ * use it.
+ */
+bool fuse_dlm_trypin_held(struct fuse_inode *inode, struct fuse_dlm_span *pin,
+			  loff_t offset, size_t length,
+			  enum fuse_page_lock_mode mode);
 
 /*
  * Fence the writers that hold a grant over [@offset, @offset + @len) but
