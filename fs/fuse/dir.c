@@ -2150,6 +2150,32 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (is_truncate) {
 		fuse_set_nowrite(inode);
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
+		/*
+		 * Hand the grants back before asking, not after the reply.
+		 * A shrink is the server taking bytes this client holds a
+		 * write grant over, so a SETATTR sent while the grants stand
+		 * leaves it no way through but to revoke them, and it does
+		 * that from inside the handler and waits for the notify
+		 * before it answers.  That notify then runs against a task
+		 * holding i_rwsem and the freeze, with waits of its own that
+		 * the server can no longer serve.  Dropped here there is
+		 * nothing left to revoke, and the atomic-O_TRUNC branch
+		 * above already drops them this way for the same request.
+		 *
+		 * Every grant, not just the tail: which range the server has
+		 * to take for a size change is its own business, and a revoke
+		 * anywhere in the file reaches the same handler.
+		 *
+		 * Nothing has to be fenced out for it, by the same argument
+		 * the O_TRUNC branch makes: i_rwsem is held exclusive so no
+		 * cached write is in progress, the folios above the new size
+		 * are discarded rather than written (truncate_pagecache()
+		 * below), and what stays dirty below it is on a range
+		 * fuse_dlm_unlock_range() keeps marked, so writeback takes
+		 * the grant again before it sends any of it.
+		 */
+		if (fc->dlm && fc->writeback_cache)
+			fuse_dlm_cache_release_locks(fi);
 		if (trust_local_cmtime && attr->ia_size != inode->i_size)
 			attr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
 	}
@@ -2246,6 +2272,12 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 * Revoke past the new size and drop what is beyond it; see
 		 * the atomic-O_TRUNC branch above for why this needs nothing
 		 * fenced out.  i_rwsem is held exclusive here as well.
+		 *
+		 * The truncate released every grant before it sent, so this
+		 * is normally a walk over an empty cache.  It stays because
+		 * the server can answer a size other than the one asked for,
+		 * and because a reader can have taken a grant back over the
+		 * tail while the SETATTR was on the wire.
 		 */
 		if (fc->dlm && fc->writeback_cache)
 			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK,
