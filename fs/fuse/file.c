@@ -3999,6 +3999,11 @@ struct fuse_fill_wb_data {
 	 */
 	u64 regrant_start;
 	u64 regrant_end;
+	/*
+	 * Deferred run error returned from fuse_dlm_regrant_range() and
+	 * stored by fuse_writepages()
+	 */
+	int defer_err;
 };
 
 static bool fuse_pages_realloc(struct fuse_fill_wb_data *data)
@@ -4309,14 +4314,47 @@ static int fuse_writepages(struct address_space *mapping,
 		 */
 		if (data.ff && data.regrant_end > data.regrant_start &&
 		    !fuse_in_notify_ctx()) {
-			fuse_dlm_regrant_range(data.ff, inode,
-					       data.regrant_start,
-					       data.regrant_end - 1);
-			regranted = true;
+			int rc = fuse_dlm_regrant_range(data.ff, inode,
+							data.regrant_start,
+							data.regrant_end - 1);
+
+			/*
+			 * Capture a deferred err so that a sync writeback
+			 * knows that a grant is not coming rather than
+			 * continuing to loop waiting for it.  Otherwise the
+			 * folios should stay dirty for a later pass.
+			 *
+			 * A grant the server gave and this client could not
+			 * record is one of those.  It is invisible to
+			 * fuse_dlm_lock_is_held(), so the pass that follows
+			 * defers every folio again and comes straight back
+			 * here, for as long as the allocation keeps failing.
+			 * Report it as the read side does rather than spin;
+			 * see fuse_read_folio_retry().
+			 */
+			if (rc < 0 && rc != -ENOSYS) {
+				if (!data.defer_err)
+					data.defer_err = rc;
+			} else if (rc > 0) {
+				if (!data.defer_err)
+					data.defer_err = -ENOMEM;
+			} else {
+				regranted = true;
+			}
 		}
 
 		if (data.ff)
 			fuse_file_put(data.ff, false);
+
+		/*
+		 * A folio deferred with an error keeps its bytes, so report
+		 * the err the same way a failed send would, so that fsync and
+		 * close see it.
+		 */
+		if (data.defer_err && !err) {
+			err = data.defer_err;
+			mapping_set_error(mapping, err);
+		}
 
 		if (err || wbc->sync_mode != WB_SYNC_ALL || !regranted)
 			break;
