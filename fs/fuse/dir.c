@@ -2013,6 +2013,7 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
 	FUSE_ARGS(args);
 	struct fuse_setattr_in inarg;
 	struct fuse_attr_out outarg;
+	int err;
 
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outarg, 0, sizeof(outarg));
@@ -2037,7 +2038,12 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
 		inarg.valid |= FATTR_WRITEBACK;
 	fuse_setattr_fill(fm->fc, &args, inode, &inarg, &outarg);
 
-	return fuse_simple_request(fm, &args);
+	/* No freeze here, and the server may revoke from the handler */
+	fuse_inode_wire_begin(inode);
+	err = fuse_simple_request(fm, &args);
+	fuse_inode_wire_end(inode);
+
+	return err;
 }
 
 /*
@@ -2174,7 +2180,16 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	attr_version = fuse_get_attr_version(fm->fc);
 	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
+	/*
+	 * A server that has to revoke this inode to carry the SETATTR out
+	 * sends the notify from inside the handler and answers only once it
+	 * returns, so nothing the revoke reaches may wait for a reply.  The
+	 * truncate holds a freeze that says so; the rest do not, and this
+	 * count covers both.  See fuse_writeback_hold().
+	 */
+	fuse_inode_wire_begin(inode);
 	err = fuse_simple_request(fm, &args);
+	fuse_inode_wire_end(inode);
 	if (err) {
 		if (err == -EINTR)
 			fuse_invalidate_attr(inode);

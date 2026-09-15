@@ -269,6 +269,15 @@ struct fuse_inode {
 			 */
 			int wb_holds;
 
+			/*
+			 * SETATTRs of this client's that are on the wire.
+			 * The server may revoke this inode from inside such
+			 * a handler and answer only once the notify returns,
+			 * so fuse_writeback_hold() refuses while this is up.
+			 * Protected by fi->lock
+			 */
+			int wire_ctr;
+
 			/** Number of files/maps using page cache */
 			int iocachectr;
 
@@ -1649,6 +1658,9 @@ void fuse_set_nowrite(struct inode *inode);
 void fuse_release_nowrite(struct inode *inode);
 bool fuse_writeback_hold(struct inode *inode);
 void fuse_writeback_unhold(struct inode *inode);
+
+void fuse_inode_wire_begin(struct inode *inode);
+void fuse_inode_wire_end(struct inode *inode);
 
 /*
  * A truncate has lowered i_size under fuse_set_nowrite().  That shrink is

@@ -739,6 +739,7 @@ int fuse_fsync_common(struct file *file, loff_t start, loff_t end,
 	struct fuse_file *ff = file->private_data;
 	FUSE_ARGS(args);
 	struct fuse_fsync_in inarg;
+	int err;
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
@@ -748,7 +749,16 @@ int fuse_fsync_common(struct file *file, loff_t start, loff_t end,
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
-	return fuse_simple_request(fm, &args);
+	/*
+	 * Sent under i_rwsem with the freeze already released, so a server
+	 * that has to revoke this client to carry it out sends the notify
+	 * from inside the handler; see fuse_writeback_hold().
+	 */
+	fuse_inode_wire_begin(inode);
+	err = fuse_simple_request(fm, &args);
+	fuse_inode_wire_end(inode);
+
+	return err;
 }
 
 static int fuse_fsync(struct file *file, loff_t start, loff_t end,
@@ -3467,6 +3477,17 @@ __acquires(fi->lock)
  * answered it, which it is waiting for this very handler to let it do.  The
  * caller drops the range without writing it back instead.
  *
+ * Refused as well while a request of this client's is on the wire for the
+ * inode, where no freeze is held but the reply is just as far away: a server
+ * that revokes this inode from inside the handler for that request answers
+ * only once the notify returns, so a wait for a FUSE_WRITE reply inside that
+ * handler never ends.  fuse_inode_wire_begin() puts the count up.
+ *
+ * The test on writectr alone covers only the truncate and the O_TRUNC open,
+ * which hold a freeze across their request.  A chmod, a chown, the
+ * ->write_inode times flush, a FALLOCATE, a COPY_FILE_RANGE and an FSYNC all
+ * send without one.
+ *
  * On true the hold biases writectr the way a sent write does, so
  * fuse_set_nowrite() waits it out: no freeze can be established behind this
  * test, and until the hold goes fuse_flush_writepages() keeps sending.
@@ -3477,7 +3498,7 @@ bool fuse_writeback_hold(struct inode *inode)
 	bool held;
 
 	spin_lock(&fi->lock);
-	held = fi->writectr >= 0;
+	held = fi->writectr >= 0 && !fi->wire_ctr;
 	if (held) {
 		fi->writectr++;
 		fi->wb_holds++;
@@ -3485,6 +3506,51 @@ bool fuse_writeback_hold(struct inode *inode)
 	spin_unlock(&fi->lock);
 
 	return held;
+}
+
+/**
+ * fuse_inode_wire_begin - account a request this client is about to send
+ * @inode: the inode it is sent on
+ *
+ * Paired with fuse_inode_wire_end() around the request itself.  The count is
+ * what fuse_writeback_hold() refuses on; see there for why.  Kept only for
+ * the regular writeback-cache files that have the counter, which are the
+ * ones the invalidate paths flush.
+ *
+ * Every request that holds i_rwsem across a round trip belongs here, since
+ * a server needing this inode's grants to carry it out sends the notify from
+ * inside that handler.  SETATTR, FALLOCATE, COPY_FILE_RANGE and FSYNC are
+ * the ones that do.
+ */
+void fuse_inode_wire_begin(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (!get_fuse_conn(inode)->writeback_cache || !S_ISREG(inode->i_mode))
+		return;
+
+	spin_lock(&fi->lock);
+	fi->wire_ctr++;
+	spin_unlock(&fi->lock);
+}
+
+/**
+ * fuse_inode_wire_end - the SETATTR fuse_inode_wire_begin() counted is answered
+ * @inode: the inode it was sent on
+ *
+ * Nothing waits on the count: a hold refused while it was up has dropped
+ * its range already.
+ */
+void fuse_inode_wire_end(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (!get_fuse_conn(inode)->writeback_cache || !S_ISREG(inode->i_mode))
+		return;
+
+	spin_lock(&fi->lock);
+	fi->wire_ctr--;
+	spin_unlock(&fi->lock);
 }
 
 /**
@@ -5148,7 +5214,14 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 	args.in_numargs = 1;
 	args.in_args[0].size = sizeof(inarg);
 	args.in_args[0].value = &inarg;
+	/*
+	 * A server that has to revoke this client's grants to punch the hole
+	 * sends the notify from inside this handler, and answers only once it
+	 * returns; see fuse_writeback_hold().
+	 */
+	fuse_inode_wire_begin(inode);
 	err = fuse_simple_request(fm, &args);
+	fuse_inode_wire_end(inode);
 	if (err == -ENOSYS) {
 		fm->fc->no_fallocate = 1;
 		err = -EOPNOTSUPP;
@@ -5260,7 +5333,10 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 	args.out_numargs = 1;
 	args.out_args[0].size = sizeof(outarg);
 	args.out_args[0].value = &outarg;
+	/* The destination's grants are what a server would have to revoke */
+	fuse_inode_wire_begin(inode_out);
 	err = fuse_simple_request(fm, &args);
+	fuse_inode_wire_end(inode_out);
 	if (err == -ENOSYS) {
 		fc->no_copy_file_range = 1;
 		err = -EOPNOTSUPP;
