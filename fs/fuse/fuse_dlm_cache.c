@@ -32,13 +32,6 @@
 
 
 /*
- * How often to ask again for a grant a revoke killed while it was in
- * flight, or the server refused as contended, before giving up on the
- * range.  Each pass is a round trip.
- */
-#define FUSE_DLM_GRANT_RETRIES 16
-
-/*
  * How far beyond the requested range a grant is recorded.
  *
  * A server may grant more than was asked for, and recording the extra is
@@ -930,7 +923,6 @@ static int __fuse_get_dlm_lock(struct fuse_file *ff, struct inode *inode,
 	struct fuse_dlm_range req;
 	uint64_t pg_start, pg_end;
 	uint64_t grant_start, grant_end;
-	int tries = FUSE_DLM_GRANT_RETRIES;
 	int err;
 
 	/* An empty range needs no lock. */
@@ -1068,16 +1060,21 @@ restart:
 
 retry:
 	/*
-	 * Ask again, but not forever.  Every pass is a whole round trip,
-	 * which throttles the loop but does not end it, and writeback asks
-	 * for a grant with a folio locked, so a node taking the range as
-	 * fast as this asks for it would hold that folio and this task for
-	 * as long as it kept going.
+	 * Ask again, for as long as it takes.  Every pass is a whole round
+	 * trip, so a range being taken away as fast as it is given paces
+	 * this loop rather than spinning it, and no caller holds a folio
+	 * while a request is out: writeback confirms its grant under a pin
+	 * and so never reaches the request below, and ->readahead asks for
+	 * nothing.
+	 *
+	 * A count would turn a contended range into an IO error, which the
+	 * callers cannot tell from a real one and which a write reports to
+	 * a caller that has no reason to expect it.  Waiting out the
+	 * notifications that caused it is the better answer.  A fatal
+	 * signal still ends it, so a killed task and close() get out.
 	 */
 	if (fatal_signal_pending(current))
 		return -EINTR;
-	if (!tries--)
-		return -EIO;
 	goto restart;
 }
 

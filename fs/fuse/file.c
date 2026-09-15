@@ -2439,13 +2439,6 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
 }
 
 /*
- * How many times a writer confirms its grant again before giving up on
- * the range.  A pass costs a round trip only when the grant has gone,
- * which is a revoke landing between the request and the confirmation.
- */
-#define FUSE_DLM_PIN_RETRIES 16
-
-/*
  * Pin [@pos, @pos + @len) with the grant over it confirmed, so the bytes
  * can be dirtied under a lock that cannot be taken away meanwhile; see
  * fuse_dlm_pin().  @pin is the caller's storage for the pin, which it
@@ -2455,6 +2448,14 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len)
  * held across that request: it is answered by the server the revoke
  * waiting for the pin came from.  So confirm and request alternate, and
  * no folio may be held here.
+ *
+ * Not capped.  A pass costs a round trip only when the grant has gone,
+ * which is a revoke landing between the request and the confirmation, so
+ * a busy range paces the loop rather than ending it.  Giving up would
+ * fail a write the caller has no reason to expect to fail and cannot
+ * distinguish from a real one, over a range that is contended and
+ * nothing worse.  A fatal signal ends it instead, so a killed task and
+ * close() get out.
  */
 static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 			      loff_t pos, size_t len)
@@ -2462,7 +2463,6 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 	struct inode *inode = file_inode(file);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
-	unsigned int tries = FUSE_DLM_PIN_RETRIES;
 	int err;
 
 	for (;;) {
@@ -2476,8 +2476,8 @@ static int fuse_dlm_pin_write(struct file *file, struct fuse_dlm_span *pin,
 			return 0;
 		fuse_dlm_unpin(fi);
 
-		if (!tries--)
-			return -EIO;
+		if (fatal_signal_pending(current))
+			return -EINTR;
 
 		err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE);
 		if (err < 0 && err != -ENOSYS)
