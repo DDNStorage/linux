@@ -1052,22 +1052,24 @@ static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
  * drops the same folios without ever waiting for the server.
  *
  * The same substitution is forced while writepages are frozen
- * (fuse_set_nowrite(): truncate, O_TRUNC open, fsync, pre-SETATTR flush),
- * where no reply can arrive because fuse_flush_writepages() parks the
- * request on fi->queued_writes until fuse_release_nowrite().  A server that
- * revokes from inside the handler it is revoking for would otherwise
- * deadlock against its own reply.  fuse_do_setattr() states the same rule
- * for its own invalidate.  There the dirty folios are left behind, and the
- * freezes that span a request drop the cache themselves once they complete:
- * fuse_do_setattr() invalidates the mapping after releasing the freeze, the
- * O_TRUNC open path calls truncate_pagecache().
+ * (fuse_set_nowrite(): truncate, O_TRUNC open, fsync, pre-SETATTR flush):
+ * fuse_flush_writepages() parks what a launder would send on
+ * fi->queued_writes until fuse_release_nowrite(), and a freeze that spans a
+ * request lifts only on the answer to it, which the server is waiting for
+ * this handler to let it give.  Which thread of the server revokes makes no
+ * difference to that.  fuse_do_setattr() states the same rule for its own
+ * invalidate.  The dirty folios are left behind, and the freezes that span a
+ * request drop the cache themselves once they complete: fuse_do_setattr()
+ * invalidates the mapping after releasing the freeze, the O_TRUNC open path
+ * calls truncate_pagecache().
+ *
+ * fuse_writeback_hold() makes that call, and keeps a freeze from starting
+ * between it and the folios going under writeback.
  */
 static void fuse_invalidate_mapping_range(struct inode *inode, pgoff_t start,
 					  pgoff_t end, bool may_be_dirty)
 {
-	struct fuse_inode *fi = get_fuse_inode(inode);
 	loff_t last;
-	bool frozen;
 
 	/*
 	 * Writeback state exists on regular files only, in the union arm
@@ -1078,11 +1080,7 @@ static void fuse_invalidate_mapping_range(struct inode *inode, pgoff_t start,
 		return;
 	}
 
-	spin_lock(&fi->lock);
-	frozen = fi->writectr < 0;
-	spin_unlock(&fi->lock);
-
-	if (frozen || !may_be_dirty) {
+	if (!may_be_dirty || !fuse_writeback_hold(inode)) {
 		invalidate_mapping_pages(inode->i_mapping, start, end);
 		return;
 	}
@@ -1098,6 +1096,7 @@ static void fuse_invalidate_mapping_range(struct inode *inode, pgoff_t start,
 	filemap_write_and_wait_range(inode->i_mapping,
 				     (loff_t)start << PAGE_SHIFT, last);
 	invalidate_inode_pages2_range(inode->i_mapping, start, end);
+	fuse_writeback_unhold(inode);
 }
 
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
@@ -1109,6 +1108,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	pgoff_t pg_start;
 	pgoff_t pg_end;
 	bool tracked;
+	int err = 0;
 
 	inode = fuse_ilookup(fc, nodeid, NULL);
 	if (!inode)
@@ -1273,10 +1273,34 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * fuse_invalidate_mapping_range() states for a frozen
 			 * inode.  The error is left to the mapping, where
 			 * fsync collects it.
+			 *
+			 * Not while writepages are frozen, where the wait is
+			 * for replies fuse_flush_writepages() holds back until
+			 * a freeze that lifts on the answer to the request
+			 * this handler is blocking.  The hold decides it and
+			 * keeps the freeze off for the flush.
+			 *
+			 * Refused, the bytes cannot be put on the server and
+			 * the grants must not be given up either: the drop
+			 * below leaves a dirty folio where it is, so answering
+			 * the notify would hand the lock to another node with
+			 * bytes still here that writeback puts on top of
+			 * whatever that node writes.  Tell the server the
+			 * revoke did not happen and let it come back once it
+			 * has answered the request that is holding this client
+			 * up, which is its own.
 			 */
-			if (has_pages && may_be_dirty)
+			if (has_pages && may_be_dirty &&
+			    !fuse_writeback_hold(inode)) {
+				err = -EAGAIN;
+				goto unfence;
+			}
+
+			if (has_pages && may_be_dirty) {
 				filemap_write_and_wait_range(inode->i_mapping,
 							     offset, end_byte);
+				fuse_writeback_unhold(inode);
+			}
 
 			fuse_dlm_revoke_inval_range(fi, offset, len);
 
@@ -1335,12 +1359,14 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			fuse_invalidate_mapping_range(inode, pg_start, pg_end,
 						      true);
 		}
+unfence:
 		if (fenced)
 			fuse_dlm_revoke_end(fi, &fence);
 		fuse_notify_ctx_leave(notify_ctx);
 	}
 	iput(inode);
-	return 0;
+
+	return err;
 }
 
 bool fuse_lock_inode(struct inode *inode)

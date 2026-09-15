@@ -3371,8 +3371,12 @@ static void fuse_writepage_finish(struct fuse_writepage_args *wpa)
  * have its last folio sent whole instead of clipped at EOF.  See
  * fuse_flush_writepages().
  *
- * A freeze makes fi->writectr negative, which is neither sent nor retired,
- * and no crop moves under one.
+ * It is the holds rather than zero that says nothing is on the wire.
+ * fuse_writeback_hold() biases fi->writectr for as long as it is up, so a
+ * comparison against zero cannot come true for anything retired during a
+ * notify driven flush, and the unhold does not settle the crop either.  A
+ * freeze makes fi->writectr negative, which is neither, and no crop moves
+ * under one.
  *
  * Called under fi->lock from every path that retires a writepage request.
  */
@@ -3380,8 +3384,8 @@ static void fuse_writeback_crop_settle(struct inode *inode)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
-	if (get_fuse_conn(inode)->writeback_cache && fi->writectr == 0 &&
-	    list_empty(&fi->queued_writes))
+	if (get_fuse_conn(inode)->writeback_cache &&
+	    fi->writectr == fi->wb_holds && list_empty(&fi->queued_writes))
 		fi->wb_crop = i_size_read(inode);
 }
 
@@ -3438,9 +3442,61 @@ __acquires(fi->lock)
 	spin_lock(&fi->lock);
 }
 
+/**
+ * fuse_writeback_hold - keep writepages sendable across a wait for them
+ * @inode: inode whose mapping is about to be written back
+ *
+ * For the invalidate paths, which write a range back and then wait for the
+ * FUSE_WRITE replies.  Returns false if writepages are frozen: what such a
+ * caller queues parks on fi->queued_writes, and the freezes that span a
+ * request (fuse_do_setattr(), the O_TRUNC open) lift only once the server has
+ * answered it, which it is waiting for this very handler to let it do.  The
+ * caller drops the range without writing it back instead.
+ *
+ * On true the hold biases writectr the way a sent write does, so
+ * fuse_set_nowrite() waits it out: no freeze can be established behind this
+ * test, and until the hold goes fuse_flush_writepages() keeps sending.
+ */
+bool fuse_writeback_hold(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	bool held;
+
+	spin_lock(&fi->lock);
+	held = fi->writectr >= 0;
+	if (held) {
+		fi->writectr++;
+		fi->wb_holds++;
+	}
+	spin_unlock(&fi->lock);
+
+	return held;
+}
+
+/**
+ * fuse_writeback_unhold - drop the hold fuse_writeback_hold() took
+ * @inode: the inode it was taken on
+ *
+ * Nothing is left to flush: every request queued under the hold went out.
+ */
+void fuse_writeback_unhold(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	spin_lock(&fi->lock);
+	fi->wb_holds--;
+	fi->writectr--;
+	wake_up(&fi->page_waitq);
+	spin_unlock(&fi->lock);
+}
+
 /*
  * If fi->writectr is positive (no truncate or fsync going on) send
  * all queued writepage requests.
+ *
+ * A hold keeps them going while a freeze is merely pending: the holder waits
+ * for these replies, and fuse_set_nowrite() has not returned yet, so the
+ * request it guards is not on the wire and nothing is out of order.
  *
  * Called with fi->lock
  */
@@ -3484,7 +3540,8 @@ __acquires(fi->lock)
 		crop = fi->wb_crop;
 	}
 
-	while (fi->writectr >= 0 && !list_empty(&fi->queued_writes)) {
+	while ((fi->writectr >= 0 || fi->wb_holds) &&
+	       !list_empty(&fi->queued_writes)) {
 		wpa = list_entry(fi->queued_writes.next,
 				 struct fuse_writepage_args, queue_entry);
 		list_del_init(&wpa->queue_entry);

@@ -260,6 +260,15 @@ struct fuse_inode {
 			 * (FUSE_NOWRITE) means more writes are blocked */
 			int writectr;
 
+			/*
+			 * Writebacks an invalidate is waiting for
+			 * (fuse_writeback_hold()).  Each biases writectr as
+			 * well, so fuse_set_nowrite() waits them out and a
+			 * freeze can only be pending while one is up, never
+			 * established.  Protected by fi->lock
+			 */
+			int wb_holds;
+
 			/** Number of files/maps using page cache */
 			int iocachectr;
 
@@ -1638,6 +1647,8 @@ void fuse_flush_writepages(struct inode *inode);
 
 void fuse_set_nowrite(struct inode *inode);
 void fuse_release_nowrite(struct inode *inode);
+bool fuse_writeback_hold(struct inode *inode);
+void fuse_writeback_unhold(struct inode *inode);
 
 /*
  * A truncate has lowered i_size under fuse_set_nowrite().  That shrink is
