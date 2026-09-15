@@ -204,6 +204,18 @@ struct dlm_locked_area
 #define FUSE_WRITE_STREAM_MIN		(64 * 1024)
 #define FUSE_READ_STREAM_MIN		(10 * PAGE_SIZE)
 
+/*
+ * A write(2) extent held against the other writers of the same inode.
+ * Caller storage, live from fuse_write_range_lock() until the matching
+ * unlock.
+ */
+struct fuse_write_range {
+	/* Byte offsets, both inclusive */
+	loff_t			start;
+	loff_t			end;
+	struct list_head	list;
+};
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -352,6 +364,24 @@ struct fuse_inode {
 			 * and every writer clears it.
 			 */
 			atomic_t size_extenders;
+
+			/*
+			 * The buffered writes in flight over this inode,
+			 * one entry per write(2) over the bytes it covers.
+			 * A write waits for the overlapping entries
+			 * published before its own, so two writers on the
+			 * same bytes do not interleave a folio at a time.
+			 *
+			 * Node local.  The DLM grant over those bytes is
+			 * held by the node rather than by a task: it orders
+			 * this client against the rest of the cluster and
+			 * says nothing about the writers on it.  Nothing in
+			 * the revoke path takes this, so a revoke never
+			 * waits behind a write.
+			 */
+			spinlock_t wr_lock;
+			struct list_head wr_ranges;
+			wait_queue_head_t wr_wq;
 
 			/*
 			 * High water mark of i_size, and the size the
