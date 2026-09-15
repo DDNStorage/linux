@@ -17,8 +17,33 @@
 
 
 struct fuse_inode;
-struct fuse_dlm_range;
 struct fuse_file;
+
+/*
+ * An operation in flight whose outcome a revoke has to be able to kill,
+ * on cache->pending: a FUSE_DLM_WB_LOCK waiting for its grant, or a read
+ * fill waiting for the bytes it will cache.
+ *
+ * Two ranges, because for a lock request the range asked for and the
+ * range that may end up recorded are not the same one: the server may
+ * grant more, up to FUSE_DLM_MAX_EXTRA_GRANT either side.  A revoke has
+ * to be tested against both, and means something different for each.  A
+ * fill records nothing and sets both to the range it reads.
+ */
+struct fuse_dlm_range {
+	/* The range asked for, as byte offsets, both inclusive */
+	uint64_t start;
+	uint64_t end;
+	/* The widest [start, end] fuse_dlm_request_commit() could record */
+	uint64_t wide_start;
+	uint64_t wide_end;
+	/* A revoke overlapped the range asked for: the grant is dead */
+	bool killed;
+	/* A revoke overlapped only the excess: record the asked for range */
+	bool clamp;
+	/* The cache->pending link */
+	struct list_head list;
+};
 
 /* Lock modes for page ranges */
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
@@ -205,24 +230,19 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
  * until fuse_dlm_unpin(), which drops the pin this task last took.  @pin
  * is caller-owned storage, live until then.  fuse_dlm_pin() waits out a
  * revoke overlapping that range and must not be called with a folio
- * held; fuse_dlm_trypin() never sleeps and fails instead.  Neither may
- * be held across a DLM request: that request is answered by the server
- * the revoke came from.
+ * held; fuse_dlm_trypin() never sleeps and fails instead.
+ *
+ * A pin must not be held across a request the server answers, since a
+ * revoke waits its pins out and the server can be sitting in a handler
+ * it has not answered.  The writethrough write is the one exception, and
+ * holds one over its FUSE_WRITE because those bytes are in no page cache
+ * and a revoke has no other way to find them.
  */
 void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 		  loff_t offset, size_t length);
 bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 		     loff_t offset, size_t length);
 void fuse_dlm_unpin(struct fuse_inode *inode);
-
-/*
- * fuse_dlm_trypin() for a fill whose reply lands in another task: @pin
- * is dropped by node rather than by owner, and is live from the request
- * until fuse_dlm_unpin_span().
- */
-bool fuse_dlm_trypin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-			  loff_t offset, size_t length);
-void fuse_dlm_unpin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin);
 
 /*
  * Fence the writers that hold a grant over [@offset, @offset + @len) but
@@ -241,6 +261,21 @@ void fuse_dlm_revoke_end(struct fuse_inode *inode,
 /* Re-validate a fuse_get_dlm_lock() grant against the live lock tree */
 bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 			   size_t length, enum fuse_page_lock_mode mode);
+
+/*
+ * Publish a read fill over [@offset, @offset + @length) before sending
+ * it, so a revoke of that range marks it instead of waiting for it.
+ * @fill is caller-owned storage, live until the commit or the abort.
+ *
+ * fuse_dlm_fill_commit() retires it and says whether the bytes may be
+ * cached; the caller marks its folios uptodate and unlocks them before
+ * fuse_dlm_fill_end(), and only on true.  Every published fill reaches
+ * the commit, on the error paths too.  See fuse_dlm_fill_begin().
+ */
+void fuse_dlm_fill_begin(struct fuse_inode *fi, struct fuse_dlm_range *fill,
+			 loff_t offset, size_t length);
+bool fuse_dlm_fill_commit(struct fuse_inode *fi, struct fuse_dlm_range *fill);
+void fuse_dlm_fill_end(struct fuse_inode *fi);
 
 /* Hold [start, end] again so writeback can send what it found revoked */
 int fuse_dlm_regrant_range(struct fuse_file *ff, struct inode *inode,

@@ -1076,7 +1076,13 @@ static void fuse_short_read(struct inode *inode, u64 attr_ver, size_t num_read,
 	}
 }
 
-static int fuse_do_readpage(struct file *file, struct page *page)
+/*
+ * @set_uptodate false leaves the folio filled but not uptodate, for a caller
+ * that has to decide under a lock of its own whether the fill may be cached
+ * at all; see fuse_read_folio().
+ */
+static int fuse_do_readpage(struct file *file, struct page *page,
+			    bool set_uptodate)
 {
 	struct inode *inode = page->mapping->host;
 	struct fuse_mount *fm = get_fuse_mount(inode);
@@ -1123,7 +1129,8 @@ static int fuse_do_readpage(struct file *file, struct page *page)
 	if (res < desc.length)
 		fuse_short_read(inode, attr_ver, res, &ia.ap);
 
-	SetPageUptodate(page);
+	if (set_uptodate)
+		SetPageUptodate(page);
 
 	return 0;
 }
@@ -1252,8 +1259,8 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	loff_t pos = folio_pos(folio);
 	size_t len = folio_size(folio);
-	struct fuse_dlm_span pin;
-	bool pinned = false;
+	struct fuse_dlm_range fill;
+	bool dlm = false;
 	int err;
 
 	err = -EIO;
@@ -1261,19 +1268,26 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 		goto out;
 
 	/*
-	 * The grant the folio is filled under, held from the confirmation
-	 * until the bytes are in the page cache.  What lands here is served
-	 * to every later reader of the file, so it must neither be fetched
-	 * under a grant a revoke has taken away nor be dropped into a range
-	 * a revoke has just swept: such a folio is uptodate and covered by
-	 * nothing, and no further notify comes for a lock this client no
-	 * longer holds.
+	 * What lands here is served to every later reader of the file, so it
+	 * must neither be fetched under a grant a revoke has taken away nor
+	 * be dropped into a range a revoke has just swept: such a folio is
+	 * uptodate and covered by nothing, and no further notify comes for a
+	 * lock this client no longer holds.
 	 *
-	 * The pin closes the second, since a revoke over the folio waits
-	 * for the fill and drops the folio after it; the confirmation
-	 * closes the first.  Both fail into fuse_read_folio_retry().
+	 * The confirmation below closes the first.  The second is closed by
+	 * the fill published with it, which a revoke of the range marks: what
+	 * comes back marked is not cached.
+	 *
+	 * The pin is only held over that confirmation, never across the
+	 * request: a revoke waits its pins out, and one dropped on a reply
+	 * would keep a server that revokes from inside a handler it has not
+	 * answered waiting for itself.  Refused, a revoke of this range is
+	 * draining and the retry waits for it with no folio held.
 	 */
 	if (fc->dlm && fc->writeback_cache) {
+		struct fuse_dlm_span pin;
+		bool pinned;
+
 		pinned = fuse_dlm_trypin(fi, &pin, pos, len);
 		if (pinned && !fuse_dlm_lock_is_held(fi, pos, len,
 						     FUSE_PAGE_LOCK_READ)) {
@@ -1282,18 +1296,46 @@ static int fuse_read_folio(struct file *file, struct folio *folio)
 		}
 		if (!pinned)
 			return fuse_read_folio_retry(file, folio, pos, len);
+
+		/* Published under the pin, so no revoke can slip in front */
+		fuse_dlm_fill_begin(fi, &fill, pos, len);
+		fuse_dlm_unpin(fi);
+		dlm = true;
 	}
 
-	err = fuse_do_readpage(file, page);
+	/*
+	 * Not marked uptodate by the fill: that is this function's to do,
+	 * inside the section below and only if the grant survived.  Marking
+	 * it here and clearing it again would not serve, since a reader that
+	 * finds a folio uptodate copies out of it without taking the lock.
+	 */
+	err = fuse_do_readpage(file, page, !dlm);
 	fuse_invalidate_atime(inode);
  out:
-	unlock_page(page);
-	/*
-	 * After the unlock, so a revoke draining this pin finds the folio
-	 * it has to drop unlocked and takes it out.
-	 */
-	if (pinned)
-		fuse_dlm_unpin(fi);
+	if (dlm) {
+		bool live = fuse_dlm_fill_commit(fi, &fill);
+
+		/*
+		 * Uptodate and unlocked together inside the section, so a
+		 * revoke that lands after the commit has the folio in the
+		 * page cache, unlocked, for the drop that follows it.
+		 */
+		if (!err && live)
+			SetPageUptodate(page);
+		unlock_page(page);
+		fuse_dlm_fill_end(fi);
+
+		/*
+		 * Revoked while the read was out: the bytes are not this
+		 * client's to cache.  Send the caller round again rather than
+		 * back an empty folio, which the VFS reports as -EIO.  Each
+		 * pass costs a round trip, which throttles the retry.
+		 */
+		if (!err && !live)
+			err = AOP_TRUNCATED_PAGE;
+	} else {
+		unlock_page(page);
+	}
 	return err;
 }
 
@@ -1306,6 +1348,7 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 	size_t count = ia->read.in.size;
 	size_t num_read = args->out_args[0].size;
 	struct address_space *mapping = NULL;
+	bool live = true;
 
 	for (i = 0; mapping == NULL && i < ap->num_pages; i++)
 		mapping = ap->pages[i]->mapping;
@@ -1322,20 +1365,26 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 		fuse_invalidate_atime(inode);
 	}
 
+	/*
+	 * Whether a revoke took the range while the read was out.  The
+	 * commit covers the folios going uptodate and unlocked below, so a
+	 * revoke either gets in front of it and none of them is cached, or
+	 * lands behind it and finds them in the page cache for its drop.
+	 * Nothing was held across the request for it to wait on; see
+	 * fuse_dlm_fill_begin().
+	 */
+	if (ia->read.dlm_fi)
+		live = fuse_dlm_fill_commit(ia->read.dlm_fi, &ia->read.dlm_fill);
+
 	for (i = 0; i < ap->num_pages; i++) {
 		struct folio *folio = page_folio(ap->pages[i]);
 
-		folio_end_read(folio, !err);
+		folio_end_read(folio, !err && live);
 		folio_put(folio);
 	}
 
-	/*
-	 * Dropped after the folios, which are filled, uptodate and unlocked
-	 * by now: a revoke draining this pin finds them and takes them out.
-	 * Held until here so it cannot have swept before they were there.
-	 */
 	if (ia->read.dlm_fi)
-		fuse_dlm_unpin_span(ia->read.dlm_fi, &ia->read.dlm_pin);
+		fuse_dlm_fill_end(ia->read.dlm_fi);
 
 	if (ia->ff)
 		fuse_file_put(ia->ff, false);
@@ -1376,11 +1425,13 @@ static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	WARN_ON((loff_t) (pos + count) < 0);
 
 	/*
-	 * The grant the read took in fuse_read_grant(), confirmed under a
-	 * pin and held until the reply has filled the pages.  A revoke of the range
-	 * waits for that, so the reply cannot be fetched under a grant the
-	 * server has since handed on, and cannot land behind a sweep that
-	 * would leave the pages uptodate and covered by nothing.
+	 * The grant the read took in fuse_read_grant(), confirmed under a pin
+	 * so a revoke already draining cannot be raced.  The pin goes before
+	 * the request does: a revoke waits its pins out, and one that only
+	 * dropped on the reply would hold up a server that revokes from
+	 * inside a handler it has not answered.  A revoke marks the fill
+	 * published in its place, and fuse_readpages_end() caches nothing
+	 * that came back marked.
 	 *
 	 * Refused, or gone since it was asked for: give the pages back
 	 * unfilled rather than serve what no lock covers.  The read that
@@ -1388,13 +1439,18 @@ static int fuse_send_readpages(struct fuse_io_args *ia, struct file *file)
 	 * again with no page held.
 	 */
 	if (fm->fc->dlm && fm->fc->writeback_cache) {
-		if (!fuse_dlm_trypin_span(fi, &ia->read.dlm_pin, pos, count))
+		struct fuse_dlm_span pin;
+
+		if (!fuse_dlm_trypin(fi, &pin, pos, count))
 			goto uncovered;
 		if (!fuse_dlm_lock_is_held(fi, pos, count,
 					   FUSE_PAGE_LOCK_READ)) {
-			fuse_dlm_unpin_span(fi, &ia->read.dlm_pin);
+			fuse_dlm_unpin(fi);
 			goto uncovered;
 		}
+		/* Published under the pin, so no revoke can slip in front */
+		fuse_dlm_fill_begin(fi, &ia->read.dlm_fill, pos, count);
+		fuse_dlm_unpin(fi);
 		ia->read.dlm_fi = fi;
 	}
 
@@ -4308,7 +4364,7 @@ retry:
 		goto success;
 	}
 
-	err = fuse_do_readpage(file, &folio->page);
+	err = fuse_do_readpage(file, &folio->page, true);
 	if (err)
 		goto cleanup;
 success:

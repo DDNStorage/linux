@@ -52,29 +52,6 @@
 #define FUSE_DLM_MAX_EXTRA_GRANT (1ULL << 30)
 
 /*
- * A FUSE_DLM_WB_LOCK request in flight, on cache->pending.
- *
- * Two ranges, because the range asked for and the range that may end up
- * recorded are not the same one: the server may grant more, up to
- * FUSE_DLM_MAX_EXTRA_GRANT either side.  A revoke has to be tested against
- * both, and means something different for each.
- */
-struct fuse_dlm_range {
-	/* The range asked for, as byte offsets, both inclusive */
-	uint64_t start;
-	uint64_t end;
-	/* The widest [start, end] fuse_dlm_request_commit() could record */
-	uint64_t wide_start;
-	uint64_t wide_end;
-	/* A revoke overlapped the range asked for: the grant is dead */
-	bool killed;
-	/* A revoke overlapped only the excess: record the asked for range */
-	bool clamp;
-	/* The cache->pending link */
-	struct list_head list;
-};
-
-/*
  * Bit of the page at @off within its shard.  Callers pass page aligned
  * bounds: a grant is aligned in __fuse_get_dlm_lock(), a revoke in
  * fuse_dlm_revoke_inval_range() and a query in fuse_dlm_lock_is_held().
@@ -297,10 +274,11 @@ void fuse_dlm_pin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
  * @offset: byte offset the caller is about to write
  * @length: length of the region in bytes
  *
- * For the writeback path, which holds a folio locked and under writeback
- * and has nothing to wait with.  A refusal means a revoke of this range
- * is draining; the caller redirties and the pass that follows sends the
- * folio.
+ * For a caller holding a folio, which has nothing to wait with: the
+ * writeback paths, which hold one locked and under writeback, and the
+ * read fills, which hold one locked.  A refusal means a revoke of this
+ * range is draining; writeback redirties and the pass that follows sends
+ * the folio, a read unlocks and retries.
  *
  * Return: true if the range is pinned, false if it is not.
  */
@@ -324,62 +302,6 @@ bool fuse_dlm_trypin(struct fuse_inode *inode, struct fuse_dlm_span *pin,
 	spin_unlock(&cache->pin_lock);
 
 	return !fenced;
-}
-
-/**
- * fuse_dlm_trypin_span - fuse_dlm_trypin() for a fill that ends elsewhere
- * @inode: the fuse inode
- * @pin: caller-owned storage, live until fuse_dlm_unpin_span()
- * @offset: byte offset the caller is about to fill
- * @length: length of the region in bytes
- *
- * For a read whose reply lands in another task: the node is dropped by
- * fuse_dlm_unpin_span() from wherever the fill ends, and carries no
- * owner, so a fuse_dlm_unpin() by the task that took it cannot match it
- * instead of its own.
- *
- * Never sleeps, and has no notify-context shortcut: a fill is not
- * reached from a revoke handler, and a pin taken there would have to be
- * dropped from a task that is not in one.
- *
- * Return: true if the range is pinned, false if a revoke of it is
- * draining.
- */
-bool fuse_dlm_trypin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin,
-			  loff_t offset, size_t length)
-{
-	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
-	bool fenced;
-
-	fuse_dlm_span_set(pin, offset, length, NULL);
-
-	spin_lock(&cache->pin_lock);
-	fenced = fuse_dlm_overlaps_locked(&cache->fences, pin->start,
-					  pin->end);
-	if (!fenced)
-		list_add(&pin->list, &cache->pins);
-	spin_unlock(&cache->pin_lock);
-
-	return !fenced;
-}
-
-/**
- * fuse_dlm_unpin_span - release the pin fuse_dlm_trypin_span() took
- * @inode: the fuse inode
- * @pin: the node published there
- */
-void fuse_dlm_unpin_span(struct fuse_inode *inode, struct fuse_dlm_span *pin)
-{
-	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
-	bool waiters;
-
-	spin_lock(&cache->pin_lock);
-	list_del(&pin->list);
-	waiters = !list_empty(&cache->fences);
-	spin_unlock(&cache->pin_lock);
-
-	if (waiters)
-		wake_up_all(&cache->pin_wq);
 }
 
 /**
@@ -822,16 +744,35 @@ static bool fuse_dlm_shard_covers(struct fuse_dlm_shard *shard, uint64_t from,
  *
  * Return: true if the entire range is locked, false otherwise
  */
+static bool __fuse_dlm_range_is_locked(struct fuse_dlm_cache *cache,
+				       uint64_t start, uint64_t end,
+				       enum fuse_page_lock_mode mode)
+{
+	unsigned long idx, last_idx;
+
+	if (start > end)
+		return false;
+
+	last_idx = end >> FUSE_DLM_SHARD_SHIFT;
+
+	for (idx = start >> FUSE_DLM_SHARD_SHIFT; idx <= last_idx; idx++) {
+		struct fuse_dlm_shard *shard = xa_load(&cache->shards, idx);
+		uint64_t lo = max(start, FUSE_DLM_SHARD_FIRST(idx));
+		uint64_t hi = min(end, FUSE_DLM_SHARD_LAST(idx));
+
+		if (!shard || !fuse_dlm_shard_covers(shard, lo, hi, mode))
+			return false;
+	}
+
+	return true;
+}
+
 static bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 				     uint64_t end,
 				     enum fuse_page_lock_mode mode)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
-	unsigned long idx, last_idx;
-	bool covered = true;
-
-	if (start > end)
-		return false;
+	bool covered;
 
 	/*
 	 * Read: coverage is only ever removed under @cache->lock held for
@@ -843,20 +784,7 @@ static bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 	 * grant it already holds.
 	 */
 	down_read(&cache->lock);
-
-	last_idx = end >> FUSE_DLM_SHARD_SHIFT;
-
-	for (idx = start >> FUSE_DLM_SHARD_SHIFT; idx <= last_idx; idx++) {
-		struct fuse_dlm_shard *shard = xa_load(&cache->shards, idx);
-		uint64_t lo = max(start, FUSE_DLM_SHARD_FIRST(idx));
-		uint64_t hi = min(end, FUSE_DLM_SHARD_LAST(idx));
-
-		if (!shard || !fuse_dlm_shard_covers(shard, lo, hi, mode)) {
-			covered = false;
-			break;
-		}
-	}
-
+	covered = __fuse_dlm_range_is_locked(cache, start, end, mode);
 	up_read(&cache->lock);
 
 	return covered;
@@ -887,6 +815,91 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
 		return true;
 
 	return fuse_dlm_range_is_locked(fi, offset & PAGE_MASK, end, mode);
+}
+
+/**
+ * fuse_dlm_fill_begin - publish a read fill before it is sent
+ * @fi: the fuse inode
+ * @fill: caller-owned storage, live until the commit or the abort
+ * @offset: first byte the fill covers
+ * @length: its length in bytes
+ *
+ * The read equivalent of fuse_dlm_request_begin(), and on the same list:
+ * a revoke of the range marks the fill rather than waiting for it, and
+ * fuse_dlm_fill_commit() then refuses to cache what comes back.
+ *
+ * A pin cannot do this job.  A revoke waits its pins out, and a pin that
+ * only dropped on the reply would leave a server that revokes from inside
+ * a handler it has not answered waiting for itself.
+ *
+ * Nor can a plain fuse_dlm_lock_is_held() at the other end: a revoke
+ * followed by a fresh grant over the same range, both while the read was
+ * out, leaves the range covered again and the bytes stale.  Only a mark
+ * placed on the fill itself tells the two apart.
+ *
+ * A fill records no grant, so there is no excess for a revoke to clamp:
+ * both ranges are the one range read, and fuse_dlm_kill_pending() can
+ * only ever set @fill->killed on it.
+ */
+void fuse_dlm_fill_begin(struct fuse_inode *fi, struct fuse_dlm_range *fill,
+			 loff_t offset, size_t length)
+{
+	struct fuse_dlm_cache *cache = &fi->dlm_locked_areas;
+
+	fill->start = (uint64_t)offset & PAGE_MASK;
+	fill->end = ((uint64_t)offset + length - 1) | (PAGE_SIZE - 1);
+	fill->wide_start = fill->start;
+	fill->wide_end = fill->end;
+	fill->killed = false;
+	fill->clamp = false;
+
+	spin_lock(&cache->pending_lock);
+	list_add_tail(&fill->list, &cache->pending);
+	spin_unlock(&cache->pending_lock);
+}
+
+/**
+ * fuse_dlm_fill_commit - may the bytes a fill read be cached?
+ * @fi: the fuse inode
+ * @fill: the fill published by fuse_dlm_fill_begin()
+ *
+ * Retires @fill and takes @cache->lock for read, which the caller drops
+ * with fuse_dlm_fill_end() once its folios are uptodate and unlocked.
+ * The lock is taken whether or not the fill survived, so the end is
+ * unconditional.
+ *
+ * Unlinking and publishing the folios are one step under that lock, the
+ * way fuse_dlm_request_commit() makes recording a grant one: a revoke
+ * takes it for write, and drops the page cache after it, so it lands
+ * either before the unlink and is seen on @fill, or after it and finds
+ * the folios in the page cache to drop.  No folio is left uptodate and
+ * covered by nothing, and the revoke waits for neither.
+ *
+ * Return: true if the bytes may be cached, false if a revoke took the
+ * range while the read was out.
+ */
+bool fuse_dlm_fill_commit(struct fuse_inode *fi, struct fuse_dlm_range *fill)
+{
+	struct fuse_dlm_cache *cache = &fi->dlm_locked_areas;
+	bool killed;
+
+	down_read(&cache->lock);
+
+	spin_lock(&cache->pending_lock);
+	list_del(&fill->list);
+	killed = fill->killed;
+	spin_unlock(&cache->pending_lock);
+
+	return !killed;
+}
+
+/**
+ * fuse_dlm_fill_end - drop the lock fuse_dlm_fill_commit() took
+ * @fi: the inode it was taken on
+ */
+void fuse_dlm_fill_end(struct fuse_inode *fi)
+{
+	up_read(&fi->dlm_locked_areas.lock);
 }
 
 /**
