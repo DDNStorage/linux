@@ -3338,6 +3338,27 @@ static void fuse_writepage_finish(struct fuse_writepage_args *wpa)
 	wake_up(&fi->page_waitq);
 }
 
+/*
+ * Let the writeback crop follow i_size again once no request is left for it
+ * to protect, so it does not stay at a high water mark this inode may never
+ * reach a second time: a file shrunk by another node and written again would
+ * have its last folio sent whole instead of clipped at EOF.  See
+ * fuse_flush_writepages().
+ *
+ * A freeze makes fi->writectr negative, which is neither sent nor retired,
+ * and no crop moves under one.
+ *
+ * Called under fi->lock from every path that retires a writepage request.
+ */
+static void fuse_writeback_crop_settle(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (get_fuse_conn(inode)->writeback_cache && fi->writectr == 0 &&
+	    list_empty(&fi->queued_writes))
+		fi->wb_crop = i_size_read(inode);
+}
+
 /* Called under fi->lock, may release and reacquire it */
 static void fuse_send_writepage(struct fuse_mount *fm,
 				struct fuse_writepage_args *wpa, loff_t size)
@@ -3379,6 +3400,12 @@ __acquires(fi->lock)
 
  out_free:
 	fi->writectr--;
+	/*
+	 * Retired without ever reaching fuse_writepage_end(), so the crop has
+	 * to be settled here as well or a request cropped away completely
+	 * leaves it standing at the old size.
+	 */
+	fuse_writeback_crop_settle(wpa->inode);
 	fuse_writepage_finish(wpa);
 	spin_unlock(&fi->lock);
 	fuse_writepage_free(wpa);
@@ -3483,17 +3510,7 @@ static void fuse_writepage_end(struct fuse_mount *fm, struct fuse_args *args,
 	spin_lock(&fi->lock);
 	fi->writectr--;
 	fuse_writepage_finish(wpa);
-	/*
-	 * Nothing sent and nothing queued: the crop has no request left to
-	 * protect, so let it follow i_size again rather than stay at a
-	 * high water mark this inode may never reach a second time -- a
-	 * file shrunk by another node and written again would otherwise
-	 * have its last folio sent whole instead of clipped at EOF.  See
-	 * fuse_flush_writepages().
-	 */
-	if (fc->writeback_cache && fi->writectr == 0 &&
-	    list_empty(&fi->queued_writes))
-		fi->wb_crop = i_size_read(inode);
+	fuse_writeback_crop_settle(inode);
 	spin_unlock(&fi->lock);
 	fuse_writepage_free(wpa);
 }

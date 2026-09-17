@@ -2111,6 +2111,16 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				fuse_dlm_cache_release_locks(fi);
 			spin_lock(&fi->lock);
 			i_size_write(inode, 0);
+			/*
+			 * An authoritative shrink, so the crop follows it
+			 * down: a writepage request still standing over the
+			 * bytes the open threw away is meant to be cropped
+			 * away, and left at the old high water mark it would
+			 * go out whole and re-extend the file.  The two other
+			 * truncate sites do the same next to their own
+			 * i_size_write().
+			 */
+			fuse_writeback_crop_truncated(inode, 0);
 			spin_unlock(&fi->lock);
 			truncate_pagecache(inode, 0);
 			goto out;
