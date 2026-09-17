@@ -1777,8 +1777,14 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * Every read that could be cached feeds the size average, streamed or
 	 * not: a reader changing its record has to be seen as well.  O_DIRECT
 	 * is not one of them, and an empty read says nothing about a record.
+	 *
+	 * On a writeback cache only, which is where the bypass below is worth
+	 * anything and where its twin on the write side sits.  Elsewhere the
+	 * page cache is all this filesystem has, and a plain mount would lose
+	 * it for any inode a sequential reader touched: nothing about that
+	 * reader says the next one will not want the folios.
 	 */
-	if (count && !(iocb->ki_flags & IOCB_DIRECT))
+	if (fc->writeback_cache && count && !(iocb->ki_flags & IOCB_DIRECT))
 		stream = fuse_stream_update(&fi->read_size_ewma,
 					    &fi->read_stream_run, count);
 
