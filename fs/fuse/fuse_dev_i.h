@@ -63,6 +63,7 @@ void fuse_copy_init(struct fuse_copy_state *cs, int write,
 void fuse_copy_finish(struct fuse_copy_state *cs);
 int fuse_copy_args(struct fuse_copy_state *cs, unsigned int numargs,
 		   unsigned int argpages, struct fuse_arg *args,
+		   unsigned int ext_numargs, struct fuse_arg *ext_args,
 		   int zeroing);
 int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		       unsigned int nbytes);

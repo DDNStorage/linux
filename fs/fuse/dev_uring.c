@@ -732,6 +732,8 @@ static int fuse_uring_args_to_ring_pages(struct fuse_ring *ring,
 	struct fuse_copy_state cs;
 	struct fuse_args *args = req->args;
 	struct fuse_in_arg *in_args = args->in_args;
+	struct fuse_in_arg *ext_in_args = args->ext_in_args;
+	char *ext_in = headers->ext_in;
 	int num_args = args->in_numargs;
 	int err;
 
@@ -757,9 +759,17 @@ static int fuse_uring_args_to_ring_pages(struct fuse_ring *ring,
 		num_args--;
 	}
 
+	if (args->has_new_ext) {
+		for (int i = 0; i < args->ext_numargs; i++) {
+			memcpy(ext_in, ext_in_args->value, ext_in_args->size);
+			ext_in += ext_in_args->size;
+			ext_in_args++;
+		}
+	}
+
 	/* copy the payload */
 	err = fuse_copy_args(&cs, num_args, args->in_pages,
-			     (struct fuse_arg *)in_args, 0);
+			     (struct fuse_arg *)in_args, 0, NULL, 0);
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
 		goto copy_finish;
@@ -782,6 +792,8 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
 	struct fuse_copy_state cs;
 	struct fuse_args *args = req->args;
 	struct fuse_in_arg *in_args = args->in_args;
+	struct fuse_in_arg *ext_in_args = args->ext_in_args;
+	char *ext_in = ent->headers->ext_in;
 	int num_args = args->in_numargs;
 	int err;
 	struct iov_iter iter;
@@ -820,9 +832,24 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
 		num_args--;
 	}
 
+	/* copy the new extension arguments */
+	if (args->has_new_ext) {
+		for (int i = 0; i < args->ext_numargs; i++) {
+			err = copy_to_user(ext_in, ext_in_args->value,
+					   ext_in_args->size);
+			if (err) {
+				pr_info_ratelimited(
+					"Copying the extension header failed.\n");
+				return -EFAULT;
+			}
+			ext_in += ext_in_args->size;
+			ext_in_args++;
+		}
+	}
+
 	/* copy the payload */
 	err = fuse_copy_args(&cs, num_args, args->in_pages,
-			     (struct fuse_arg *)in_args, 0);
+			     (struct fuse_arg *)in_args, 0, NULL, 0);
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
 		goto copy_finish;
