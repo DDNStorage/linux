@@ -33,7 +33,6 @@
 #include <linux/refcount.h>
 #include <linux/user_namespace.h>
 #include "fuse_dlm_cache.h"
-#include "fuse_range_lock.h"
 
 /** Default max number of pages that can be used in a single read request */
 #define FUSE_DEFAULT_MAX_PAGES_PER_REQ 32
