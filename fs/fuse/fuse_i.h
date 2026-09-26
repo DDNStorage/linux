@@ -390,18 +390,19 @@ struct fuse_args {
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
 	/*
 	 * Called from fuse_request_end(), synchronously, on the thread
-	 * processing the reply -- before that thread wakes a requester
-	 * blocked in request_wait_answer(), runs any FR_BACKGROUND
-	 * completion, or invokes 'end' above. Unlike 'end' (gated on
-	 * FR_ASYNC, and which for background requests runs after the
-	 * request has already been fully torn down), 'complete' runs for
-	 * every request that reaches fuse_request_end(), synchronous or
-	 * not, letting a caller do work that must be visible before the
-	 * requester resumes or the reply-processing thread moves on to the
-	 * next message -- e.g. moving a range lock from INIT to READY as
-	 * part of processing a grant reply, instead of leaving that race
-	 * window open until the (possibly much later, descheduled)
-	 * requester thread gets to run.
+	 * processing the reply -- before that thread sets FR_FINISHED, and
+	 * so while 'args' is still owned by the requester's stack frame,
+	 * before it wakes a requester blocked in request_wait_answer(),
+	 * runs any FR_BACKGROUND completion, or invokes 'end' above.
+	 * Unlike 'end' (gated on FR_ASYNC, and which for background
+	 * requests runs after the request has already been fully torn
+	 * down), 'complete' runs for every request that reaches
+	 * fuse_request_end(), synchronous or not, letting a caller do work
+	 * that must be visible before the requester resumes or the
+	 * reply-processing thread moves on to the next message -- e.g.
+	 * moving a range lock from INIT to READY as part of processing a
+	 * grant reply, instead of leaving that race window open until the
+	 * (possibly much later, descheduled) requester thread gets to run.
 	 */
 	void (*complete)(struct fuse_mount *fm, struct fuse_args *args, int error);
 	/* Used for kvec iter backed by vmalloc address */
@@ -467,7 +468,8 @@ struct fuse_io_priv {
  * FR_LOCKED:		data is being copied to/from the request
  * FR_PENDING:		request is not yet in userspace
  * FR_SENT:		request is in userspace, waiting for an answer
- * FR_FINISHED:		request is finished
+ * FR_FINISHED:		request is finished, the requester may return
+ * FR_ENDING:		fuse_request_end() has claimed the request
  * FR_PRIVATE:		request is on private list
  * FR_ASYNC:		request is asynchronous
  * FR_URING:		request is handled through fuse-io-uring
@@ -483,6 +485,7 @@ enum fuse_req_flag {
 	FR_PENDING,
 	FR_SENT,
 	FR_FINISHED,
+	FR_ENDING,
 	FR_PRIVATE,
 	FR_ASYNC,
 	FR_URING,
