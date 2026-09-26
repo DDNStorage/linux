@@ -719,6 +719,39 @@ static void free_ext_value(struct fuse_args *args)
  * If the filesystem doesn't support this, then fall back to separate
  * 'mknod' + 'open' requests.
  */
+static void fuse_create_init(struct fuse_conn *fc, struct fuse_args *args,
+			     u64 nodeid, const struct qstr *name, u32 opcode,
+			     unsigned int flags, umode_t mode,
+			     struct fuse_create_in *inarg,
+			     struct fuse_entry_out *outentry,
+			     struct fuse_open_out *outopen)
+{
+	bool trunc = flags & O_TRUNC;
+
+	memset(inarg, 0, sizeof(*inarg));
+	memset(outentry, 0, sizeof(*outentry));
+	memset(outopen, 0, sizeof(*outopen));
+	inarg->flags = flags;
+	inarg->mode = mode;
+	inarg->umask = current_umask();
+	if (fc->handle_killpriv_v2 && trunc &&
+	    !(flags & O_EXCL) && !capable(CAP_FSETID))
+		inarg->open_flags |= FUSE_OPEN_KILL_SUIDGID;
+
+	args->opcode = opcode;
+	args->nodeid = nodeid;
+	args->in_numargs = 2;
+	args->in_args[0].size = sizeof(*inarg);
+	args->in_args[0].value = inarg;
+	args->in_args[1].size = name->len + 1;
+	args->in_args[1].value = name->name;
+	args->out_numargs = 2;
+	args->out_args[0].size = sizeof(*outentry);
+	args->out_args[0].value = outentry;
+	args->out_args[1].size = sizeof(*outopen);
+	args->out_args[1].value = outopen;
+}
+
 static int fuse_create_open(struct inode *dir, struct dentry *entry,
 			    struct file *file, unsigned int flags,
 			    umode_t mode, u32 opcode)
@@ -753,29 +786,9 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 		mode &= ~current_umask();
 
 	flags &= ~O_NOCTTY;
-	memset(&inarg, 0, sizeof(inarg));
-	memset(&outentry, 0, sizeof(outentry));
-	inarg.flags = flags;
-	inarg.mode = mode;
-	inarg.umask = current_umask();
 
-	if (fm->fc->handle_killpriv_v2 && trunc &&
-	    !(flags & O_EXCL) && !capable(CAP_FSETID)) {
-		inarg.open_flags |= FUSE_OPEN_KILL_SUIDGID;
-	}
-
-	args.opcode = opcode;
-	args.nodeid = get_node_id(dir);
-	args.in_numargs = 2;
-	args.in_args[0].size = sizeof(inarg);
-	args.in_args[0].value = &inarg;
-	args.in_args[1].size = entry->d_name.len + 1;
-	args.in_args[1].value = entry->d_name.name;
-	args.out_numargs = 2;
-	args.out_args[0].size = sizeof(outentry);
-	args.out_args[0].value = &outentry;
-	args.out_args[1].size = sizeof(outopen);
-	args.out_args[1].value = &outopen;
+	fuse_create_init(fm->fc, &args, get_node_id(dir), &entry->d_name, opcode,
+			 flags, mode, &inarg, &outentry, &outopen);
 
 	err = get_create_ext(&args, dir, entry, mode);
 	if (err)
@@ -835,6 +848,251 @@ out_err:
 
 static int fuse_mknod(struct mnt_idmap *, struct inode *, struct dentry *,
 		      umode_t, dev_t);
+
+/*
+ * Compound LOOKUP+CREATE for atomic_open.
+ *
+ * Sends a single FUSE_COMPOUND containing FUSE_LOOKUP followed by FUSE_CREATE,
+ * collapsing the two round trips that fuse_atomic_open() would otherwise make
+ * (fuse_lookup() then fuse_create_open()) into one.
+ *
+ * Semantics match the separate-op path:
+ *   - LOOKUP runs first. If it finds a positive entry, the kernel splices the
+ *     resulting inode onto the dentry and lets the VFS retry via finish_no_open();
+ *     the CREATE result (if any) is ignored.
+ *   - If LOOKUP returns ENOENT (or nodeid 0), the CREATE result is consumed:
+ *     on success the new inode is instantiated and finish_open() is called; on
+ *     EEXIST the dentry is invalidated; on ENOSYS the no_create flag is set so
+ *     the caller falls back to the mknod path.
+ *
+ * Returns 0 on success (either the no_open or finish_open path completed),
+ * -ENOSYS if the FUSE_COMPOUND mechanism is not supported by the server (the
+ * caller will disable the feature flag and retry via the separate-op path), or
+ * any other negative errno for terminal errors.
+ */
+static int fuse_compound_lookup_create(struct inode *dir, struct dentry *entry,
+				       struct file *file, unsigned int flags,
+				       umode_t mode)
+{
+	struct fuse_mount *fm = get_fuse_mount(dir);
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_compound_req *compound;
+	struct fuse_args lookup_args = {};
+	struct fuse_args create_args = {};
+	struct fuse_entry_out outlookup;
+	struct fuse_entry_out outentry;
+	struct fuse_open_out outopen;
+	struct fuse_create_in create_in;
+	struct fuse_forget_link *forget;
+	struct fuse_file *ff;
+	struct fuse_inode *fi;
+	struct inode *inode;
+	struct dentry *newent;
+	bool trunc = flags & O_TRUNC;
+	int lookup_err, create_err;
+	int err;
+
+	/* atomic_open only ever creates regular files */
+	BUG_ON((mode & S_IFMT) != S_IFREG);
+
+	forget = fuse_alloc_forget();
+	if (!forget)
+		return -ENOMEM;
+
+	ff = fuse_file_alloc(fm, true);
+	if (!ff) {
+		err = -ENOMEM;
+		goto out_forget;
+	}
+
+	if (!fc->dont_mask)
+		mode &= ~current_umask();
+	flags &= ~O_NOCTTY;
+
+	compound = fuse_compound_alloc(fm, 0);
+	if (IS_ERR(compound)) {
+		err = PTR_ERR(compound);
+		goto out_ff;
+	}
+
+	fuse_lookup_init(fc, &lookup_args, get_node_id(dir), &entry->d_name,
+			 &outlookup);
+	err = fuse_compound_add(compound, &lookup_args);
+	if (err)
+		goto out_compound;
+
+	fuse_create_init(fc, &create_args, get_node_id(dir), &entry->d_name,
+			 FUSE_CREATE, flags, mode,
+			 &create_in, &outentry, &outopen);
+
+	err = get_create_ext(&create_args, dir, entry, mode);
+	if (err)
+		goto out_compound;
+
+	err = fuse_compound_add(compound, &create_args);
+	if (err) {
+		free_ext_value(&create_args);
+		goto out_compound;
+	}
+
+	err = fuse_compound_send(compound);
+	free_ext_value(&create_args);
+	if (err) {
+		/* FUSE_COMPOUND unsupported -- caller will disable the flag */
+		goto out_compound;
+	}
+
+	lookup_err = fuse_compound_get_error(compound, 0);
+	create_err = fuse_compound_get_error(compound, 1);
+
+	/*
+	 * LOOKUP succeeded with a positive nodeid: the file already existed.
+	 * Mirror fuse_lookup_name() + fuse_lookup() post-processing, then take
+	 * the no_open path (CREATE result, if executed, is discarded).
+	 */
+	if (!lookup_err && outlookup.nodeid) {
+		fuse_file_free(ff);
+		ff = NULL;
+
+		err = -EIO;
+		if (fuse_invalid_attr(&outlookup.attr))
+			goto out_compound;
+		if (outlookup.nodeid == FUSE_ROOT_ID)
+			goto out_compound;
+
+		inode = fuse_iget(dir->i_sb, outlookup.nodeid,
+				  outlookup.generation, &outlookup.attr,
+				  ATTR_TIMEOUT(&outlookup),
+				  fuse_get_attr_version(fc),
+				  fuse_get_evict_ctr(fc));
+		if (!inode) {
+			fuse_queue_forget(fc, forget, outlookup.nodeid, 1);
+			forget = NULL;
+			err = -ENOMEM;
+			goto out_compound;
+		}
+		kfree(forget);
+		forget = NULL;
+
+		newent = d_splice_alias(inode, entry);
+		if (IS_ERR(newent)) {
+			err = PTR_ERR(newent);
+			goto out_compound;
+		}
+		if (newent)
+			entry = newent;
+		fuse_change_entry_timeout(entry, &outlookup);
+		fuse_advise_use_readdirplus(dir);
+
+		err = finish_no_open(file, newent);
+		dput(newent);
+		kfree(compound);
+		return err;
+	}
+
+	/* Anything other than "doesn't exist" from LOOKUP is terminal. */
+	if (lookup_err && lookup_err != -ENOENT) {
+		err = lookup_err;
+		goto out_compound;
+	}
+
+	/*
+	 * LOOKUP said the entry doesn't exist; consume CREATE.
+	 */
+	if (create_err == -ENOSYS) {
+		/* Server can't FUSE_CREATE; let caller fall back to mknod. */
+		fc->no_create = 1;
+		err = -ENOSYS;
+		goto out_compound;
+	}
+	if (create_err) {
+		err = create_err;
+		if (err == -EEXIST)
+			fuse_invalidate_entry(entry);
+		goto out_compound;
+	}
+
+	err = -EIO;
+	if (!S_ISREG(outentry.attr.mode) || invalid_nodeid(outentry.nodeid) ||
+	    fuse_invalid_attr(&outentry.attr))
+		goto out_compound;
+
+	file->f_mode |= FMODE_CREATED;
+
+	ff->fh = outopen.fh;
+	ff->nodeid = outentry.nodeid;
+	ff->open_flags = outopen.open_flags;
+	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
+			  &outentry.attr, ATTR_TIMEOUT(&outentry), 0, 0);
+	if (!inode) {
+		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+		fuse_sync_release(NULL, ff, flags);
+		ff = NULL;
+		fuse_queue_forget(fc, forget, outentry.nodeid, 1);
+		forget = NULL;
+		err = -ENOMEM;
+		goto out_compound;
+	}
+	kfree(forget);
+	forget = NULL;
+
+	/*
+	 * Unlike the separate-op path, we did not pre-run fuse_lookup() on
+	 * @entry, so it is still d_in_lookup() here. That means its
+	 * d_u.d_in_lookup_hash node is on the parent's in-lookup chain --
+	 * and that field is unioned with d_u.d_alias, so the BUG_ON in
+	 * d_instantiate() would fire. Use d_splice_alias() instead: it
+	 * goes through __d_add(), which detects d_in_lookup and calls
+	 * __d_lookup_done() before attaching the inode.
+	 *
+	 * For a regular file (asserted at function entry) d_splice_alias
+	 * cannot return an error and cannot return a different dentry --
+	 * both of those only happen via the S_ISDIR branch of d_splice_alias.
+	 * The IS_ERR and non-NULL return cases are therefore unreachable;
+	 * we WARN if invariants are ever broken (e.g. someone removes the
+	 * S_ISREG BUG_ON) rather than silently mishandling refcounts.
+	 */
+	newent = d_splice_alias(inode, entry);
+	if (WARN_ON_ONCE(IS_ERR(newent))) {
+		err = PTR_ERR(newent);
+		/* inode ref consumed by d_splice_alias on error */
+		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+		fuse_sync_release(NULL, ff, flags);
+		ff = NULL;
+		goto out_compound;
+	}
+	WARN_ON_ONCE(newent);
+
+	fuse_change_entry_timeout(entry, &outentry);
+	fuse_dir_changed(dir);
+	err = generic_file_open(inode, file);
+	if (!err) {
+		file->private_data = ff;
+		err = finish_open(file, entry, fuse_finish_open);
+	}
+	if (err) {
+		fi = get_fuse_inode(inode);
+		fuse_sync_release(fi, ff, flags);
+	} else {
+		if (fc->atomic_o_trunc && trunc)
+			truncate_pagecache(inode, 0);
+		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+			invalidate_inode_pages2(inode->i_mapping);
+	}
+	dput(newent);
+	kfree(compound);
+	return err;
+
+out_compound:
+	kfree(compound);
+	if (ff)
+		fuse_file_free(ff);
+out_ff:
+out_forget:
+	kfree(forget);
+	return err;
+}
+
 static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 			    struct file *file, unsigned flags,
 			    umode_t mode)
@@ -845,6 +1103,15 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 
 	if (fuse_is_bad(dir))
 		return -EIO;
+
+	if (d_in_lookup(entry) && (flags & O_CREAT) && !fc->no_create &&
+	    fc->compound_lookup_create) {
+		err = fuse_compound_lookup_create(dir, entry, file, flags, mode);
+		if (err != -ENOSYS && err != -EOPNOTSUPP)
+			return err;
+		fc->compound_lookup_create = 0;
+		/* fall through to the separate-op path */
+	}
 
 	if (d_in_lookup(entry)) {
 		res = fuse_lookup(dir, entry, 0);

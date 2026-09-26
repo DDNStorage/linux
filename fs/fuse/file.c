@@ -243,8 +243,10 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 			err = fuse_compound_open_getattr(fm, nodeid, open_flags,
 							 opcode, ff,
 							 &attr_outarg, &outarg);
-			if (err == -ENOSYS)
+			if (err == -ENOSYS || err == -EOPNOTSUPP) {
 				fc->compound_open_getattr = 0;
+				err = -ENOSYS;
+			}
 			if (!err)
 				fuse_change_attributes(inode, &attr_outarg.attr,
 						       NULL,
