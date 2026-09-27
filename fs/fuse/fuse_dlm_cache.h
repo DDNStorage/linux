@@ -24,7 +24,9 @@ struct fuse_inode;
  *
  *  - Serialize concurrent cached reads/writes that touch overlapping
  *    byte ranges of the same file, while letting non-overlapping IO
- *    proceed concurrently.
+ *    proceed concurrently.  A range is rounded out to whole pages when
+ *    it is taken, because a folio is what two IOs meeting inside a page
+ *    share: byte-exact ranges would let both of them work on it at once.
  *
  *  - Let attribute/BRL invalidation (fuse_reverse_inval_inode(),
  *    truncate in fuse_do_setattr()) block only on in-progress IO that
@@ -120,8 +122,8 @@ struct fuse_range_lock {
 void fuse_range_lock_tree_init(struct fuse_inode *inode);
 
 /*
- * Reserve a range lock on [start, end] (inclusive byte offsets) in the
- * given mode, in INIT state. Blocks until the range can be reserved
+ * Reserve a range lock on [start, end] (inclusive byte offsets, rounded
+ * out to whole pages) in the given mode, in INIT state. Blocks until the range can be reserved
  * without conflicting with any other currently held, overlapping range
  * (INIT or READY), same as a plain exclusive acquire. Invisible to
  * fuse_range_lock_acquire_ready() until fuse_range_lock_mark_ready()
