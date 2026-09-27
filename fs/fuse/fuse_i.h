@@ -1523,6 +1523,8 @@ void fuse_flush_time_update(struct inode *inode);
 void fuse_update_ctime(struct inode *inode);
 
 int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask);
+int fuse_update_attributes_sync(struct inode *inode, struct file *file,
+				u32 mask);
 
 void fuse_flush_writepages(struct inode *inode);
 

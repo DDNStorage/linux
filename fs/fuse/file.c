@@ -1151,6 +1151,39 @@ static void fuse_readahead(struct readahead_control *rac)
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to);
 
+/*
+ * Whether the size has to come from the server rather than from the attribute
+ * cache.
+ *
+ * Under dlm the size is the server's, and nothing here expires it: a recorded
+ * grant is never requested again, and an append another node makes outside
+ * every range this node holds a grant on revokes nothing, so no notify marks
+ * the attributes stale.  What is left is the attribute timeout, and it says
+ * nothing about the cluster.
+ */
+static bool fuse_size_needs_server(struct inode *inode)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	return fc->dlm && fc->writeback_cache && S_ISREG(inode->i_mode);
+}
+
+/*
+ * A read stops at i_size, so one crossing a stale i_size stops short of bytes
+ * another node has already written.  Ask the server for the size first.
+ *
+ * On the whole read rather than on its start: gated on the start, the read
+ * spanning the stale end still comes back short and only the one after it is
+ * answered, for the same round trip.
+ *
+ * The caller has to be outside the IO range lock: applying a size takes
+ * ranges out of the page cache.
+ */
+static bool fuse_read_needs_size(struct inode *inode, loff_t pos, size_t len)
+{
+	return fuse_size_needs_server(inode) && pos + len > i_size_read(inode);
+}
+
 static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
@@ -1167,10 +1200,14 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * Otherwise, only update if we attempt to read past EOF (to ensure
 	 * i_size is up to date).
 	 */
-	if (fc->auto_inval_data ||
-	    (iocb->ki_pos + iov_iter_count(to) > i_size_read(inode))) {
+	if (fc->auto_inval_data || (iocb->ki_pos + count > i_size_read(inode))) {
 		int err;
-		err = fuse_update_attributes(inode, iocb->ki_filp, STATX_SIZE);
+
+		if (fuse_read_needs_size(inode, iocb->ki_pos, count))
+			err = fuse_update_attributes_sync(inode, file,
+							  STATX_SIZE);
+		else
+			err = fuse_update_attributes(inode, file, STATX_SIZE);
 		if (err)
 			return err;
 	}
@@ -3445,6 +3482,11 @@ static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
 	return vfs_setpos(file, outarg.offset, inode->i_sb->s_maxbytes);
 
 fallback:
+	/*
+	 * Resolves against i_size, but the caller holds the inode lock and
+	 * this is the path a server without FUSE_LSEEK takes, so no forced
+	 * round trip here.
+	 */
 	err = fuse_update_attributes(inode, file, STATX_SIZE);
 	if (!err)
 		return generic_file_llseek(file, offset, whence);
@@ -3464,6 +3506,18 @@ static loff_t fuse_file_llseek(struct file *file, loff_t offset, int whence)
 		retval = generic_file_llseek(file, offset, whence);
 		break;
 	case SEEK_END:
+		/*
+		 * SEEK_END resolves against i_size.  The round trip goes
+		 * before the lock: taken across it, it holds every writer and
+		 * every direct reader of the inode behind a cluster round
+		 * trip.  The update below then finds the attributes fresh.
+		 */
+		if (fuse_size_needs_server(inode)) {
+			retval = fuse_update_attributes_sync(inode, file,
+							     STATX_SIZE);
+			if (retval)
+				break;
+		}
 		inode_lock(inode);
 		retval = fuse_update_attributes(inode, file, STATX_SIZE);
 		if (!retval)
@@ -3635,12 +3689,21 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	loff_t offset = iocb->ki_pos;
 	struct fuse_io_priv *io;
 	bool async = ff->fm->fc->async_dio;
+	bool eof_from_cache;
 
 	pos = offset;
 	inode = file->f_mapping->host;
 	i_size = i_size_read(inode);
 
-	if ((iov_iter_rw(iter) == READ) && (offset >= i_size))
+	/*
+	 * Only where the end of the file is the cache's to report.  Where it is
+	 * the server's, nothing expires the size this read would resolve
+	 * against, so it takes the end from the reply as the synchronous path
+	 * does, rather than stopping short of bytes another node has written.
+	 */
+	eof_from_cache = !fuse_size_needs_server(inode);
+
+	if (eof_from_cache && iov_iter_rw(iter) == READ && offset >= i_size)
 		return 0;
 
 	if ((iov_iter_rw(iter) == WRITE) && async && !inode->i_sb->s_dio_done_wq) {
@@ -3669,7 +3732,8 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	io->blocking = is_sync_kiocb(iocb);
 
 	/* optimization for short read */
-	if (io->async && !io->write && offset + count > i_size) {
+	if (eof_from_cache && io->async && !io->write &&
+	    offset + count > i_size) {
 		iov_iter_truncate(iter, fuse_round_up(ff->fm->fc, i_size - offset));
 		shortened = count - iov_iter_count(iter);
 		count -= shortened;
