@@ -1807,6 +1807,23 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
 
 		/*
+		 * Open-code generic_file_write_iter() so that the IO range
+		 * lock can be held across the page-cache dirtying: a
+		 * concurrent NOTIFY_INVAL_INODE takes the same range lock for
+		 * the range it invalidates, so it must not be able to strand
+		 * the folios we are about to dirty.  The latch is re-checked
+		 * once the range lock is READY below (it may have been set
+		 * while we blocked on the inode lock) and the write re-routed
+		 * to the direct path if it is now set; the DLM write lock
+		 * taken above is harmless there, as the direct path does its
+		 * own server coordination.
+		 */
+		if (exclusive)
+			inode_lock(inode);
+		else
+			inode_lock_shared(inode);
+
+		/*
 		 * Reserve the IO range lock in INIT state over the byte range
 		 * this write will (provisionally) touch before requesting the
 		 * DLM write lock below, and before taking i_rwsem: the request
@@ -1843,6 +1860,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 						     NULL);
 			if (err) {
 				fuse_range_lock_release(fi, &rlock);
+				fuse_cache_wr_unlock(inode, exclusive);
+
 				return err;
 			}
 
@@ -1858,23 +1877,6 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			 */
 			exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
 		}
-
-		/*
-		 * Open-code generic_file_write_iter() so that the IO range
-		 * lock can be held across the page-cache dirtying: a
-		 * concurrent NOTIFY_INVAL_INODE takes the same range lock for
-		 * the range it invalidates, so it must not be able to strand
-		 * the folios we are about to dirty.  The latch is re-checked
-		 * once the range lock is READY below (it may have been set
-		 * while we blocked on the inode lock) and the write re-routed
-		 * to the direct path if it is now set; the DLM write lock
-		 * taken above is harmless there, as the direct path does its
-		 * own server coordination.
-		 */
-		if (exclusive)
-			inode_lock(inode);
-		else
-			inode_lock_shared(inode);
 
 		/* note that this small code dup will save us a lot of headache later
 		 * when appends are done concurrently without using parallel direct writes */
