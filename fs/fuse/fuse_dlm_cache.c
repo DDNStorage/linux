@@ -63,7 +63,6 @@ int fuse_dlm_cache_init(struct fuse_inode *inode)
 
 	init_rwsem(&cache->lock);
 	cache->ranges = RB_ROOT_CACHED;
-	cache->revoke_gen = 0;
 
 	return 0;
 }
@@ -85,7 +84,6 @@ void fuse_dlm_cache_release_locks(struct fuse_inode *inode)
 
 	/* Release all locks */
 	down_write(&cache->lock);
-	WRITE_ONCE(cache->revoke_gen, cache->revoke_gen + 1);
 	while ((node = rb_first_cached(&cache->ranges)) != NULL) {
 		range = rb_entry(node, struct fuse_dlm_range, rb);
 		fuse_page_it_remove(range, &cache->ranges);
@@ -168,13 +166,11 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 }
 
 /**
- * __fuse_dlm_lock_range - Lock a range of pages
+ * fuse_dlm_lock_range - Lock a range of pages
  * @cache: The page cache
  * @start: Start page offset
  * @end: End page offset
  * @mode: Lock mode (read or write)
- * @genp: If non-NULL, the revocation generation sampled before the grant
- *        was requested; recording fails with -EAGAIN if it has moved
  *
  * Add a locked range on the specified range of pages.
  * If parts of the range are already locked, only add the remaining parts.
@@ -185,9 +181,8 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
  *
  * Return: 0 on success, negative error code on failure
  */
-static int __fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
-				 uint64_t end, enum fuse_page_lock_mode mode,
-				 const uint64_t *genp)
+int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
+			uint64_t end, enum fuse_page_lock_mode mode)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range, *new_range, *next;
@@ -206,17 +201,6 @@ static int __fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 						    FUSE_PCACHE_LK_WRITE;
 
 	down_write(&cache->lock);
-
-	/*
-	 * A revoke was processed after @genp was sampled; the grant this
-	 * record carries may be the very one it targeted (a revoke of a
-	 * not-yet-recorded grant removes nothing and would never be
-	 * retried).  Refuse, the caller re-requests.
-	 */
-	if (genp && cache->revoke_gen != *genp) {
-		up_write(&cache->lock);
-		return -EAGAIN;
-	}
 
 	/* Find all ranges that overlap with [start, end] */
 	range = fuse_page_it_iter_first(&cache->ranges, start, end);
@@ -313,35 +297,6 @@ out_free:
 	return ret;
 }
 
-int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
-			uint64_t end, enum fuse_page_lock_mode mode)
-{
-	return __fuse_dlm_lock_range(inode, start, end, mode, NULL);
-}
-
-int fuse_dlm_lock_range_gen(struct fuse_inode *inode, uint64_t start,
-			    uint64_t end, enum fuse_page_lock_mode mode,
-			    uint64_t gen)
-{
-	return __fuse_dlm_lock_range(inode, start, end, mode, &gen);
-}
-
-/**
- * fuse_dlm_revoke_gen - sample the revocation generation
- * @inode: the fuse inode
- *
- * Sampled before a FUSE_DLM_WB_LOCK request leaves the client.  The
- * reply and a NOTIFY revoke can be serviced on different threads, so a
- * revoke may be processed between the reply arriving and its grant
- * being recorded.  fuse_dlm_lock_range_gen() re-checks the generation
- * under the cache lock and refuses to record a grant such a revoke may
- * have already killed.
- */
-uint64_t fuse_dlm_revoke_gen(struct fuse_inode *inode)
-{
-	return READ_ONCE(inode->dlm_locked_areas.revoke_gen);
-}
-
 /**
  * fuse_dlm_punch_hole - Punch a hole in a locked range
  * @cache: The page cache
@@ -434,14 +389,6 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 		return -EINVAL;
 
 	down_write(&cache->lock);
-
-	/*
-	 * Unconditional, even when nothing overlaps: the revoke racing
-	 * with an in-flight grant finds an empty tree precisely because
-	 * the grant is not recorded yet, and the bump is what makes the
-	 * recording side notice (see fuse_dlm_lock_range_gen()).
-	 */
-	WRITE_ONCE(cache->revoke_gen, cache->revoke_gen + 1);
 
 	/* Find all ranges that overlap with [start, end] */
 	range = fuse_page_it_iter_first(&cache->ranges, start, end);
@@ -620,12 +567,62 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
 	return fuse_dlm_range_is_locked(fi, offset & PAGE_MASK, end, mode);
 }
 
+/* Context for a fuse_get_dlm_lock() request, embedding struct
+ * fuse_args as required by the request API. */
+struct fuse_dlm_lock_args {
+	struct fuse_args args;
+	struct fuse_inode *fi;
+	struct fuse_range_lock *rlock;
+};
+
+/*
+ * fuse_get_dlm_lock_complete - move the caller's range lock to READY
+ *
+ * Called from fuse_request_end() on the thread processing the reply,
+ * before it wakes the thread blocked in fuse_get_dlm_lock() or moves on
+ * to the next message (e.g. an invalidate notification for the same
+ * inode). This is what keeps the range invisible to invalidation for no
+ * longer than necessary: were this instead left to run on the (possibly
+ * not-yet-scheduled) requester thread after waking, an invalidate queued
+ * right behind this reply could be processed first and race ahead of a
+ * grant that, logically, already arrived first.
+ *
+ * Does not re-validate the granted range against what was requested --
+ * fuse_get_dlm_lock() still does that itself after being woken.
+ */
+static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
+				       struct fuse_args *args, int error)
+{
+	struct fuse_dlm_lock_args *dargs =
+		container_of(args, struct fuse_dlm_lock_args, args);
+
+	if (!dargs->rlock)
+		return;
+
+	/*
+	 * error is 0 (a grant) or -ENOSYS (the server has no DLM, so the
+	 * range is treated as covered) here: either way fuse_get_dlm_lock()
+	 * goes on to consider the range usable. Any other error fails the
+	 * IO instead, and the caller releases the still-INIT rlock directly
+	 * without ever touching the page cache under it -- leave it alone.
+	 */
+	if (error && error != -ENOSYS)
+		return;
+
+	fuse_range_lock_mark_ready(dargs->fi, dargs->rlock);
+}
+
 /**
  * fuse_get_dlm_lock - request a dlm lock from the fuse server
  * @file:   the file being accessed
  * @offset: byte offset into the file (need not be page-aligned)
  * @length: length of the region in bytes (need not be page-aligned)
  * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ * @rlock:  optional IO range lock reserved by the caller in INIT state;
+ *	moved to READY as part of processing a reply that leaves the range
+ *	covered, before this function's caller is even woken up -- see
+ *	fuse_get_dlm_lock_complete() and the declaration in
+ *	fuse_dlm_cache.h.
  *
  * Return: 0 when the range is covered by a recorded grant on return,
  * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
@@ -635,7 +632,8 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
  * they would spin.
  */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
-		      size_t length, enum fuse_page_lock_mode mode)
+		      size_t length, enum fuse_page_lock_mode mode,
+		      struct fuse_range_lock *rlock)
 {
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
@@ -643,17 +641,16 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_mount *fm = ff->fm;
 
-	FUSE_ARGS(args);
+	struct fuse_dlm_lock_args dargs = { .fi = fi, .rlock = rlock };
+	struct fuse_args *args = &dargs.args;
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
-	uint64_t gen;
 	int err;
 
 	/* An empty range needs no lock. */
 	if (!length)
 		return 0;
 
-restart:
 	/* note that this can be run from different processes
 	 * at the same time. It is intentionally not protected
 	 * since a DLM implementation in the FUSE server should take care
@@ -661,18 +658,11 @@ restart:
 	 * The early exit uses the same helper the callers re-validate
 	 * with, so this check and a later fuse_dlm_lock_is_held() can
 	 * never disagree about what counts as covered. */
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
+	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
+		if (rlock)
+			fuse_range_lock_mark_ready(fi, rlock);
 		return 0; /* we already have this area locked */
-
-	/*
-	 * Sample the revocation generation before the request leaves.
-	 * The reply and a NOTIFY revoke are serviced on different
-	 * threads, so a revoke aimed at the grant this request returns
-	 * can be processed before the grant is recorded below --
-	 * recording it anyway would resurrect a dead grant that no later
-	 * NOTIFY will ever remove.
-	 */
-	gen = fuse_dlm_revoke_gen(fi);
+	}
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
@@ -685,15 +675,16 @@ restart:
 	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
 		FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
 
-	args.opcode = FUSE_DLM_WB_LOCK;
-	args.nodeid = get_node_id(inode);
-	args.in_numargs = 1;
-	args.in_args[0].size = sizeof(inarg);
-	args.in_args[0].value = &inarg;
-	args.out_numargs = 1;
-	args.out_args[0].size = sizeof(outarg);
-	args.out_args[0].value = &outarg;
-	err = fuse_simple_request(fm, &args);
+	args->opcode = FUSE_DLM_WB_LOCK;
+	args->nodeid = get_node_id(inode);
+	args->in_numargs = 1;
+	args->in_args[0].size = sizeof(inarg);
+	args->in_args[0].value = &inarg;
+	args->out_numargs = 1;
+	args->out_args[0].size = sizeof(outarg);
+	args->out_args[0].value = &outarg;
+	args->complete = fuse_get_dlm_lock_complete;
+	err = fuse_simple_request(fm, args);
 	if (err == -ENOSYS) {
 		/* fuse server does not support dlm, save the info */
 		fc->dlm = 0;
@@ -715,20 +706,7 @@ restart:
 	 * The server granted the lock; record it so
 	 * fuse_dlm_lock_is_held() sees it.
 	 */
-	err = fuse_dlm_lock_range_gen(fi, outarg.start, outarg.end, mode, gen);
-	if (err == -EAGAIN) {
-		/*
-		 * A revoke was processed while the request was in flight;
-		 * the grant may already be dead, so re-request instead of
-		 * recording it.  Retry until a grant survives long enough to
-		 * be recorded: giving up here would hand the caller an error
-		 * for a range no one else holds, and the write path turns
-		 * that into a failed write.  Each pass makes a fresh server
-		 * round trip, so a revoke storm throttles this loop rather
-		 * than spinning it.
-		 */
-		goto restart;
-	}
+	err = fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode);
 
 	/*
 	 * A failure to record (small-allocation -ENOMEM) does not undo
@@ -736,7 +714,8 @@ restart:
 	 * bookkeeping is missing.  Report that as
 	 * FUSE_DLM_GRANT_UNRECORDED so callers neither fail an IO that
 	 * is actually covered nor keep re-requesting a grant that will
-	 * not become visible.
+	 * not become visible.  (rlock, if any, was already moved to READY
+	 * by fuse_get_dlm_lock_complete() while processing the reply.)
 	 */
 	if (err)
 		return FUSE_DLM_GRANT_UNRECORDED;

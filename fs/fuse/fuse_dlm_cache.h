@@ -13,6 +13,7 @@
 
 
 struct fuse_inode;
+struct fuse_range_lock;
 
 /* Lock modes for page ranges */
 enum fuse_page_lock_mode { FUSE_PAGE_LOCK_READ, FUSE_PAGE_LOCK_WRITE };
@@ -32,13 +33,6 @@ struct fuse_dlm_cache {
 	struct rw_semaphore lock;
 	/* Interval tree of locked ranges */
 	struct rb_root_cached ranges;
-	/*
-	 * Bumped under @lock by every revocation
-	 * (fuse_dlm_unlock_range(), fuse_dlm_cache_release_locks());
-	 * lets fuse_get_dlm_lock() order recording a reply's grant
-	 * against revokes processed while the reply was in flight.
-	 */
-	uint64_t revoke_gen;
 };
 
 /* Initialize a page cache lock manager */
@@ -50,14 +44,6 @@ void fuse_dlm_cache_release_locks(struct fuse_inode *inode);
 /* Lock a range of pages */
 int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 			uint64_t end, enum fuse_page_lock_mode mode);
-
-/* As above, but refuse (-EAGAIN) if a revoke ran since @gen was sampled */
-int fuse_dlm_lock_range_gen(struct fuse_inode *inode, uint64_t start,
-			    uint64_t end, enum fuse_page_lock_mode mode,
-			    uint64_t gen);
-
-/* Sample the revocation generation (see fuse_dlm_lock_range_gen()) */
-uint64_t fuse_dlm_revoke_gen(struct fuse_inode *inode);
 
 /* Unlock a range of pages */
 int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
@@ -74,8 +60,22 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 /* Is any part of the file held for write? */
 bool fuse_dlm_write_grant_exists(struct fuse_inode *inode);
 
-/* This is the interface to the filesystem */
+/*
+ * This is the interface to the filesystem.
+ *
+ * @rlock: optional IO range lock, previously reserved by the caller in
+ * INIT state via fuse_range_lock_acquire_init(), covering (at least)
+ * [offset, offset + length - 1].  When non-NULL, it is moved to READY
+ * as part of processing a reply that leaves the range covered -- i.e.
+ * the already-held fast path, a granted lock, or the server having no
+ * DLM at all -- as soon as that outcome is known, which for a request
+ * that reaches the server is before this function's caller is even
+ * woken up (see fuse_get_dlm_lock_complete() in fuse_dlm_cache.c).
+ * Left at INIT on a hard error, since the caller will not touch the
+ * page cache and releases it directly.
+ */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
-		      size_t length, enum fuse_page_lock_mode mode);
+		      size_t length, enum fuse_page_lock_mode mode,
+		      struct fuse_range_lock *rlock);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */
