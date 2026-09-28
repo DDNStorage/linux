@@ -1456,7 +1456,8 @@ static inline unsigned int fuse_wr_pages(loff_t pos, size_t len,
 		     max_pages);
 }
 
-static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
+static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
+				  unsigned int write_flags)
 {
 	struct address_space *mapping = iocb->ki_filp->f_mapping;
 	struct inode *inode = mapping->host;
@@ -1475,6 +1476,8 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 		struct fuse_args_pages *ap = &ia.ap;
 		unsigned int nr_pages = fuse_wr_pages(pos, iov_iter_count(ii),
 						      fc->max_pages);
+
+		ia.write.in.write_flags |= write_flags;
 
 		ap->folios = fuse_folios_alloc(nr_pages, GFP_KERNEL, &ap->descs);
 		if (!ap->folios) {
@@ -1649,6 +1652,46 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
 	return (err < 0 && err != -ENOSYS) ? err : 0;
 }
 
+/*
+ * Fold one buffered write size into the rolling mean of this inode's write
+ * sizes and report whether the file is being streamed: the same buffer size
+ * arriving FUSE_WRITE_STREAM_RUN times over, which is what a writer working
+ * through a file a record at a time looks like from here.  A size outside the
+ * tolerance around the mean starts the run again from that size, so a writer
+ * changing its record is followed rather than averaged with what it did
+ * before.
+ *
+ * The mean is per inode rather than per handle, so a stream stays one stream
+ * across reopens and across the handles of a shared file, whose writers are
+ * streaming it together without any one of them being sequential.
+ *
+ * A hint only, read and written without the inode lock, which the DLM path
+ * holds shared: writers landing on it together cost a misread run, not
+ * correctness.  Each mark is read once into a local and written once for that
+ * to hold.
+ */
+static bool fuse_write_stream_update(struct fuse_inode *fi, size_t len)
+{
+	unsigned int sample = min_t(size_t, len, FUSE_WRITE_EWMA_MAX);
+	unsigned int ewma = READ_ONCE(fi->write_size_ewma);
+	unsigned int run = READ_ONCE(fi->write_stream_run);
+	unsigned int avg = ewma >> FUSE_WRITE_EWMA_SHIFT;
+
+	if (run && abs_diff(sample, avg) <= avg >> FUSE_WRITE_TOL_SHIFT) {
+		/* E += sample - (E >> SHIFT); avg = E >> SHIFT */
+		WRITE_ONCE(fi->write_size_ewma, ewma + sample - avg);
+		if (run < FUSE_WRITE_STREAM_RUN)
+			run++;
+	} else {
+		WRITE_ONCE(fi->write_size_ewma,
+			   sample << FUSE_WRITE_EWMA_SHIFT);
+		run = 1;
+	}
+	WRITE_ONCE(fi->write_stream_run, run);
+
+	return run >= FUSE_WRITE_STREAM_RUN;
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1661,6 +1704,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_range_lock rlock;
 	bool range_locked = false;
+	bool stream = false;
+	bool through = false;
 	bool exclusive = true;
 	loff_t dlm_pos = 0;
 	size_t dlm_len = 0;
@@ -1712,6 +1757,35 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if ((fc->handle_killpriv_v2 || fc->dlm) &&
 		    setattr_should_drop_suidgid(idmap, file_inode(file)))
 			goto writethrough;
+
+		/*
+		 * Every write that can be cached feeds the rolling mean,
+		 * streamed or not: a writer changing its record has to be seen
+		 * as well.  The size is the one the caller asked for, before
+		 * generic_write_checks() has had a chance to clamp it, which is
+		 * the record the writer is working with.
+		 */
+		if (!(iocb->ki_flags & IOCB_DIRECT))
+			stream = fuse_write_stream_update(fi,
+							  iov_iter_count(from));
+
+		/*
+		 * A streamed write of FUSE_WRITE_STREAM_MIN or more is written
+		 * through from here instead of being left dirty: the pages a
+		 * stream writes are never read back, and a write sent from here
+		 * leaves them clean, so reclaim takes them without a writeback
+		 * pass and i_size is the server's again as soon as the write
+		 * returns.  Size is the whole of the test: what a record is
+		 * worth a write of its own, not where it lands or how it fits
+		 * the alignment the server asked for.
+		 *
+		 * Only where the server took FUSE_BIG_WRITES: without it
+		 * fuse_fill_write_pages() fills one page per request, and a
+		 * record costs a round trip per page instead of one per
+		 * fc->max_write.
+		 */
+		through = stream && fc->big_writes &&
+			  iov_iter_count(from) >= FUSE_WRITE_STREAM_MIN;
 
 		exclusive = fuse_cache_wr_exclusive_lock(iocb, true);
 
@@ -1940,6 +2014,45 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				goto wb_out;
 			written = direct_write_fallback(iocb, from, written,
 					generic_perform_write(iocb, from));
+		} else if (through) {
+			loff_t pos = iocb->ki_pos;
+
+			count = iov_iter_count(from);
+
+			/*
+			 * What is cached under the write goes to the server
+			 * before it: fuse_fill_write_pages() copies into the
+			 * pages and marks them uptodate, but never clears
+			 * dirty, so a dirty one left here would be written back
+			 * on top of the bytes sent below.  Under DLM the READY
+			 * range lock holds off an invalidate and any
+			 * overlapping reader or writer of this node across all
+			 * of it, without one the exclusive inode lock does, and
+			 * the grant requested above keeps the other nodes off
+			 * the bytes, as for a cached write.
+			 */
+			if (mapping->nrpages) {
+				err = filemap_write_and_wait_range(mapping, pos,
+							pos + count - 1);
+				if (err) {
+					written = err;
+					goto wb_out;
+				}
+			}
+
+			/*
+			 * FUSE_WRITE_CACHE: this is a write from the page cache
+			 * of a range this node holds the DLM lock for.  A
+			 * server taking the lock for the write, as it does for
+			 * one without the flag, would wait for the lock we are
+			 * holding across the request.
+			 *
+			 * The pages are left clean and uptodate, and i_size is
+			 * committed from inside, the way fuse_write_end()
+			 * commits it for the cached path.
+			 */
+			written = fuse_perform_write(iocb, from,
+						     FUSE_WRITE_CACHE);
 		} else {
 			written = generic_perform_write(iocb, from);
 		}
@@ -1995,9 +2108,9 @@ writethrough:
 		if (written < 0 || !iov_iter_count(from))
 			goto out;
 		written = direct_write_fallback(iocb, from, written,
-				fuse_perform_write(iocb, from));
+				fuse_perform_write(iocb, from, 0));
 	} else {
-		written = fuse_perform_write(iocb, from);
+		written = fuse_perform_write(iocb, from, 0);
 	}
 out:
 	inode_unlock(inode);
@@ -3912,6 +4025,8 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	init_waitqueue_head(&fi->direct_io_waitq);
 	fi->notify_stamp = jiffies;
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
+	fi->write_size_ewma = 0;
+	fi->write_stream_run = 0;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
