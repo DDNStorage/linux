@@ -2287,12 +2287,24 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 			return res;
 		}
 	}
-	if (!cuse && filemap_range_has_writeback(mapping, pos, (pos + count - 1))) {
-		if (!write)
-			inode_lock(inode);
-		fuse_sync_writes(inode);
-		if (!write)
-			inode_unlock(inode);
+	if (!cuse && filemap_range_has_writeback(mapping, pos, pos + count - 1)) {
+		/*
+		 * fuse_sync_writes() biases fi->writectr, which asserts an
+		 * exclusive i_rwsem holder: two shared holders reach the
+		 * assertion together and the second dies inside fi->lock.  A
+		 * caller holding it shared waits the range out instead, which
+		 * is what the test above asked about anyway.
+		 */
+		if (flags & FUSE_DIO_SHARED) {
+			filemap_fdatawait_range_keep_errors(mapping, pos,
+							    pos + count - 1);
+		} else {
+			if (!write)
+				inode_lock(inode);
+			fuse_sync_writes(inode);
+			if (!write)
+				inode_unlock(inode);
+		}
 	}
 
 	if (fopen_direct_io && write) {
@@ -2413,7 +2425,8 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 
 			res = fuse_direct_io(&io, from, &iocb->ki_pos,
-					     FUSE_DIO_WRITE);
+					     FUSE_DIO_WRITE |
+					     (exclusive ? 0 : FUSE_DIO_SHARED));
 			fuse_write_update_attr(inode, iocb->ki_pos, res);
 		}
 		if (res > 0 && mapping->nrpages) {
@@ -3747,7 +3760,8 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	}
 
 	if (iov_iter_rw(iter) == WRITE) {
-		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
+		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE |
+				     (exclusive ? 0 : FUSE_DIO_SHARED));
 		fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 	} else {
 		ret = __fuse_direct_read(io, iter, &pos);
