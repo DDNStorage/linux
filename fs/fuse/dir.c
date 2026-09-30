@@ -1241,8 +1241,51 @@ out:
 	return err;
 }
 
-static void fuse_fillattr(struct mnt_idmap *idmap, struct inode *inode,
-			  struct fuse_attr *attr, struct kstat *stat)
+/*
+ * st_dev for an inode. With FUSE_DATASET_DEV every dataset slot other than
+ * 0 gets its own anonymous device number, allocated on first use and
+ * released with the connection. Slot 0 is the dataset the file system was
+ * mounted from and keeps the superblock's device. A failed allocation fails
+ * the stat: falling back to the superblock's device would let one file
+ * report two devices.
+ */
+int fuse_inode_dev(struct inode *inode, dev_t *devp)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	u16 slot = READ_ONCE(get_fuse_inode(inode)->ds_slot);
+	dev_t dev;
+	void *old;
+	int err;
+
+	if (!fc->dataset_dev || slot == 0) {
+		*devp = inode->i_sb->s_dev;
+		return 0;
+	}
+
+	old = xa_load(&fc->ds_devs, slot);
+	if (old) {
+		*devp = (dev_t)xa_to_value(old);
+		return 0;
+	}
+
+	err = get_anon_bdev(&dev);
+	if (err)
+		return err;
+
+	old = xa_cmpxchg(&fc->ds_devs, slot, NULL, xa_mk_value(dev), GFP_KERNEL);
+	if (old) {
+		/* Lost a race with another allocation, or out of memory */
+		free_anon_bdev(dev);
+		if (xa_is_err(old))
+			return xa_err(old);
+		dev = (dev_t)xa_to_value(old);
+	}
+	*devp = dev;
+	return 0;
+}
+
+static int fuse_fillattr(struct mnt_idmap *idmap, struct inode *inode,
+			 struct fuse_attr *attr, struct kstat *stat)
 {
 	unsigned int blkbits;
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1250,8 +1293,11 @@ static void fuse_fillattr(struct mnt_idmap *idmap, struct inode *inode,
 				      make_kuid(fc->user_ns, attr->uid));
 	vfsgid_t vfsgid = make_vfsgid(idmap, fc->user_ns,
 				      make_kgid(fc->user_ns, attr->gid));
+	int err;
 
-	stat->dev = inode->i_sb->s_dev;
+	err = fuse_inode_dev(inode, &stat->dev);
+	if (err)
+		return err;
 	stat->ino = attr->ino;
 	stat->mode = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
 	stat->nlink = attr->nlink;
@@ -1273,6 +1319,7 @@ static void fuse_fillattr(struct mnt_idmap *idmap, struct inode *inode,
 		blkbits = inode->i_sb->s_blocksize_bits;
 
 	stat->blksize = 1 << blkbits;
+	return 0;
 }
 
 static void fuse_statx_to_attr(struct fuse_statx *sx, struct fuse_attr *attr)
@@ -1315,6 +1362,8 @@ static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, ui
 	sx->rdev_major = MAJOR(attr->rdev);
 	sx->rdev_minor = MINOR(attr->rdev);
 	sx->blksize = attr->blksize;
+	sx->dev_minor = (attr->flags & FUSE_ATTR_DEV_SLOT_MASK) >>
+			FUSE_ATTR_DEV_SLOT_SHIFT;
 }
 
 /*
@@ -1445,7 +1494,9 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 		stat->result_mask = sx->mask & (STATX_BASIC_STATS | STATX_BTIME);
 		stat->btime.tv_sec = sx->btime.tv_sec;
 		stat->btime.tv_nsec = min_t(u32, sx->btime.tv_nsec, NSEC_PER_SEC - 1);
-		fuse_fillattr(idmap, inode, &attr, stat);
+		err = fuse_fillattr(idmap, inode, &attr, stat);
+		if (err)
+			return err;
 		stat->result_mask |= STATX_TYPE;
 	}
 
@@ -1489,7 +1540,8 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 					       ATTR_TIMEOUT(&outarg),
 					       attr_version);
 			if (stat)
-				fuse_fillattr(idmap, inode, &outarg.attr, stat);
+				err = fuse_fillattr(idmap, inode, &outarg.attr,
+						    stat);
 		}
 	}
 	return err;
@@ -1683,6 +1735,9 @@ retry:
 		generic_fillattr(idmap, sx_mask, inode, stat);
 		stat->mode = fi->orig_i_mode;
 		stat->ino = fi->orig_ino;
+		err = fuse_inode_dev(inode, &stat->dev);
+		if (err)
+			return err;
 		if (test_bit(FUSE_I_BTIME, &fi->state)) {
 			stat->btime = fi->i_btime;
 			stat->result_mask |= STATX_BTIME;
@@ -2600,8 +2655,7 @@ static int fuse_getattr(struct mnt_idmap *idmap,
 			 * error out, but return st_dev only.
 			 */
 			stat->result_mask = 0;
-			stat->dev = inode->i_sb->s_dev;
-			return 0;
+			return fuse_inode_dev(inode, &stat->dev);
 		}
 		return -EACCES;
 	}
