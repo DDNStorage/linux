@@ -510,6 +510,60 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 }
 
 /**
+ * fuse_dlm_covered_end - how far a granted lock covers [@start, @end]
+ * @inode: the fuse inode
+ * @start: first byte to check
+ * @end:   last byte to check (inclusive, must be below U64_MAX)
+ * @mode:  FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ *
+ * For a caller that can fill part of a range: the page cache fill paths
+ * run with the folios locked and may not ask for a grant, so they fill
+ * what is covered and give the rest back.
+ *
+ * Return: the first byte at or after @start that no granted lock of at
+ * least @mode covers, i.e. @start when nothing is covered and @end + 1
+ * when all of it is.
+ */
+uint64_t fuse_dlm_covered_end(struct fuse_inode *inode, uint64_t start,
+			      uint64_t end, enum fuse_page_lock_mode mode)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+	uint64_t covered = start;
+	int lock_mode = 0;
+
+	if (start > end)
+		return start;
+
+	if (mode == FUSE_PAGE_LOCK_READ)
+		lock_mode = FUSE_PCACHE_LK_READ;
+	else if (mode == FUSE_PAGE_LOCK_WRITE)
+		lock_mode = FUSE_PCACHE_LK_WRITE;
+
+	down_read(&cache->lock);
+	for (range = fuse_dlm_find_overlapping(cache, start, end); range;
+	     range = fuse_page_it_iter_next(range, start, end)) {
+		/* A grant weaker than asked for covers nothing here. */
+		if (lock_mode && range->mode < lock_mode)
+			break;
+
+		/* A gap before this range ends the covered run. */
+		if (range->start > covered)
+			break;
+
+		if (range->end >= end) {
+			covered = end + 1;
+			break;
+		}
+
+		covered = range->end + 1;
+	}
+	up_read(&cache->lock);
+
+	return covered;
+}
+
+/**
  * fuse_dlm_write_grant_exists - does the inode hold an exclusive grant anywhere
  * @fi: the fuse inode
  *
