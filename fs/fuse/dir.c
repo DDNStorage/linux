@@ -1221,6 +1221,40 @@ out:
 	return err;
 }
 
+/*
+ * st_dev for an inode. With FUSE_DATASET_DEV every dataset slot other than
+ * 0 gets its own anonymous device number, allocated on first use and
+ * released with the connection. Slot 0 is the dataset the file system was
+ * mounted from and keeps the superblock's device.
+ */
+dev_t fuse_inode_dev(struct inode *inode)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	u16 slot = READ_ONCE(get_fuse_inode(inode)->ds_slot);
+	dev_t dev;
+	void *old;
+
+	if (!fc->dataset_dev || slot == 0)
+		return inode->i_sb->s_dev;
+
+	old = xa_load(&fc->ds_devs, slot);
+	if (old)
+		return (dev_t)xa_to_value(old);
+
+	if (get_anon_bdev(&dev))
+		return inode->i_sb->s_dev;
+
+	old = xa_cmpxchg(&fc->ds_devs, slot, NULL, xa_mk_value(dev), GFP_KERNEL);
+	if (old) {
+		/* Lost a race with another allocation, or out of memory */
+		free_anon_bdev(dev);
+		if (xa_is_err(old))
+			return inode->i_sb->s_dev;
+		return (dev_t)xa_to_value(old);
+	}
+	return dev;
+}
+
 static void fuse_fillattr(struct mnt_idmap *idmap, struct inode *inode,
 			  struct fuse_attr *attr, struct kstat *stat)
 {
@@ -1231,7 +1265,7 @@ static void fuse_fillattr(struct mnt_idmap *idmap, struct inode *inode,
 	vfsgid_t vfsgid = make_vfsgid(idmap, fc->user_ns,
 				      make_kgid(fc->user_ns, attr->gid));
 
-	stat->dev = inode->i_sb->s_dev;
+	stat->dev = fuse_inode_dev(inode);
 	stat->ino = attr->ino;
 	stat->mode = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
 	stat->nlink = attr->nlink;
@@ -1485,6 +1519,7 @@ retry:
 		generic_fillattr(idmap, sx_mask, inode, stat);
 		stat->mode = fi->orig_i_mode;
 		stat->ino = fi->orig_ino;
+		stat->dev = fuse_inode_dev(inode);
 		if (test_bit(FUSE_I_BTIME, &fi->state)) {
 			stat->btime = fi->i_btime;
 			stat->result_mask |= STATX_BTIME;
@@ -2380,7 +2415,7 @@ static int fuse_getattr(struct mnt_idmap *idmap,
 			 * error out, but return st_dev only.
 			 */
 			stat->result_mask = 0;
-			stat->dev = inode->i_sb->s_dev;
+			stat->dev = fuse_inode_dev(inode);
 			return 0;
 		}
 		return -EACCES;
