@@ -513,6 +513,8 @@ struct fuse_file_lock {
 #define FUSE_OVER_IO_URING	(1ULL << 41)
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
 #define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
+/* FUSE_DATASET_DEV: report a separate st_dev per dataset slot */
+#define FUSE_DATASET_DEV	(1ULL << 57)
 #define FUSE_SETATTR_WRITEBACK	(1ULL << 58)
 #define FUSE_URING_REDUCED_Q	(1ULL << 59)
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
@@ -603,6 +605,16 @@ struct fuse_file_lock {
  */
 #define FUSE_ATTR_SUBMOUNT      (1 << 0)
 #define FUSE_ATTR_DAX		(1 << 1)
+
+/*
+ * With FUSE_DATASET_DEV negotiated, bits 16..31 of fuse_attr.flags carry
+ * the dataset slot of the inode, and a statx reply carries it in
+ * stx_dev_minor with stx_dev_major 0. The kernel reports a separate st_dev
+ * for every non-zero slot, so inode numbers only need to be unique within
+ * one dataset. Slot 0 is the dataset the file system was mounted from.
+ */
+#define FUSE_ATTR_DEV_SLOT_SHIFT	16
+#define FUSE_ATTR_DEV_SLOT_MASK	(0xffffU << FUSE_ATTR_DEV_SLOT_SHIFT)
 
 /**
  * Open flags
