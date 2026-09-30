@@ -359,6 +359,16 @@ static int fuse_open(struct inode *inode, struct file *file)
 	if (err)
 		return err;
 
+	/*
+	 * The server truncates on FUSE_OPEN, before handle_truncate() checks
+	 * for a running executable.
+	 */
+	if (is_truncate) {
+		err = get_write_access(inode);
+		if (err)
+			return err;
+	}
+
 	if (is_wb_truncate || dax_truncate)
 		inode_lock(inode);
 
@@ -401,6 +411,8 @@ static int fuse_open(struct inode *inode, struct file *file)
 out_inode_unlock:
 	if (is_wb_truncate || dax_truncate)
 		inode_unlock(inode);
+	if (is_truncate)
+		put_write_access(inode);
 
 	return err;
 }
