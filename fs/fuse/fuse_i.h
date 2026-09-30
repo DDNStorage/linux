@@ -136,6 +136,9 @@ struct fuse_inode {
 	/** 64 bit inode number */
 	u64 orig_ino;
 
+	/** Dataset slot from the last attribute update (FUSE_DATASET_DEV) */
+	u16 ds_slot;
+
 	/** Version of last attribute change */
 	u64 attr_version;
 
@@ -734,6 +737,9 @@ struct fuse_conn {
 	/*  expire inode entries when doing inode invalidation */
 	unsigned expire_inode_entries:1;
 
+	/*  report a separate st_dev per dataset slot */
+	unsigned dataset_dev:1;
+
 	/*
 	 * The following bitfields are only for optimization purposes
 	 * and hence races in setting them will not cause malfunction
@@ -950,6 +956,9 @@ struct fuse_conn {
 	/* The foffset alignment in PAGE */
 	unsigned int alignment_pages;
 
+
+	/** Anonymous device numbers of dataset slots (FUSE_DATASET_DEV) */
+	struct xarray ds_devs;
 };
 
 /*
@@ -1294,6 +1303,9 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
  * Release reference to fuse_conn
  */
 void fuse_conn_put(struct fuse_conn *fc);
+
+/** st_dev of an inode, per dataset slot when FUSE_DATASET_DEV is on */
+dev_t fuse_inode_dev(struct inode *inode);
 
 struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc);
 struct fuse_dev *fuse_dev_alloc(void);
