@@ -370,6 +370,8 @@ static void fuse_change_attributes_common_sx(struct inode *inode,
 		inode->i_mode &= ~S_ISVTX;
 
 	fi->orig_ino = attr->ino;
+	if (fc->dataset_dev && sx->dev_major == 0)
+		WRITE_ONCE(fi->ds_slot, sx->dev_minor & 0xffff);
 
 	/*
 	 * We are refreshing inode data and it is possible that another
@@ -472,6 +474,9 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 		inode->i_mode &= ~S_ISVTX;
 
 	fi->orig_ino = attr->ino;
+	if (fc->dataset_dev)
+		WRITE_ONCE(fi->ds_slot, (attr->flags & FUSE_ATTR_DEV_SLOT_MASK) >>
+					  FUSE_ATTR_DEV_SLOT_SHIFT);
 
 	/*
 	 * We are refreshing inode data and it is possible that another
@@ -1472,6 +1477,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 		    const struct fuse_iqueue_ops *fiq_ops, void *fiq_priv)
 {
 	memset(fc, 0, sizeof(*fc));
+	xa_init(&fc->ds_devs);
 	spin_lock_init(&fc->lock);
 	spin_lock_init(&fc->bg_lock);
 	init_rwsem(&fc->killsb);
@@ -1528,6 +1534,16 @@ static void delayed_release(struct rcu_head *p)
 	fc->release(fc);
 }
 
+static void fuse_free_ds_devs(struct fuse_conn *fc)
+{
+	unsigned long slot;
+	void *entry;
+
+	xa_for_each(&fc->ds_devs, slot, entry)
+		free_anon_bdev((dev_t)xa_to_value(entry));
+	xa_destroy(&fc->ds_devs);
+}
+
 void fuse_conn_put(struct fuse_conn *fc)
 {
 	if (refcount_dec_and_test(&fc->count)) {
@@ -1548,6 +1564,7 @@ void fuse_conn_put(struct fuse_conn *fc)
 		}
 		if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			fuse_backing_files_free(fc);
+		fuse_free_ds_devs(fc);
 		xa_destroy(&fc->dlm_retry_tasks);
 		call_rcu(&fc->rcu, delayed_release);
 	}
@@ -1975,6 +1992,8 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->inval_inode_entries = 1;
 			if (flags & FUSE_EXPIRE_INODE_ENTRY)
 				fc->expire_inode_entries = 1;
+			if (flags & FUSE_DATASET_DEV)
+				fc->dataset_dev = 1;
 			if (flags & FUSE_SETATTR_WRITEBACK)
 				fc->setattr_writeback = 1;
 		} else {
@@ -2030,7 +2049,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
 		FUSE_REQUEST_TIMEOUT | FUSE_INVAL_INODE_ENTRY |
-		FUSE_EXPIRE_INODE_ENTRY | FUSE_URING_REDUCED_Q |
+		FUSE_EXPIRE_INODE_ENTRY | FUSE_DATASET_DEV | FUSE_URING_REDUCED_Q |
 		FUSE_SETATTR_WRITEBACK;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
