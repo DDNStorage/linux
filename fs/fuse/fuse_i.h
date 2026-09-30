@@ -145,6 +145,9 @@ struct fuse_inode {
 	    preserve the original mode */
 	umode_t orig_i_mode;
 
+	/** Dataset slot from the last attribute update (FUSE_DATASET_DEV) */
+	u16 ds_slot;
+
 	/* Cache birthtime */
 	struct timespec64 i_btime;
 
@@ -835,6 +838,9 @@ struct fuse_conn {
 	/*  expire inode entries when doing inode invalidation */
 	unsigned expire_inode_entries:1;
 
+	/*  report a separate st_dev per dataset slot */
+	unsigned dataset_dev:1;
+
 	/*  mark writeback-initiated SETATTR requests with FATTR_WRITEBACK */
 	unsigned setattr_writeback:1;
 
@@ -1051,6 +1057,8 @@ struct fuse_conn {
 	/* The foffset alignment in PAGE */
 	unsigned int alignment_pages;
 
+	/** Anonymous device numbers of dataset slots (FUSE_DATASET_DEV) */
+	struct xarray ds_devs;
 };
 
 /*
@@ -1411,6 +1419,9 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
  * Release reference to fuse_conn
  */
 void fuse_conn_put(struct fuse_conn *fc);
+
+/** st_dev of an inode, per dataset slot when FUSE_DATASET_DEV is on */
+int fuse_inode_dev(struct inode *inode, dev_t *devp);
 
 struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc);
 struct fuse_dev *fuse_dev_alloc(void);
