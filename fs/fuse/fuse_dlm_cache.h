@@ -246,6 +246,10 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode, uint64_t start,
 bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 			      uint64_t end, enum fuse_page_lock_mode mode);
 
+/* How far a granted lock covers a range; see fuse_dlm_cache.c */
+uint64_t fuse_dlm_covered_end(struct fuse_inode *inode, uint64_t start,
+			      uint64_t end, enum fuse_page_lock_mode mode);
+
 /* Re-validate a fuse_get_dlm_lock() grant against the live lock tree */
 bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 			   size_t length, enum fuse_page_lock_mode mode);
