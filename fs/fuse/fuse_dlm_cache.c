@@ -587,6 +587,17 @@ struct fuse_dlm_lock_args {
  * right behind this reply could be processed first and race ahead of a
  * grant that, logically, already arrived first.
  *
+ * Uses fuse_range_lock_mark_ready() rather than _mark_locked() because
+ * this runs on the (shared) thread processing replies/notifications for
+ * the connection: _mark_locked() can block on a conflicting overlapping
+ * range (e.g. an invalidate that is itself queued behind messages this
+ * thread has yet to process), which would stall that thread. READY is
+ * just as visible to invalidation's fuse_range_lock_acquire_locked() as
+ * LOCKED, so this does not widen the race window above; the requester
+ * thread promotes the range the rest of the way to LOCKED, blocking
+ * there instead if still necessary, right before it touches the page
+ * cache.
+ *
  * Does not re-validate the granted range against what was requested --
  * fuse_get_dlm_lock() still does that itself after being woken.
  */
@@ -620,9 +631,10 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
  * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
  * @rlock:  optional IO range lock reserved by the caller in INIT state;
  *	moved to READY as part of processing a reply that leaves the range
- *	covered, before this function's caller is even woken up -- see
- *	fuse_get_dlm_lock_complete() and the declaration in
- *	fuse_dlm_cache.h.
+ *	covered, before this function's caller is even woken up, or
+ *	directly to LOCKED when the range is already covered without a
+ *	round trip -- see fuse_get_dlm_lock_complete() and the declaration
+ *	in fuse_dlm_cache.h.
  *
  * Return: 0 when the range is covered by a recorded grant on return,
  * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
@@ -660,7 +672,7 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	 * never disagree about what counts as covered. */
 	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
 		if (rlock)
-			fuse_range_lock_mark_ready(fi, rlock);
+			fuse_range_lock_mark_locked(fi, rlock);
 		return 0; /* we already have this area locked */
 	}
 
@@ -762,13 +774,14 @@ void fuse_range_lock_tree_init(struct fuse_inode *inode)
  * fuse_range_conflicts - Test @lock's range against currently held ranges
  * @tree: The range lock tree
  * @lock: The range lock being tested (not yet inserted, or already held)
- * @ready_only: If true, ignore existing ranges still in INIT state
+ * @locked_only: If true, ignore existing ranges still in INIT state
  *
  * A conflict occurs whenever an overlapping range exists (other than
  * @lock itself) and either @lock or that range is a WRITE lock (READ
- * ranges may overlap each other freely). When @ready_only is set, a
+ * ranges may overlap each other freely). When @locked_only is set, a
  * range still in INIT state (reserved, not yet touching the page cache)
- * is not considered -- see fuse_range_lock_acquire_ready().
+ * is not considered, but a range already in READY or LOCKED state is --
+ * see fuse_range_lock_acquire_locked().
  *
  * Caller holds @tree->lock.
  *
@@ -776,14 +789,14 @@ void fuse_range_lock_tree_init(struct fuse_inode *inode)
  */
 static bool fuse_range_conflicts(struct fuse_range_lock_tree *tree,
 				struct fuse_range_lock *lock,
-				bool ready_only)
+				bool locked_only)
 {
 	struct fuse_range_lock *cur;
 
 	cur = fuse_range_it_iter_first(&tree->root, lock->start, lock->end);
 	while (cur) {
 		if (cur != lock &&
-		    (!ready_only || cur->state == FUSE_RANGE_LOCK_READY) &&
+		    (!locked_only || cur->state != FUSE_RANGE_LOCK_INIT) &&
 		    (lock->mode == FUSE_RANGE_LOCK_WRITE ||
 		     cur->mode == FUSE_RANGE_LOCK_WRITE))
 			return true;
@@ -824,19 +837,19 @@ static bool fuse_range_try_lock_init(struct fuse_range_lock_tree *tree,
 }
 
 /**
- * fuse_range_try_lock_ready - Try to insert @lock into @tree in READY state
+ * fuse_range_try_lock_locked - Try to insert @lock into @tree in LOCKED state
  * @tree: The range lock tree
  * @lock: The range lock to try to acquire
  *
- * Conflict tested only against existing READY ranges: an overlapping
- * range still in INIT state is ignored, so this never waits behind a
- * read/write that has only reserved a range and not yet started
+ * Conflict tested only against existing READY or LOCKED ranges: an
+ * overlapping range still in INIT state is ignored, so this never waits
+ * behind a read/write that has only reserved a range and not yet started
  * touching the page cache.
  *
  * Return: true if @lock was inserted, false if the caller must wait.
  */
-static bool fuse_range_try_lock_ready(struct fuse_range_lock_tree *tree,
-				     struct fuse_range_lock *lock)
+static bool fuse_range_try_lock_locked(struct fuse_range_lock_tree *tree,
+				      struct fuse_range_lock *lock)
 {
 	bool conflict;
 
@@ -844,7 +857,7 @@ static bool fuse_range_try_lock_ready(struct fuse_range_lock_tree *tree,
 
 	conflict = fuse_range_conflicts(tree, lock, true);
 	if (!conflict) {
-		lock->state = FUSE_RANGE_LOCK_READY;
+		lock->state = FUSE_RANGE_LOCK_LOCKED;
 		fuse_range_it_insert(lock, &tree->root);
 	}
 
@@ -854,15 +867,15 @@ static bool fuse_range_try_lock_ready(struct fuse_range_lock_tree *tree,
 }
 
 /**
- * fuse_range_try_mark_ready - Try to move an already-held @lock to READY
+ * fuse_range_try_mark_locked - Try to move an already-held @lock to LOCKED
  * @tree: The range lock tree
- * @lock: The (already inserted) range lock to move to READY state
+ * @lock: The (already inserted) range lock to move to LOCKED state
  *
- * Return: true if @lock is now READY, false if the caller must wait for
- * a conflicting READY range to be released.
+ * Return: true if @lock is now LOCKED, false if the caller must wait for
+ * a conflicting READY or LOCKED range to be released.
  */
-static bool fuse_range_try_mark_ready(struct fuse_range_lock_tree *tree,
-				     struct fuse_range_lock *lock)
+static bool fuse_range_try_mark_locked(struct fuse_range_lock_tree *tree,
+				      struct fuse_range_lock *lock)
 {
 	bool conflict;
 
@@ -870,7 +883,7 @@ static bool fuse_range_try_mark_ready(struct fuse_range_lock_tree *tree,
 
 	conflict = fuse_range_conflicts(tree, lock, true);
 	if (!conflict)
-		lock->state = FUSE_RANGE_LOCK_READY;
+		lock->state = FUSE_RANGE_LOCK_LOCKED;
 
 	spin_unlock(&tree->lock);
 
@@ -908,24 +921,47 @@ void fuse_range_lock_acquire_init(struct fuse_inode *inode,
  * @inode: The fuse inode
  * @lock: The range lock previously passed to fuse_range_lock_acquire_init()
  *
- * Blocks until no other currently held, overlapping READY range
- * conflicts with @lock.
+ * Never blocks: moving @lock from INIT to READY only ever adds a new
+ * conflict for another caller (e.g. an invalidation that has not reached
+ * this range yet), it never resolves an existing one, so there is
+ * nothing for this call to wait for and no waiter to wake.
  */
 void fuse_range_lock_mark_ready(struct fuse_inode *inode,
 			       struct fuse_range_lock *lock)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
-	wait_event(tree->waitq, fuse_range_try_mark_ready(tree, lock));
+	spin_lock(&tree->lock);
+	lock->state = FUSE_RANGE_LOCK_READY;
+	spin_unlock(&tree->lock);
 }
 
 /**
- * fuse_range_lock_mark_init - Move a READY range lock back to INIT state
+ * fuse_range_lock_mark_locked - Move a reserved range lock to LOCKED state
  * @inode: The fuse inode
- * @lock: The range lock previously moved to READY state
+ * @lock: The range lock previously passed to fuse_range_lock_acquire_init(),
+ *	whether still in INIT state or already moved to READY by
+ *	fuse_range_lock_mark_ready()
+ *
+ * Blocks until no other currently held, overlapping READY or LOCKED range
+ * conflicts with @lock.
+ */
+void fuse_range_lock_mark_locked(struct fuse_inode *inode,
+				struct fuse_range_lock *lock)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	wait_event(tree->waitq, fuse_range_try_mark_locked(tree, lock));
+}
+
+/**
+ * fuse_range_lock_mark_init - Move a READY or LOCKED range lock back to
+ * INIT state
+ * @inode: The fuse inode
+ * @lock: The range lock previously moved to READY or LOCKED state
  *
  * Never blocks. Wakes waiters, since an invalidation may be waiting on
- * @lock's (until now READY) range and can now proceed around it.
+ * @lock's (until now READY or LOCKED) range and can now proceed around it.
  */
 void fuse_range_lock_mark_init(struct fuse_inode *inode,
 			      struct fuse_range_lock *lock)
@@ -940,7 +976,7 @@ void fuse_range_lock_mark_init(struct fuse_inode *inode,
 }
 
 /**
- * fuse_range_lock_acquire_ready - Acquire a byte range lock in READY state
+ * fuse_range_lock_acquire_locked - Acquire a byte range lock in LOCKED state
  * @inode: The fuse inode
  * @lock: Caller-allocated storage for the lock (e.g. on the stack)
  * @start: Start byte offset (inclusive)
@@ -948,14 +984,14 @@ void fuse_range_lock_mark_init(struct fuse_inode *inode,
  * @mode: FUSE_RANGE_LOCK_READ or FUSE_RANGE_LOCK_WRITE
  *
  * Blocks until [start, end] can be locked in the requested mode without
- * conflicting with any other currently held READY, overlapping range.
- * An overlapping range still in INIT state does not block this.  The
- * range is rounded out to whole pages; see fuse_dlm_cache.h.
+ * conflicting with any other currently held READY or LOCKED, overlapping
+ * range.  An overlapping range still in INIT state does not block this.
+ * The range is rounded out to whole pages; see fuse_dlm_cache.h.
  */
-void fuse_range_lock_acquire_ready(struct fuse_inode *inode,
-				  struct fuse_range_lock *lock,
-				  uint64_t start, uint64_t end,
-				  enum fuse_range_lock_mode mode)
+void fuse_range_lock_acquire_locked(struct fuse_inode *inode,
+				   struct fuse_range_lock *lock,
+				   uint64_t start, uint64_t end,
+				   enum fuse_range_lock_mode mode)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
@@ -963,14 +999,14 @@ void fuse_range_lock_acquire_ready(struct fuse_inode *inode,
 	lock->end = end | (PAGE_SIZE - 1);
 	lock->mode = mode;
 
-	wait_event(tree->waitq, fuse_range_try_lock_ready(tree, lock));
+	wait_event(tree->waitq, fuse_range_try_lock_locked(tree, lock));
 }
 
 /**
  * fuse_range_lock_release - Release a previously acquired range lock
  * @inode: The fuse inode
  * @lock: The range lock previously passed to
- *	fuse_range_lock_acquire_init() or fuse_range_lock_acquire_ready()
+ *	fuse_range_lock_acquire_init() or fuse_range_lock_acquire_locked()
  */
 void fuse_range_lock_release(struct fuse_inode *inode,
 			    struct fuse_range_lock *lock)
