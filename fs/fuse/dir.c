@@ -1501,35 +1501,37 @@ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
 }
 
 /*
- * How often to ask when the answer does not reach the inode.  A drop needs an
- * update landing while the request is out and does not repeat.
- */
-#define FUSE_ATTR_SYNC_TRIES	3
-
-/*
- * Ask the server, whatever the attribute cache says, and for the size keep
- * asking while what it reports is beyond i_size.  fuse_change_attributes()
- * returns without applying a reply that an update landing since has
- * overtaken, so the call returning is no statement about i_size, and a caller
- * resolving EOF against it reports EOF over bytes that are there.  A size the
- * cache wins with is reported below i_size and ends the loop.
+ * Ask the server, whatever the attribute cache says, and take a size beyond
+ * i_size from the reply.  fuse_change_attributes() returns without applying
+ * a reply that an update landing since has overtaken, so the call returning
+ * is no statement about i_size, and a caller resolving EOF against it would
+ * report EOF over bytes that are there.  A larger size is a lower bound on
+ * the file: only a truncate racing the request makes it stale, and its own
+ * reply corrects that.  A smaller one is the cache's to keep where unwritten
+ * data is behind it, and stays with fuse_change_attributes().  The version
+ * bump keeps a short read answered before the growth from shrinking it back.
  *
  * For attributes the timeout cannot speak for, see fuse_size_needs_server().
  */
 int fuse_update_attributes_sync(struct inode *inode, struct file *file,
 				u32 mask)
 {
-	unsigned int tries = FUSE_ATTR_SYNC_TRIES;
-	loff_t size;
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t size = 0;
 	int err;
 
-	do {
-		size = 0;
-		err = fuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL,
-					   mask, AT_STATX_FORCE_SYNC, &size);
-		if (err || !(mask & STATX_SIZE))
-			return err;
-	} while (size > i_size_read(inode) && --tries);
+	err = fuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL, mask,
+				   AT_STATX_FORCE_SYNC, &size);
+	if (err || !(mask & STATX_SIZE))
+		return err;
+
+	spin_lock(&fi->lock);
+	if (size > inode->i_size) {
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
+		i_size_write(inode, size);
+	}
+	spin_unlock(&fi->lock);
 
 	return 0;
 }
