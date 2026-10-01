@@ -1207,7 +1207,7 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * range -- without waiting out this (unbounded, cluster round trip)
 	 * request.  Only meaningful under DLM with the writeback cache:
 	 * without DLM there is no round trip to protect against, and the
-	 * truncate / invalidate paths' fuse_range_lock_acquire_ready()
+	 * truncate / invalidate paths' fuse_range_lock_acquire_locked()
 	 * calls simply find no overlapping node to wait on; without the
 	 * writeback cache there is no DLM-covered write to race against.
 	 */
@@ -1230,12 +1230,13 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 				  range_locked ? &rlock : NULL);
 
 	/*
-	 * Ensure the range lock is READY before touching the page cache:
-	 * the DLM reply above already moved it there when it was taken;
-	 * this is then just a confirmation.  It still does the transition
-	 * itself when no DLM request was made above (no writeback cache or
-	 * no dlm), and blocks only if a NOTIFY invalidate is currently
-	 * draining an overlapping range -- once granted it fences any *new*
+	 * Ensure the range lock is LOCKED before touching the page cache:
+	 * the DLM reply above already moved it to READY when it was taken,
+	 * so this call promotes it the rest of the way.  It still does the
+	 * full INIT-to-LOCKED transition itself when no DLM request was
+	 * made above (no writeback cache or no dlm), and blocks only if a
+	 * NOTIFY invalidate is currently draining an overlapping range --
+	 * once granted it fences any *new*
 	 * overlapping invalidate until the range lock is released below.
 	 * An invalidate that instead ran to completion entirely while we
 	 * were still in INIT above (and so invisible to it) has already
@@ -1246,7 +1247,7 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * round trip on this or the next read, never stale data.
 	 */
 	if (range_locked) {
-		fuse_range_lock_mark_ready(fi, &rlock);
+		fuse_range_lock_mark_locked(fi, &rlock);
 
 		if (fuse_inode_force_dio(inode)) {
 			fuse_range_lock_release(fi, &rlock);
@@ -1659,7 +1660,7 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
  *
  * @rlock: passed straight through to fuse_get_dlm_lock(); NULL unless
  * @rlock is the range lock the caller will actually touch the page
- * cache under, since that is what "reply processing marks it READY"
+ * cache under, since that is what "reply processing marks it LOCKED"
  * is meant to cover.
  */
 static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
@@ -1814,7 +1815,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * concurrent NOTIFY_INVAL_INODE takes the same range lock for
 		 * the range it invalidates, so it must not be able to strand
 		 * the folios we are about to dirty.  The latch is re-checked
-		 * once the range lock is READY below (it may have been set
+		 * once the range lock is LOCKED below (it may have been set
 		 * while we blocked on the inode lock) and the write re-routed
 		 * to the direct path if it is now set; the DLM write lock
 		 * taken above is harmless there, as the direct path does its
@@ -1837,7 +1838,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * of waiting out the request.  The grant-to-use window this
 		 * leaves open is closed by the exact-range DLM request once the
 		 * write's final range is known below, which moves the range
-		 * lock to READY as part of its reply.  Only the append case
+		 * lock to LOCKED as part of its reply.  Only the append case
 		 * must wait for the lock: its range depends on i_size, which is
 		 * stable only under the exclusive inode lock.
 		 */
@@ -1855,7 +1856,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			 * re-acquired narrower, in INIT state, once the exact
 			 * write range is known below, so it is not the range
 			 * lock this write actually touches the page cache
-			 * under -- that one is requested, and marked READY,
+			 * under -- that one is requested, and marked LOCKED,
 			 * further down.
 			 */
 			err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
@@ -1926,7 +1927,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 		/*
 		 * Kill suid/sgid and stamp the timestamps here, before the
-		 * range lock moves to READY, instead of leaving them to
+		 * range lock moves to LOCKED, instead of leaving them to
 		 * __generic_file_write_iter().  file_remove_privs() is the one
 		 * that reaches the server: without handle_killpriv[_v2]
 		 * fuse_setattr() kills the bits by asking it (a FUSE_GETATTR to
@@ -1935,9 +1936,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * security_inode_killpriv() can drop the capability xattr with
 		 * another round trip.  A server may have to invalidate this
 		 * inode from inside such a handler; its NOTIFY_INVAL_INODE then
-		 * calls fuse_range_lock_acquire_ready(), which does not wait on
-		 * our INIT range.  Nothing held once the range lock is READY
-		 * may wait for the server.  file_update_time() only marks the
+		 * calls fuse_range_lock_acquire_locked(), which does not wait
+		 * on our INIT range.  Nothing held once the range lock is
+		 * LOCKED may wait for the server.  file_update_time() only marks the
 		 * inode dirty, but stays next to it to keep the VFS order.
 		 */
 		err = file_remove_privs(file);
@@ -1977,10 +1978,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			 * Request the DLM write lock for the exact range this
 			 * write will touch, with the range lock itself passed
 			 * through this time: fuse_get_dlm_lock() moves it to
-			 * READY as part of processing the reply (or right away,
-			 * if the range is already covered by the provisional
-			 * grant above -- see its fast path).  Nothing is left
-			 * to re-validate below.
+			 * READY as part of processing the reply (or directly to
+			 * LOCKED right away, if the range is already covered by
+			 * the provisional grant above -- see its fast path).
+			 * Nothing is left to re-validate below.
 			 */
 			err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len,
 						     &rlock);
@@ -1991,12 +1992,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 
 		/*
-		 * Move the range lock to READY.  The DLM request above already
-		 * made this transition as part of processing its reply, so this
-		 * is just a confirmation; it still does the transition itself
-		 * when nothing was reserved above (no DLM), in which case it
-		 * never blocks.  Otherwise this blocks only if a NOTIFY
-		 * invalidate is currently draining an overlapping range, and
+		 * Move the range lock to LOCKED.  The DLM request above already
+		 * moved it to READY as part of processing its reply (or straight
+		 * to LOCKED via its fast path), so this call promotes it the
+		 * rest of the way.  This blocks only if a NOTIFY invalidate is
+		 * currently draining an overlapping range, and
 		 * once granted fences any *new* overlapping invalidate until
 		 * the range lock is released below (see wb_out:).  This is what
 		 * gives invalidation an exact conflict test instead of draining
@@ -2006,7 +2006,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * writer on an overlapping range.
 		 */
 		if (range_locked)
-			fuse_range_lock_mark_ready(fi, &rlock);
+			fuse_range_lock_mark_locked(fi, &rlock);
 
 		if (fuse_inode_force_dio(inode)) {
 			if (range_locked)
@@ -2031,7 +2031,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			 * before it: fuse_fill_write_pages() copies into the
 			 * pages and marks them uptodate, but never clears
 			 * dirty, so a dirty one left here would be written back
-			 * on top of the bytes sent below.  Under DLM the READY
+			 * on top of the bytes sent below.  Under DLM the LOCKED
 			 * range lock holds off an invalidate and any
 			 * overlapping reader or writer of this node across all
 			 * of it, without one the exclusive inode lock does, and

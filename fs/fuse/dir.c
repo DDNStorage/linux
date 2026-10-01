@@ -2144,10 +2144,10 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			 * Revoke and drop under the full-range IO range lock,
 			 * like the NOTIFY invalidate path
 			 * (fuse_reverse_inval_inode()): a reader/writer that
-			 * already reached READY state must not have the lock
+			 * already reached LOCKED state must not have the lock
 			 * tree and the cache yanked mid-hold, or it would
 			 * repopulate the truncated range trusting a grant that
-			 * no longer exists.  fuse_range_lock_acquire_ready()
+			 * no longer exists.  fuse_range_lock_acquire_locked()
 			 * ignores an overlapping INIT range (a read/write with
 			 * only a DLM request in flight), so waiting here is
 			 * bounded.  Blocking is also safe: we hold i_rwsem
@@ -2158,8 +2158,8 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			 * fuse_range_lock.h.
 			 */
 			if (range_locked)
-				fuse_range_lock_acquire_ready(fi, &rlock, 0, ~0ULL,
-							      FUSE_RANGE_LOCK_WRITE);
+				fuse_range_lock_acquire_locked(fi, &rlock, 0, ~0ULL,
+							       FUSE_RANGE_LOCK_WRITE);
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_cache_release_locks(fi);
 			spin_lock(&fi->lock);
@@ -2270,12 +2270,12 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 * Revoke and drop under the full-range IO range lock; see
 		 * the atomic-O_TRUNC branch above.  i_rwsem is held
 		 * exclusive here as well (setattr), so waiting out
-		 * in-progress READY IO cannot deadlock.  Only meaningful
+		 * in-progress LOCKED IO cannot deadlock.  Only meaningful
 		 * under DLM with the writeback cache; see fuse_range_lock.h.
 		 */
 		if (range_locked)
-			fuse_range_lock_acquire_ready(fi, &rlock, 0, ~0ULL,
-						      FUSE_RANGE_LOCK_WRITE);
+			fuse_range_lock_acquire_locked(fi, &rlock, 0, ~0ULL,
+						       FUSE_RANGE_LOCK_WRITE);
 		if (fc->dlm && fc->writeback_cache)
 			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK, -1);
 
