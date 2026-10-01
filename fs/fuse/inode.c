@@ -997,8 +997,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 *
 		 * 1. Coherency.  Drop the affected page-cache range so no
 		 *    local read returns a folio the remote modify has
-		 *    superseded.  fuse_range_lock_acquire_ready() blocks
-		 *    only on an overlapping range already in READY state --
+		 *    superseded.  fuse_range_lock_acquire_locked() blocks
+		 *    only on an overlapping range already in LOCKED state --
 		 *    i.e. one actually touching, or about to touch, the page
 		 *    cache -- and ignores one still in INIT state, i.e. a
 		 *    cached read/write that has only reserved the range
@@ -1035,9 +1035,9 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			lock_start = offset;
 			lock_end = len <= 0 ? ~0ULL : (uint64_t)offset + len - 1;
 
-			fuse_range_lock_acquire_ready(fi, &rlock, lock_start,
-						      lock_end,
-						      FUSE_RANGE_LOCK_WRITE);
+			fuse_range_lock_acquire_locked(fi, &rlock, lock_start,
+						       lock_end,
+						       FUSE_RANGE_LOCK_WRITE);
 		}
 
 		if (fc->dlm && fc->writeback_cache)
