@@ -345,10 +345,12 @@ static int fuse_open(struct inode *inode, struct file *file)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_file *ff;
+	struct fuse_range_lock rlock;
 	int err;
 	bool is_truncate = (file->f_flags & O_TRUNC) && fc->atomic_o_trunc;
 	bool is_wb_truncate = is_truncate && fc->writeback_cache;
 	bool dax_truncate = is_truncate && FUSE_IS_DAX(inode);
+	bool range_locked = is_wb_truncate && fc->dlm;
 
 	if (fuse_is_bad(inode))
 		return -EIO;
@@ -367,7 +369,10 @@ static int fuse_open(struct inode *inode, struct file *file)
 			goto out_inode_unlock;
 	}
 
-	if (is_wb_truncate || dax_truncate)
+	if (range_locked)
+		fuse_range_lock_acquire_init(fi, &rlock, 0, ~0ULL,
+					     FUSE_RANGE_LOCK_WRITE);
+	else if (is_wb_truncate || dax_truncate)
 		fuse_set_nowrite(inode);
 
 	err = fuse_do_open(fm, get_node_id(inode), file, false);
@@ -380,8 +385,11 @@ static int fuse_open(struct inode *inode, struct file *file)
 			fuse_truncate_update_attr(inode, file);
 	}
 
-	if (is_wb_truncate || dax_truncate)
+	if (range_locked)
+		fuse_range_lock_release(fi, &rlock);
+	else if (is_wb_truncate || dax_truncate)
 		fuse_release_nowrite(inode);
+
 	if (!err) {
 		if (is_truncate)
 			truncate_pagecache(inode, 0);
