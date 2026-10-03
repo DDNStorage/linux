@@ -688,7 +688,10 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
  *	covered, before this function's caller is even woken up, or
  *	directly to LOCKED when the range is already covered without a
  *	round trip -- see fuse_get_dlm_lock_complete() and the declaration
- *	in fuse_dlm_cache.h.
+ *	in fuse_dlm_cache.h. In the later case, the grant is re-validated
+ *  one LOCKED (fencing further revokes) before being trusted; if a
+ *  concurrent invalidate is found to have revoked it, @rlock is put
+ *  back in INIT and a fresh grant is requested below instead.
  *
  * Return: 0 when the range is covered by a recorded grant on return,
  * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
@@ -723,12 +726,22 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	 * of any races in lock requests.
 	 * The early exit uses the same helper the callers re-validate
 	 * with, so this check and a later fuse_dlm_lock_is_held() can
-	 * never disagree about what counts as covered. */
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
-		if (rlock)
-			fuse_range_lock_mark_locked(fi, rlock);
+	 * never disagree about what counts as covered.
+     *
+     * rlock is still INIT here, invisible to invalidation. Move
+     * it to LOCKED -- which blocks until any invalidate that is
+     * concurrently draining an overlapping range (one that got
+     * past its own conflict check while we were INIT) has fully
+     * revoked the grant and released -- then re-check: only once
+     * LOCKED, which fences any further revoke, can is_held() be
+     * trusted. If the grant was revoked, undo back to INIT (never
+     * blocks) and fall through to request a fresh grant below. */
+    if (rlock)
+        fuse_range_lock_mark_locked(fi, rlock);
+	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
 		return 0; /* we already have this area locked */
-	}
+    if (rlock)
+        fuse_range_lock_mark_init(fi, rlock);
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
