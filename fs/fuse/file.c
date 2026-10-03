@@ -1379,15 +1379,15 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * full INIT-to-LOCKED transition itself when no DLM request was
 	 * made above (no writeback cache or no dlm), and blocks only if a
 	 * NOTIFY invalidate is currently draining an overlapping range --
-	 * once granted it fences any *new*
-	 * overlapping invalidate until the range lock is released below.
-	 * An invalidate that instead ran to completion entirely while we
-	 * were still in INIT above (and so invisible to it) has already
-	 * dropped whatever page-cache range it revoked, so no re-validation
-	 * of the DLM grant requested above is needed here: either way, the
-	 * page cache this read is about to see is consistent.  A
-	 * revoked-but-unnoticed grant costs at most an extra cache-miss
-	 * round trip on this or the next read, never stale data.
+	 * once granted it fences any *new* overlapping invalidate until the
+	 * range lock is released below.  An invalidate that instead ran to
+	 * completion entirely while we were still in INIT above (and so
+	 * invisible to it) could otherwise have revoked a grant that
+	 * fuse_get_dlm_lock() above believed it already held, without this
+	 * call having anything left to block on; fuse_get_dlm_lock()
+	 * itself re-validates that case before returning, falling back to
+	 * requesting a fresh grant if the race happened, so by the time we
+	 * get here the page cache this read is about to see is consistent.
 	 */
 	if (range_locked) {
 		fuse_range_lock_mark_locked(fi, &rlock);
@@ -2204,8 +2204,10 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * time: fuse_get_dlm_lock() moves it to READY as part of
 		 * processing the reply (or directly to LOCKED right away, if
 		 * the range is already covered by the provisional grant
-		 * above -- see its fast path).  Nothing is left to
-		 * re-validate below.
+		 * above -- see its fast path, which re-validates the grant
+		 * itself once LOCKED before trusting it, falling back to a
+		 * fresh round trip if a concurrent invalidate revoked it).
+		 * Nothing more is left to re-validate below.
 		 */
 		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, &rlock);
 		if (err)
