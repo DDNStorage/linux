@@ -910,40 +910,6 @@ static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
 	fuse_dlm_unlock_range(fi, start, end);
 }
 
-/*
- * Drop a page-cache range on behalf of a NOTIFY invalidate.
- *
- * invalidate_inode_pages2_range() waits out folios under writeback and
- * launders dirty ones, both of which need a FUSE_WRITE reply.  While
- * writepages are frozen (fuse_set_nowrite(): truncate, O_TRUNC open, fsync,
- * pre-SETATTR flush) no reply can arrive, because fuse_flush_writepages()
- * parks the request on fi->queued_writes until fuse_release_nowrite().  A
- * server that revokes from inside the handler it is revoking for then
- * deadlocks against its own reply.  fuse_do_setattr() states the same rule
- * for its own invalidate.
- *
- * So while frozen use invalidate_mapping_pages(), which skips dirty and
- * under-writeback folios and never blocks.  The stale clean folios still
- * go, and the freezes that span a request drop the cache themselves once
- * they complete: fuse_do_setattr() invalidates the mapping after releasing
- * the freeze, the O_TRUNC open path calls truncate_pagecache().
- */
-static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
-					 pgoff_t end)
-{
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	bool frozen;
-
-	spin_lock(&fi->lock);
-	frozen = fi->writectr < 0;
-	spin_unlock(&fi->lock);
-
-	if (frozen)
-		invalidate_mapping_pages(inode->i_mapping, start, end);
-	else
-		invalidate_inode_pages2_range(inode->i_mapping, start, end);
-}
-
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len)
 {
@@ -1071,9 +1037,10 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * notified range.
 		 */
 		if (fuse_inode_force_dio(inode))
-			fuse_notify_invalidate_range(inode, 0, -1);
+			invalidate_inode_pages2_range(inode->i_mapping, 0, -1);
 		else
-			fuse_notify_invalidate_range(inode, pg_start, pg_end);
+			invalidate_inode_pages2_range(inode->i_mapping,
+						      pg_start, pg_end);
 
 		if (latched)
 			pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",

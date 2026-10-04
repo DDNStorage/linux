@@ -2257,10 +2257,6 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 	spin_unlock(&fi->lock);
 
-	/*
-	 * Only call invalidate_inode_pages2() after removing
-	 * FUSE_NOWRITE, otherwise fuse_launder_folio() would deadlock.
-	 */
 	if ((is_truncate || !is_wb) &&
 	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
 		struct fuse_range_lock rlock;
