@@ -10,7 +10,6 @@
 #include <linux/slab.h>
 #include <linux/interval_tree_generic.h>
 
-
 /* A range of pages with a lock */
 struct fuse_dlm_range {
 	/* Interval tree node */
@@ -43,8 +42,8 @@ static inline uint64_t fuse_dlm_range_last(struct fuse_dlm_range *range)
 }
 
 INTERVAL_TREE_DEFINE(struct fuse_dlm_range, rb, uint64_t, __subtree_end,
-		    		fuse_dlm_range_start, fuse_dlm_range_last, static,
-		    		fuse_page_it);
+		     fuse_dlm_range_start, fuse_dlm_range_last, static,
+		     fuse_page_it);
 
 /**
  * fuse_page_cache_init - Initialize a page cache lock manager
@@ -379,7 +378,7 @@ out:
  * Return: 0 on success, negative error code on failure
  */
 int fuse_dlm_unlock_range(struct fuse_inode *inode,
-						uint64_t start, uint64_t end)
+			  uint64_t start, uint64_t end)
 {
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range, *next;
@@ -622,7 +621,8 @@ bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
 }
 
 /* Context for a fuse_get_dlm_lock() request, embedding struct
- * fuse_args as required by the request API. */
+ * fuse_args as required by the request API.
+ */
 struct fuse_dlm_lock_args {
 	struct fuse_args args;
 	struct fuse_inode *fi;
@@ -727,28 +727,30 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	 * The early exit uses the same helper the callers re-validate
 	 * with, so this check and a later fuse_dlm_lock_is_held() can
 	 * never disagree about what counts as covered.
-     *
-     * rlock is still INIT here, invisible to invalidation. Move
-     * it to LOCKED -- which blocks until any invalidate that is
-     * concurrently draining an overlapping range (one that got
-     * past its own conflict check while we were INIT) has fully
-     * revoked the grant and released -- then re-check: only once
-     * LOCKED, which fences any further revoke, can is_held() be
-     * trusted. If the grant was revoked, undo back to INIT (never
-     * blocks) and fall through to request a fresh grant below. */
-    if (rlock)
-        fuse_range_lock_mark_locked(fi, rlock);
+	 *
+	 * rlock is still INIT here, invisible to invalidation. Move
+	 * it to LOCKED -- which blocks until any invalidate that is
+	 * concurrently draining an overlapping range (one that got
+	 * past its own conflict check while we were INIT) has fully
+	 * revoked the grant and released -- then re-check: only once
+	 * LOCKED, which fences any further revoke, can is_held() be
+	 * trusted. If the grant was revoked, undo back to INIT (never
+	 * blocks) and continue to request a fresh grant below.
+	 */
+	if (rlock)
+		fuse_range_lock_mark_locked(fi, rlock);
 	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
 		return 0; /* we already have this area locked */
-    if (rlock)
-        fuse_range_lock_mark_init(fi, rlock);
+	if (rlock)
+		fuse_range_lock_mark_init(fi, rlock);
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
 
 	/* note that the offset and length don't have to be page aligned
 	 * here but since we only get here on writeback caching we will
-	 * send out page aligned requests */
+	 * send out page aligned requests
+	 */
 	inarg.start = offset & PAGE_MASK;
 	inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
 	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
@@ -821,8 +823,8 @@ static inline uint64_t fuse_range_lock_last(struct fuse_range_lock *lock)
 }
 
 INTERVAL_TREE_DEFINE(struct fuse_range_lock, rb, uint64_t, __subtree_end,
-		   fuse_range_lock_start, fuse_range_lock_last, static,
-		   fuse_range_it);
+		     fuse_range_lock_start, fuse_range_lock_last, static,
+		     fuse_range_it);
 
 /**
  * fuse_range_lock_tree_init - Initialize the range lock manager
@@ -855,8 +857,8 @@ void fuse_range_lock_tree_init(struct fuse_inode *inode)
  * Return: true if @lock's range conflicts with an existing held range.
  */
 static bool fuse_range_conflicts(struct fuse_range_lock_tree *tree,
-				struct fuse_range_lock *lock,
-				bool locked_only)
+				 struct fuse_range_lock *lock,
+				 bool locked_only)
 {
 	struct fuse_range_lock *cur;
 
@@ -886,7 +888,7 @@ static bool fuse_range_conflicts(struct fuse_range_lock_tree *tree,
  * Return: true if @lock was inserted, false if the caller must wait.
  */
 static bool fuse_range_try_lock_init(struct fuse_range_lock_tree *tree,
-				    struct fuse_range_lock *lock)
+				     struct fuse_range_lock *lock)
 {
 	bool conflict;
 
@@ -916,7 +918,7 @@ static bool fuse_range_try_lock_init(struct fuse_range_lock_tree *tree,
  * Return: true if @lock was inserted, false if the caller must wait.
  */
 static bool fuse_range_try_lock_locked(struct fuse_range_lock_tree *tree,
-				      struct fuse_range_lock *lock)
+				       struct fuse_range_lock *lock)
 {
 	bool conflict;
 
@@ -942,7 +944,7 @@ static bool fuse_range_try_lock_locked(struct fuse_range_lock_tree *tree,
  * a conflicting READY or LOCKED range to be released.
  */
 static bool fuse_range_try_mark_locked(struct fuse_range_lock_tree *tree,
-				      struct fuse_range_lock *lock)
+				       struct fuse_range_lock *lock)
 {
 	bool conflict;
 
@@ -970,9 +972,9 @@ static bool fuse_range_try_mark_locked(struct fuse_range_lock_tree *tree,
  * The range is rounded out to whole pages; see fuse_dlm_cache.h.
  */
 void fuse_range_lock_acquire_init(struct fuse_inode *inode,
-				 struct fuse_range_lock *lock,
-				 uint64_t start, uint64_t end,
-				 enum fuse_range_lock_mode mode)
+				  struct fuse_range_lock *lock,
+				  uint64_t start, uint64_t end,
+				  enum fuse_range_lock_mode mode)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
@@ -994,7 +996,7 @@ void fuse_range_lock_acquire_init(struct fuse_inode *inode,
  * nothing for this call to wait for and no waiter to wake.
  */
 void fuse_range_lock_mark_ready(struct fuse_inode *inode,
-			       struct fuse_range_lock *lock)
+				struct fuse_range_lock *lock)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
@@ -1014,7 +1016,7 @@ void fuse_range_lock_mark_ready(struct fuse_inode *inode,
  * conflicts with @lock.
  */
 void fuse_range_lock_mark_locked(struct fuse_inode *inode,
-				struct fuse_range_lock *lock)
+				 struct fuse_range_lock *lock)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
@@ -1031,7 +1033,7 @@ void fuse_range_lock_mark_locked(struct fuse_inode *inode,
  * @lock's (until now READY or LOCKED) range and can now proceed around it.
  */
 void fuse_range_lock_mark_init(struct fuse_inode *inode,
-			      struct fuse_range_lock *lock)
+			       struct fuse_range_lock *lock)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
@@ -1056,9 +1058,9 @@ void fuse_range_lock_mark_init(struct fuse_inode *inode,
  * The range is rounded out to whole pages; see fuse_dlm_cache.h.
  */
 void fuse_range_lock_acquire_locked(struct fuse_inode *inode,
-				   struct fuse_range_lock *lock,
-				   uint64_t start, uint64_t end,
-				   enum fuse_range_lock_mode mode)
+				    struct fuse_range_lock *lock,
+				    uint64_t start, uint64_t end,
+				    enum fuse_range_lock_mode mode)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
@@ -1076,7 +1078,7 @@ void fuse_range_lock_acquire_locked(struct fuse_inode *inode,
  *	fuse_range_lock_acquire_init() or fuse_range_lock_acquire_locked()
  */
 void fuse_range_lock_release(struct fuse_inode *inode,
-			    struct fuse_range_lock *lock)
+			     struct fuse_range_lock *lock)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
