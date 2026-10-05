@@ -3180,7 +3180,7 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	struct inode *inode = file_inode(file);
 	struct fuse_mount *fm = get_fuse_mount(inode);
 
-	if (fm->fc->dlm) {
+	if (!fm->fc->writeback_cache && fm->fc->dlm) {
 		loff_t pos = vmf->pgoff << PAGE_SHIFT;
 		size_t length = PAGE_SIZE;
 		int err = fuse_get_page_mkwrite_lock(file, pos, length);
@@ -3200,9 +3200,49 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	return VM_FAULT_LOCKED;
 }
 
+static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
+{
+	struct file *file = vmf->vma->vm_file;
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
+	if (fc->writeback_cache && fc->dlm) {
+		struct fuse_inode *fi = get_fuse_inode(inode);
+		struct fuse_range_lock rlock;
+		loff_t pos = vmf->pgoff << PAGE_SHIFT;
+		enum fuse_page_lock_mode mode = FUSE_PAGE_LOCK_READ;
+		enum fuse_range_lock_mode range_mode = FUSE_RANGE_LOCK_READ;
+		vm_fault_t ret;
+		int err;
+
+		if ((vmf->vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) ==
+		    (VM_SHARED | VM_MAYWRITE)) {
+			mode = FUSE_PAGE_LOCK_WRITE;
+			range_mode = FUSE_RANGE_LOCK_WRITE;
+		}
+
+		fuse_range_lock_acquire_init(fi, &rlock, pos,
+					     pos + PAGE_SIZE - 1,
+					     range_mode);
+		err = fuse_get_dlm_lock(file, pos, PAGE_SIZE, mode, &rlock);
+		if (err < 0 && err != -ENOSYS) {
+			fuse_range_lock_release(fi, &rlock);
+			return vmf_error(err);
+		}
+
+		fuse_range_lock_mark_locked(fi, &rlock);
+
+		ret = filemap_fault(vmf);
+		fuse_range_lock_release(fi, &rlock);
+		return ret;
+	}
+
+	return filemap_fault(vmf);
+}
+
 static const struct vm_operations_struct fuse_file_vm_ops = {
 	.close		= fuse_vma_close,
-	.fault		= filemap_fault,
+	.fault		= fuse_filemap_fault,
 	.map_pages	= filemap_map_pages,
 	.page_mkwrite	= fuse_page_mkwrite,
 };
