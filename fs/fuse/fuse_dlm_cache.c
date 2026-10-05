@@ -1007,6 +1007,37 @@ int fuse_range_lock_acquire_init(struct fuse_inode *inode,
 }
 
 /**
+ * fuse_range_lock_try_acquire_init - Try to reserve a byte range lock in
+ * INIT state without blocking
+ * @inode: The fuse inode
+ * @lock: Caller-allocated storage for the lock (e.g. on the stack)
+ * @start: Start byte offset (inclusive)
+ * @end: End byte offset (inclusive)
+ * @mode: FUSE_RANGE_LOCK_READ or FUSE_RANGE_LOCK_WRITE
+ *
+ * Same semantics as fuse_range_lock_acquire_init() but never waits, for
+ * callers that must not block, e.g. the fault path under mmap_lock.
+ *
+ * Return: true with the range reserved, false if a conflicting range is
+ * currently held -- the lock was not inserted then and must not be
+ * passed to fuse_range_lock_release().
+ */
+bool fuse_range_lock_try_acquire_init(struct fuse_inode *inode,
+				      struct fuse_range_lock *lock,
+				      uint64_t start, uint64_t end,
+				      enum fuse_range_lock_mode mode)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	lock->start = round_down(start, PAGE_SIZE);
+	lock->end = end | (PAGE_SIZE - 1);
+	lock->mode = mode;
+	lock->owner = current;
+
+	return fuse_range_try_lock_init(tree, lock);
+}
+
+/**
  * fuse_range_lock_mark_ready - Move a reserved range lock to READY state
  * @inode: The fuse inode
  * @lock: The range lock previously passed to fuse_range_lock_acquire_init()
@@ -1049,6 +1080,26 @@ int fuse_range_lock_mark_locked(struct fuse_inode *inode,
 
 	return wait_event_killable(tree->waitq,
 				   fuse_range_try_mark_locked(tree, lock));
+}
+
+/**
+ * fuse_range_lock_try_mark_locked - Try to move an already-held range
+ * lock to LOCKED state without blocking
+ * @inode: The fuse inode
+ * @lock: The range lock previously reserved in INIT (or moved to READY)
+ *
+ * Same semantics as fuse_range_lock_mark_locked() but never waits.
+ *
+ * Return: true if @lock is now LOCKED, false if a conflicting READY or
+ * LOCKED range is held -- @lock then keeps its previous state and is
+ * still held, so the caller must still release it.
+ */
+bool fuse_range_lock_try_mark_locked(struct fuse_inode *inode,
+				     struct fuse_range_lock *lock)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	return fuse_range_try_mark_locked(tree, lock);
 }
 
 /**

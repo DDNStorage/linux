@@ -20,6 +20,7 @@
 #include <linux/uio.h>
 #include <linux/fs.h>
 #include <linux/filelock.h>
+#include <linux/file.h>
 #include <linux/splice.h>
 
 int sb_init_dio_done_wq(struct super_block *sb);
@@ -3362,6 +3363,76 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 			range_mode = FUSE_RANGE_LOCK_WRITE;
 		}
 
+		/*
+		 * Fast path: range lock uncontended and the grant already
+		 * recorded.  Nothing here blocks, so it is safe under
+		 * mmap_lock (or the per-VMA lock).  LOCKED first, then
+		 * is_held(): only once LOCKED, which fences any concurrent
+		 * revoke, can the recorded grant be trusted -- same order
+		 * as fuse_get_dlm_lock()'s own fast path.
+		 */
+		if (fuse_range_lock_try_acquire_init(fi, &rlock, pos,
+						     pos + PAGE_SIZE - 1,
+						     range_mode)) {
+			if (fuse_range_lock_try_mark_locked(fi, &rlock) &&
+			    fuse_dlm_lock_is_held(fi, pos, PAGE_SIZE, mode)) {
+				ret = filemap_fault(vmf);
+				fuse_range_lock_release(fi, &rlock);
+				return ret;
+			}
+			fuse_range_lock_release(fi, &rlock);
+		}
+
+		/*
+		 * Slow path: the range lock or the grant needs waiting --
+		 * a range conflict, an invalidation draining the range, or
+		 * a DLM round trip to the server.  Blocking here while
+		 * holding mmap_lock recreates the ABBA the read/write
+		 * paths set up the other way around: they hold the range
+		 * lock while faulting in their user buffers, which takes
+		 * mmap_lock.  Drop the fault lock first, do the blocking
+		 * work with only a file reference pinning the inode, then
+		 * ask for the fault to be retried; the retry takes the
+		 * fast path above off the now-recorded grant.  The range
+		 * lock is not held across the retry (there would be
+		 * nowhere to release it), so the retried fault can still
+		 * miss and come back here; each pass leaves a recorded
+		 * grant behind, which only a real invalidation takes away
+		 * again.
+		 */
+		if ((vmf->flags & FAULT_FLAG_ALLOW_RETRY) &&
+		    !(vmf->flags & FAULT_FLAG_TRIED)) {
+			if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
+				return VM_FAULT_RETRY;
+
+			file = get_file(file);
+			release_fault_lock(vmf);
+
+			err = fuse_range_lock_acquire_init(fi, &rlock, pos,
+							   pos + PAGE_SIZE - 1,
+							   range_mode);
+			if (!err) {
+				/*
+				 * A hard error is not failed here: the
+				 * retried fault ends up on the blocking
+				 * path below, which turns a persistent
+				 * error into SIGBUS.
+				 */
+				fuse_get_dlm_lock(file, pos, PAGE_SIZE,
+						  mode, &rlock);
+				fuse_range_lock_release(fi, &rlock);
+			}
+			fput(file);
+			return VM_FAULT_RETRY;
+		}
+
+		/*
+		 * Retries exhausted or not allowed: block in place.  The
+		 * waits are killable, and a same-task fault-in never
+		 * conflicts with its own IO's range lock, so this cannot
+		 * deadlock on itself; it can still stack behind a pending
+		 * mmap_lock writer the way any blocking fault can.
+		 */
 		err = fuse_range_lock_acquire_init(fi, &rlock, pos,
 						   pos + PAGE_SIZE - 1,
 						   range_mode);
