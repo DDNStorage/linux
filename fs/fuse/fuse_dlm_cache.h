@@ -149,10 +149,14 @@ void fuse_range_lock_tree_init(struct fuse_inode *inode);
  * to fuse_range_lock_acquire_locked() until fuse_range_lock_mark_ready()
  * or fuse_range_lock_mark_locked() is called.
  *
+ * The wait is killable: returns 0 with the range reserved, or
+ * -ERESTARTSYS on a fatal signal, in which case the lock was never
+ * inserted and must not be released.
+ *
  * Caller must only call this when both the writeback cache and DLM are
  * in use for @inode's connection; see the range lock comment above.
  */
-void fuse_range_lock_acquire_init(struct fuse_inode *inode,
+int fuse_range_lock_acquire_init(struct fuse_inode *inode,
 				 struct fuse_range_lock *lock,
 				 uint64_t start, uint64_t end,
 				 enum fuse_range_lock_mode mode);
@@ -174,10 +178,14 @@ void fuse_range_lock_mark_ready(struct fuse_inode *inode,
  * overlapping READY or LOCKED holder conflicts (e.g. an invalidation that
  * raced ahead while this range was still INIT).
  *
+ * The wait is killable: returns 0 once LOCKED, or -ERESTARTSYS on a
+ * fatal signal, in which case the lock keeps its previous state (INIT
+ * or READY) and is still held -- the caller must still release it.
+ *
  * Caller must only call this when both the writeback cache and DLM are
  * in use for @inode's connection; see the range lock comment above.
  */
-void fuse_range_lock_mark_locked(struct fuse_inode *inode,
+int fuse_range_lock_mark_locked(struct fuse_inode *inode,
 				struct fuse_range_lock *lock);
 
 /*

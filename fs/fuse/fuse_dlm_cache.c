@@ -737,8 +737,11 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	 * trusted. If the grant was revoked, undo back to INIT (never
 	 * blocks) and continue to request a fresh grant below.
 	 */
-	if (rlock)
-		fuse_range_lock_mark_locked(fi, rlock);
+	if (rlock) {
+		err = fuse_range_lock_mark_locked(fi, rlock);
+		if (err)
+			return err;
+	}
 	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
 		return 0; /* we already have this area locked */
 	if (rlock)
@@ -978,11 +981,19 @@ static bool fuse_range_try_mark_locked(struct fuse_range_lock_tree *tree,
  * Blocks until [start, end] can be reserved in the requested mode
  * without conflicting with any other currently held, overlapping range.
  * The range is rounded out to whole pages; see fuse_dlm_cache.h.
+ *
+ * Killable, so a wait that has gone wrong (a lost conflicting holder)
+ * leaves a D-state task SIGKILL can still reach rather than one only a
+ * reboot clears.
+ *
+ * Return: 0 with the range reserved, or -ERESTARTSYS if a fatal signal
+ * arrived first -- the lock was never inserted then and must not be
+ * passed to fuse_range_lock_release().
  */
-void fuse_range_lock_acquire_init(struct fuse_inode *inode,
-				  struct fuse_range_lock *lock,
-				  uint64_t start, uint64_t end,
-				  enum fuse_range_lock_mode mode)
+int fuse_range_lock_acquire_init(struct fuse_inode *inode,
+				 struct fuse_range_lock *lock,
+				 uint64_t start, uint64_t end,
+				 enum fuse_range_lock_mode mode)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
@@ -991,7 +1002,8 @@ void fuse_range_lock_acquire_init(struct fuse_inode *inode,
 	lock->mode = mode;
 	lock->owner = current;
 
-	wait_event(tree->waitq, fuse_range_try_lock_init(tree, lock));
+	return wait_event_killable(tree->waitq,
+				   fuse_range_try_lock_init(tree, lock));
 }
 
 /**
@@ -1023,13 +1035,20 @@ void fuse_range_lock_mark_ready(struct fuse_inode *inode,
  *
  * Blocks until no other currently held, overlapping READY or LOCKED range
  * conflicts with @lock.
+ *
+ * Killable, like fuse_range_lock_acquire_init().
+ *
+ * Return: 0 once LOCKED, or -ERESTARTSYS if a fatal signal arrived
+ * first -- @lock then keeps its previous state (INIT or READY) and is
+ * still held, so the caller must still release it.
  */
-void fuse_range_lock_mark_locked(struct fuse_inode *inode,
-				 struct fuse_range_lock *lock)
+int fuse_range_lock_mark_locked(struct fuse_inode *inode,
+				struct fuse_range_lock *lock)
 {
 	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
 
-	wait_event(tree->waitq, fuse_range_try_mark_locked(tree, lock));
+	return wait_event_killable(tree->waitq,
+				   fuse_range_try_mark_locked(tree, lock));
 }
 
 /**
