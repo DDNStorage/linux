@@ -162,6 +162,17 @@ int fuse_range_lock_acquire_init(struct fuse_inode *inode,
 				 enum fuse_range_lock_mode mode);
 
 /*
+ * Non-blocking variant of fuse_range_lock_acquire_init(), for callers
+ * that must not sleep on the range lock (the fault path under
+ * mmap_lock).  Returns true with the range reserved, or false without
+ * inserting the lock (it must not be released then).
+ */
+bool fuse_range_lock_try_acquire_init(struct fuse_inode *inode,
+				      struct fuse_range_lock *lock,
+				      uint64_t start, uint64_t end,
+				      enum fuse_range_lock_mode mode);
+
+/*
  * Move a range lock reserved by fuse_range_lock_acquire_init() from
  * INIT to READY state. Never blocks.
  *
@@ -187,6 +198,14 @@ void fuse_range_lock_mark_ready(struct fuse_inode *inode,
  */
 int fuse_range_lock_mark_locked(struct fuse_inode *inode,
 				struct fuse_range_lock *lock);
+
+/*
+ * Non-blocking variant of fuse_range_lock_mark_locked().  Returns true
+ * once LOCKED, or false with the lock keeping its previous state (still
+ * held, so the caller must still release it).
+ */
+bool fuse_range_lock_try_mark_locked(struct fuse_inode *inode,
+				     struct fuse_range_lock *lock);
 
 /*
  * Move a range lock back from READY or LOCKED to INIT state, e.g. because
