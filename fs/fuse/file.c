@@ -380,11 +380,17 @@ static int fuse_open(struct inode *inode, struct file *file)
 			goto out_inode_unlock;
 	}
 
-	if (range_locked)
-		fuse_range_lock_acquire_init(fi, &rlock, 0, ~0ULL,
-					     FUSE_RANGE_LOCK_WRITE);
-	else if (is_wb_truncate || dax_truncate)
+	if (range_locked) {
+		err = fuse_range_lock_acquire_init(fi, &rlock, 0, ~0ULL,
+						   FUSE_RANGE_LOCK_WRITE);
+		if (err) {
+			if (dax_truncate)
+				filemap_invalidate_unlock(inode->i_mapping);
+			goto out_inode_unlock;
+		}
+	} else if (is_wb_truncate || dax_truncate) {
 		fuse_set_nowrite(inode);
+	}
 
 	err = fuse_do_open(fm, get_node_id(inode), file, false);
 	if (!err) {
@@ -1355,10 +1361,13 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * writeback cache there is no DLM-covered write to race against.
 	 */
 	if (fc->writeback_cache && fc->dlm && count) {
+		int err = fuse_range_lock_acquire_init(fi, &rlock,
+						       iocb->ki_pos,
+						       iocb->ki_pos + count - 1,
+						       FUSE_RANGE_LOCK_READ);
+		if (err)
+			return err;
 		range_locked = true;
-		fuse_range_lock_acquire_init(fi, &rlock, iocb->ki_pos,
-					     iocb->ki_pos + count - 1,
-					     FUSE_RANGE_LOCK_READ);
 	}
 
 	/*
@@ -1390,7 +1399,12 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * get here the page cache this read is about to see is consistent.
 	 */
 	if (range_locked) {
-		fuse_range_lock_mark_locked(fi, &rlock);
+		int err = fuse_range_lock_mark_locked(fi, &rlock);
+
+		if (err) {
+			fuse_range_lock_release(fi, &rlock);
+			return err;
+		}
 
 		if (fuse_inode_force_dio(inode)) {
 			fuse_range_lock_release(fi, &rlock);
@@ -2077,10 +2091,14 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		dlm_pos = iocb->ki_pos;
 		dlm_len = iov_iter_count(from);
 
+		err = fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
+						   dlm_pos + dlm_len - 1,
+						   FUSE_RANGE_LOCK_WRITE);
+		if (err) {
+			fuse_cache_wr_unlock(inode, exclusive);
+			return err;
+		}
 		range_locked = true;
-		fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
-					     dlm_pos + dlm_len - 1,
-					     FUSE_RANGE_LOCK_WRITE);
 
 		/*
 		 * Pass the provisional range lock through, not NULL:
@@ -2126,10 +2144,12 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		dlm_pos = i_size_read(inode);
 		dlm_len = iov_iter_count(from);
 
+		err = fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
+						   dlm_pos + dlm_len - 1,
+						   FUSE_RANGE_LOCK_WRITE);
+		if (err)
+			goto out;
 		range_locked = true;
-		fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
-					     dlm_pos + dlm_len - 1,
-					     FUSE_RANGE_LOCK_WRITE);
 
 		/* Provisional range lock passed through, not NULL: see the
 		 * comment above the first redfs_cache_wr_dlm_lock() call. */
@@ -2153,11 +2173,15 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	    iocb->ki_pos != dlm_pos) {
 
 		fuse_range_lock_release(fi, &rlock);
+		range_locked = false;
 		dlm_pos = iocb->ki_pos;
 		dlm_len = count;
-		fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
-					     dlm_pos + dlm_len - 1,
-					     FUSE_RANGE_LOCK_WRITE);
+		err = fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
+						   dlm_pos + dlm_len - 1,
+						   FUSE_RANGE_LOCK_WRITE);
+		if (err)
+			goto out;
+		range_locked = true;
 
 		/* Provisional range lock passed through, not NULL: see the
 		 * comment above the first redfs_cache_wr_dlm_lock() call. */
@@ -2213,10 +2237,12 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		dlm_pos = iocb->ki_pos;
 		dlm_len = count;
 
+		err = fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
+						   dlm_pos + dlm_len - 1,
+						   FUSE_RANGE_LOCK_WRITE);
+		if (err)
+			goto out;
 		range_locked = true;
-		fuse_range_lock_acquire_init(fi, &rlock, dlm_pos,
-					     dlm_pos + dlm_len - 1,
-					     FUSE_RANGE_LOCK_WRITE);
 
 		/*
 		 * Request the DLM write lock for the exact range this write
@@ -2247,8 +2273,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	 * fuse_cache_read_iter() on an overlapping range, and against
 	 * another shared-locked writer on an overlapping range.
 	 */
-	if (range_locked)
-		fuse_range_lock_mark_locked(fi, &rlock);
+	if (range_locked) {
+		err = fuse_range_lock_mark_locked(fi, &rlock);
+		if (err)
+			goto out;
+	}
 
 	if (fuse_inode_force_dio(inode)) {
 		if (range_locked)
@@ -3339,16 +3368,22 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 			range_mode = FUSE_RANGE_LOCK_WRITE;
 		}
 
-		fuse_range_lock_acquire_init(fi, &rlock, pos,
-					     pos + PAGE_SIZE - 1,
-					     range_mode);
+		err = fuse_range_lock_acquire_init(fi, &rlock, pos,
+						   pos + PAGE_SIZE - 1,
+						   range_mode);
+		if (err)
+			return vmf_error(err);
 		err = fuse_get_dlm_lock(file, pos, PAGE_SIZE, mode, &rlock);
 		if (err < 0 && err != -ENOSYS) {
 			fuse_range_lock_release(fi, &rlock);
 			return vmf_error(err);
 		}
 
-		fuse_range_lock_mark_locked(fi, &rlock);
+		err = fuse_range_lock_mark_locked(fi, &rlock);
+		if (err) {
+			fuse_range_lock_release(fi, &rlock);
+			return vmf_error(err);
+		}
 
 		ret = filemap_fault(vmf);
 		fuse_range_lock_release(fi, &rlock);
