@@ -850,6 +850,14 @@ void fuse_range_lock_tree_init(struct fuse_inode *inode)
  * is not considered, but a range already in READY or LOCKED state is --
  * see fuse_range_lock_acquire_locked().
  *
+ * A range held by @lock's own task never conflicts: the only way that
+ * happens is the task faulting in its own user buffer mid-IO, where
+ * fuse_filemap_fault() takes a range lock on the faulting page while
+ * the read/write path already holds one covering it.  Waiting here
+ * would then deadlock on ourselves, and skipping is safe -- the outer
+ * hold already gives invalidation an overlapping range to conflict
+ * with for as long as both are held.
+ *
  * Caller holds @tree->lock.
  *
  * Return: true if @lock's range conflicts with an existing held range.
@@ -862,7 +870,7 @@ static bool fuse_range_conflicts(struct fuse_range_lock_tree *tree,
 
 	cur = fuse_range_it_iter_first(&tree->root, lock->start, lock->end);
 	while (cur) {
-		if (cur != lock &&
+		if (cur != lock && cur->owner != lock->owner &&
 		    (!locked_only || cur->state != FUSE_RANGE_LOCK_INIT) &&
 		    (lock->mode == FUSE_RANGE_LOCK_WRITE ||
 		     cur->mode == FUSE_RANGE_LOCK_WRITE))
@@ -979,6 +987,7 @@ void fuse_range_lock_acquire_init(struct fuse_inode *inode,
 	lock->start = round_down(start, PAGE_SIZE);
 	lock->end = end | (PAGE_SIZE - 1);
 	lock->mode = mode;
+	lock->owner = current;
 
 	wait_event(tree->waitq, fuse_range_try_lock_init(tree, lock));
 }
@@ -1065,6 +1074,7 @@ void fuse_range_lock_acquire_locked(struct fuse_inode *inode,
 	lock->start = round_down(start, PAGE_SIZE);
 	lock->end = end | (PAGE_SIZE - 1);
 	lock->mode = mode;
+	lock->owner = current;
 
 	wait_event(tree->waitq, fuse_range_try_lock_locked(tree, lock));
 }

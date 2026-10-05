@@ -127,6 +127,15 @@ struct fuse_range_lock {
 	enum fuse_range_lock_mode mode;
 	/* Lifecycle state; see the range lock comment above */
 	enum fuse_range_lock_state state;
+	/*
+	 * Task that acquired the range.  Ranges held by the same task never
+	 * conflict with each other: the only way a task acquires a range
+	 * overlapping its own is re-entering through the page fault path
+	 * while faulting in its own user buffer mid-IO (see
+	 * fuse_filemap_fault()), and the outer hold already fences
+	 * invalidation over the overlap for as long as both are held.
+	 */
+	struct task_struct *owner;
 };
 
 /* Initialize the range lock manager embedded in a fuse_inode */
