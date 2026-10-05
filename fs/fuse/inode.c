@@ -497,10 +497,17 @@ u32 fuse_get_cache_mask(struct inode *inode)
  * and older if we still have unwritten data there.  Keep the cached values
  * for exactly what the grant covers:
  *
- *  - size, when the server reports less than i_size and the tail it does not
- *    know about, [srv_size, i_size), is entirely under a write grant.  Taking
- *    the server's answer would shrink i_size and have truncate_pagecache()
- *    throw the unwritten tail away.
+ *  - size, when the server reports less than i_size and the last page of the
+ *    file is under a write grant.  The server reports less for one of two
+ *    reasons: our extension is still unwritten, or a remote truncate cut the
+ *    file.  A remote truncate revokes every grant above its new size before
+ *    it proceeds, so a write grant still covering the page holding i_size - 1
+ *    rules it out and leaves the extension as the only explanation.  Taking
+ *    the server's answer then would shrink i_size and have
+ *    truncate_pagecache() throw the unwritten tail away.  The bytes between
+ *    the server's size and the extension need no grant of their own: a
+ *    write past EOF leaves them a hole, and another node reading or writing
+ *    the hole revokes nothing the extension rests on.
  *  - mtime and ctime, while a write grant covers unwritten data: our writes
  *    have stamped them locally and the server's stamps predate them.  Only
  *    while the cache is actually dirty, not for as long as the grant lives:
@@ -510,20 +517,24 @@ u32 fuse_get_cache_mask(struct inode *inode)
  *
  * A remote truncate cannot slip through.  It has to revoke the grant first,
  * and the revoke launders the tail and drops the grant, so by the time the
- * smaller size is reported neither check holds and the server's answer is
- * applied as usual.  A grant the server made but that could not be recorded
- * (FUSE_DLM_GRANT_UNRECORDED) is invisible to the lock tree and falls back to
- * trusting the server, as before.
+ * smaller size is reported the last page is uncovered and the server's
+ * answer is applied as usual.  A grant the server made but that could not be
+ * recorded (FUSE_DLM_GRANT_UNRECORDED) is invisible to the lock tree and
+ * falls back to trusting the server, as before.
  *
- * Must be called without fi->lock: the lock tree query sleeps.
+ * Must be called without fi->lock: the lock tree query sleeps.  @size_seen
+ * returns the i_size the decision was made on, for the caller to notice an
+ * extension claimed in the meantime under fi->lock.
  */
 static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
-				bool have_size)
+				bool have_size, loff_t *size_seen)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	u32 cache_mask = fuse_get_cache_mask(inode);
 	loff_t size = i_size_read(inode);
+
+	*size_seen = size;
 
 	if (cache_mask || !fc->dlm || !fc->writeback_cache ||
 	    !S_ISREG(inode->i_mode))
@@ -537,8 +548,7 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 		cache_mask |= STATX_MTIME | STATX_CTIME;
 
 	if (have_size && size > (loff_t) attr->size &&
-	    fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
-				  FUSE_PAGE_LOCK_WRITE))
+	    fuse_dlm_lock_is_held(fi, size - 1, 1, FUSE_PAGE_LOCK_WRITE))
 		cache_mask |= STATX_SIZE;
 
 	return cache_mask;
@@ -579,14 +589,24 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	u32 cache_mask;
 	loff_t oldsize;
 	struct timespec64 old_mtime;
+	loff_t size_seen;
 	bool have_size = !sx || (sx->mask & STATX_SIZE);
 	bool have_mtime = !sx || (sx->mask & STATX_MTIME);
 	bool have_ctime = !sx || (sx->mask & STATX_CTIME);
 
-	cache_mask = fuse_attr_cache_mask(inode, attr, have_size);
+	cache_mask = fuse_attr_cache_mask(inode, attr, have_size, &size_seen);
 
 	spin_lock(&fi->lock);
-
+	/*
+	 * The size decision was made on a snapshot of i_size taken outside
+	 * fi->lock.  A write claiming an extension since holds a grant the
+	 * snapshot did not see, and the server's answer predates that claim,
+	 * so it cannot shrink i_size past it: keep the cached size and let
+	 * the next reply decide against the new i_size.
+	 */
+	if (have_size && !(cache_mask & STATX_SIZE) &&
+	    inode->i_size != size_seen)
+		cache_mask |= STATX_SIZE;
 	if (cache_mask & STATX_SIZE)
 		attr->size = i_size_read(inode);
 
