@@ -1973,7 +1973,17 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	loff_t dlm_pos = 0;
 	size_t dlm_len = 0;
 
-	if (fuse_inode_force_dio(inode))
+	/*
+	 * An O_DIRECT write (e.g. set with F_SETFL) on a cached inode under
+	 * DLM goes out as a WRITE without FUSE_WRITE_CACHE, for which the
+	 * server takes the DLM lock itself.  Holding our own grant and a
+	 * LOCKED range lock across it would deadlock: the server revokes
+	 * the grant, and the NOTIFY_INVAL_INODE that follows waits on the
+	 * range lock until the WRITE returns.  Send it as a plain direct
+	 * write instead, which takes neither.
+	 */
+	if (fuse_inode_force_dio(inode) ||
+	    ((iocb->ki_flags & IOCB_DIRECT) && fc->writeback_cache && fc->dlm))
 		return fuse_direct_write_iter(iocb, from);
 
 	if (fc->writeback_cache) {
@@ -2627,6 +2637,7 @@ static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	struct fuse_file *ff = iocb->ki_filp->private_data;
 	struct address_space *mapping = inode->i_mapping;
 	loff_t pos;
 	bool exclusive = false;
@@ -2635,6 +2646,20 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	fuse_dio_lock(iocb, from, &exclusive, &uncached);
 	res = generic_write_checks(iocb, from);
+
+	/*
+	 * O_DIRECT on a cached open: write back dirty folios in the range
+	 * under the inode lock, as generic_file_direct_write() does, so the
+	 * invalidation after the write does not launder stale data over it.
+	 * fuse_direct_io() already does this for FOPEN_DIRECT_IO.
+	 */
+	if (res > 0 && !(ff->open_flags & FOPEN_DIRECT_IO) && mapping->nrpages) {
+		int err = filemap_write_and_wait_range(mapping, iocb->ki_pos,
+						       iocb->ki_pos + res - 1);
+		if (err)
+			res = err;
+	}
+
 	if (res > 0) {
 		/* O_APPEND: generic_write_checks() moved ki_pos to EOF */
 		pos = iocb->ki_pos;
