@@ -1901,10 +1901,9 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
  * the caller must fail the write instead.  A granted-but-unrecorded
  * lock (positive return) is covered cluster-wide; proceed regardless.
  *
- * @rlock: passed straight through to fuse_get_dlm_lock(); NULL unless
- * @rlock is the range lock the caller will actually touch the page
- * cache under, since that is what "reply processing marks it LOCKED"
- * is meant to cover.
+ * @rlock: passed straight through to fuse_get_dlm_lock(), which may
+ * leave it READY or LOCKED; the caller must not wait for the server
+ * while holding it in either state.
  */
 static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
 				  struct fuse_range_lock *rlock)
@@ -2074,13 +2073,19 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					     FUSE_RANGE_LOCK_WRITE);
 
 		/*
-		 * NULL rlock: this provisional range is released and
-		 * re-acquired narrower, in INIT state, once the exact write
-		 * range is known below, so it is not the range lock this
-		 * write actually touches the page cache under -- that one
-		 * is requested, and marked LOCKED, further down.
+		 * Pass the provisional range lock through, not NULL:
+		 * redfs_get_dlm_lock() trusts an already-held grant only
+		 * once the range lock is LOCKED, which fences a concurrent
+		 * revoke, and for a request that reaches the server, reply
+		 * processing marks it READY before an invalidate queued
+		 * behind the reply can run.  Without it, the grant check
+		 * and the recording of a new grant race an invalidate of
+		 * the same DLM range.  The range lock may therefore leave
+		 * this call READY or LOCKED; it is released before
+		 * kiocb_modified() below and re-acquired narrower, in INIT
+		 * state, once the exact write range is known.
 		 */
-		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, NULL);
+		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, &rlock);
 		if (err) {
 			fuse_range_lock_release(fi, &rlock);
 			fuse_cache_wr_unlock(inode, exclusive);
@@ -2116,9 +2121,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					     dlm_pos + dlm_len - 1,
 					     FUSE_RANGE_LOCK_WRITE);
 
-		/* NULL rlock: provisional range, see the comment above the
-		 * first fuse_cache_wr_dlm_lock() call above. */
-		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, NULL);
+		/* Provisional range lock passed through, not NULL: see the
+		 * comment above the first redfs_cache_wr_dlm_lock() call. */
+		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, &rlock);
 		if (err)
 			goto out;
 	}
@@ -2144,9 +2149,9 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 					     dlm_pos + dlm_len - 1,
 					     FUSE_RANGE_LOCK_WRITE);
 
-		/* NULL rlock: provisional range, see the comment above the
-		 * first fuse_cache_wr_dlm_lock() call above. */
-		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, NULL);
+		/* Provisional range lock passed through, not NULL: see the
+		 * comment above the first redfs_cache_wr_dlm_lock() call. */
+		err = fuse_cache_wr_dlm_lock(file, dlm_pos, dlm_len, &rlock);
 		if (err)
 			goto out;
 	}
