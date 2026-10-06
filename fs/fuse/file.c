@@ -2029,6 +2029,16 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 
 		/*
+		 * Drop the provisional range lock before file_remove_privs():
+		 * the DLM request above may have left it READY or LOCKED, and
+		 * nothing held in either state may wait for the server.
+		 */
+		if (range_locked) {
+			fuse_range_lock_release(fi, &rlock);
+			range_locked = false;
+		}
+
+		/*
 		 * Kill suid/sgid and stamp the timestamps here, before the
 		 * range lock moves to LOCKED, instead of leaving them to
 		 * __generic_file_write_iter().  file_remove_privs() is the one
@@ -2053,21 +2063,16 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		}
 
 		/*
-		 * Narrow the range lock reservation from the provisional DLM
-		 * request range above (if any) to the exact range this write
+		 * Re-acquire the range lock for the exact range this write
 		 * will touch -- generic_write_checks() may have trimmed the
-		 * count below the provisional dlm_len -- staying in INIT state
-		 * so an invalidate that is already draining an overlapping
-		 * range is not waited on here either.  Only reacquired while
-		 * still on the DLM path: a fuse_cache_wr_dlm_lock() call above
-		 * may have found the server has no DLM and cleared fc->dlm, in
-		 * which case the exclusive i_rwsem already serializes this
-		 * write against invalidation and the range lock is not needed.
+		 * count below the provisional dlm_len -- in INIT state so an
+		 * invalidate that is already draining an overlapping range is
+		 * not waited on here either.  Only reacquired while still on
+		 * the DLM path: a fuse_cache_wr_dlm_lock() call above may have
+		 * found the server has no DLM and cleared fc->dlm, in which
+		 * case the exclusive i_rwsem already serializes this write
+		 * against invalidation and the range lock is not needed.
 		 */
-		if (range_locked) {
-			fuse_range_lock_release(fi, &rlock);
-			range_locked = false;
-		}
 		if (fc->dlm) {
 			dlm_pos = iocb->ki_pos;
 			dlm_len = iov_iter_count(from);
