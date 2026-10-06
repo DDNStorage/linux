@@ -22,6 +22,8 @@
 #include <linux/filelock.h>
 #include <linux/file.h>
 #include <linux/splice.h>
+#include <linux/uaccess.h>
+#include <linux/sizes.h>
 
 int sb_init_dio_done_wq(struct super_block *sb);
 
@@ -1331,12 +1333,68 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		}
 	}
 
-	res = generic_file_read_iter(iocb, to);
+	if (!range_locked)
+		return generic_file_read_iter(iocb, to);
 
-	if (range_locked)
+	/*
+	 * Nothing held once the range lock is LOCKED may wait for the
+	 * server (see fuse_cache_write_iter), and faulting on the user
+	 * buffer can do exactly that: a buffer backed by a shared-writable
+	 * mapping of this (or any) fuse file sends fuse_filemap_fault()
+	 * after a WRITE grant, and granting it can first require the
+	 * server to revoke this read's own READ grant -- whose
+	 * invalidation then waits on this read's LOCKED range.  ABBA
+	 * through the server, and request_wait_answer() does not die to
+	 * SIGKILL once the request is in userspace.
+	 *
+	 * So copy with page faults disabled (a non-resident user page
+	 * makes the copy come back short instead of faulting), and fault
+	 * the buffer in with the range lock demoted to INIT: an INIT range
+	 * neither blocks the revoke's invalidation nor conflicts with the
+	 * fault's own range lock.  The grant may be revoked while INIT, so
+	 * re-cover it before re-locking and resuming -- the same
+	 * INIT-request-LOCKED cycle the first pass above did.  Same shape
+	 * as gfs2_file_read_iter() around its glock.
+	 */
+	{
+		ssize_t total = 0;
+		size_t prev_count = 0;
+
+		for (;;) {
+			size_t window;
+			int err;
+
+			pagefault_disable();
+			res = generic_file_read_iter(iocb, to);
+			pagefault_enable();
+			if (res > 0)
+				total += res;
+
+			if (res != -EFAULT &&
+			    !(res >= 0 && iov_iter_count(to) &&
+			      iocb->ki_pos < i_size_read(inode)))
+				break;
+			if (!user_backed_iter(to) ||
+			    iov_iter_count(to) == prev_count)
+				break;
+			prev_count = iov_iter_count(to);
+
+			fuse_range_lock_mark_init(fi, &rlock);
+			window = min_t(size_t, iov_iter_count(to), SZ_1M);
+			window -= fault_in_iov_iter_writeable(to, window);
+			if (!window)
+				break;
+			fuse_get_dlm_lock(file, iocb->ki_pos,
+					  iov_iter_count(to),
+					  FUSE_PAGE_LOCK_READ, &rlock);
+			err = fuse_range_lock_mark_locked(fi, &rlock);
+			if (err)
+				break;
+		}
+
 		fuse_range_lock_release(fi, &rlock);
-
-	return res;
+		return total > 0 ? total : res;
+	}
 }
 
 static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
