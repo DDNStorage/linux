@@ -1371,11 +1371,60 @@ static ssize_t fuse_send_write(struct fuse_io_args *ia, loff_t pos,
 	return err ?: ia->write.out.size;
 }
 
+/*
+ * Zero what a size extension exposes of the old EOF folio.
+ *
+ * A shared mapping can write past EOF within the last folio, and nothing
+ * owns those bytes until the file grows over them.  iomap zeroes them from
+ * iomap_write_end() and 6.13 from pagecache_isize_extended(); this base does
+ * neither, and the classic write path never touches a folio its write does
+ * not land in.  Only a cached, uptodate folio can hold anything: one filled
+ * later is read or zeroed then.  The server's side of the gap is a hole, so
+ * a clean folio stays clean.
+ *
+ * Called before the caller publishes a size of @to or beyond, with nothing
+ * held.  A concurrent writer may fill the gap first: its copy runs under the
+ * same folio lock and its fuse_write_end() moves i_size under fi->lock, so
+ * i_size still at the value read means nothing landed in the gap.  When it
+ * moved, the mover zeroed its own gap before publishing, and only what lies
+ * past the new size is left to do.
+ */
+void fuse_zero_eof_gap(struct inode *inode, loff_t to)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct folio *folio;
+	loff_t from, end;
+	bool done;
+
+	do {
+		from = i_size_read(inode);
+		if (from >= to || !(from & (PAGE_SIZE - 1)))
+			return;
+
+		folio = filemap_lock_folio(inode->i_mapping, from >> PAGE_SHIFT);
+		if (IS_ERR(folio))
+			return;
+
+		end = min(to, folio_pos(folio) + (loff_t)folio_size(folio));
+		spin_lock(&fi->lock);
+		done = inode->i_size == from;
+		if (done && folio_test_uptodate(folio))
+			folio_zero_segment(folio, offset_in_folio(folio, from),
+					   end - folio_pos(folio));
+		spin_unlock(&fi->lock);
+		folio_unlock(folio);
+		folio_put(folio);
+	} while (!done);
+}
+
 bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	bool ret = false;
+
+	if (written > 0)
+		fuse_zero_eof_gap(inode, pos - written);
 
 	spin_lock(&fi->lock);
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
@@ -2976,6 +3025,13 @@ static int fuse_write_begin(struct file *file, struct address_space *mapping,
 	int err;
 
 	WARN_ON(!fc->writeback_cache);
+
+	/*
+	 * A write landing past EOF exposes what the EOF folio holds beyond
+	 * it once fuse_write_end() publishes the size.  Zero that now, before
+	 * this folio is locked, so no two folio locks nest.
+	 */
+	fuse_zero_eof_gap(mapping->host, pos);
 
 retry:
 	err = -ENOMEM;

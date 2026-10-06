@@ -2231,6 +2231,9 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		goto error;
 	}
 
+	if ((is_truncate || !is_wb) && S_ISREG(inode->i_mode))
+		fuse_zero_eof_gap(inode, outarg.attr.size);
+
 	spin_lock(&fi->lock);
 	/* the kernel maintains i_mtime locally */
 	if (trust_local_cmtime) {
