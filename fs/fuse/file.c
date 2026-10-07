@@ -22,6 +22,7 @@
 #include <linux/filelock.h>
 #include <linux/file.h>
 #include <linux/splice.h>
+#include <linux/delay.h>
 #include <linux/uaccess.h>
 #include <linux/sizes.h>
 
@@ -3400,6 +3401,179 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	return VM_FAULT_LOCKED;
 }
 
+/*
+ * Does filemap_fault() need a synchronous READ before it can map
+ * @index?  True when the folio is absent or not uptodate and the fault
+ * is inside i_size -- past EOF, filemap_fault() returns SIGBUS before
+ * ever touching the folio, so no READ can happen there.  The lookup
+ * never blocks, so this is safe under mmap_lock (or the per-VMA lock)
+ * and with the range lock in any state.
+ */
+static bool fuse_fault_needs_read(struct inode *inode, pgoff_t index)
+{
+	struct folio *folio;
+	bool uptodate;
+
+	if (((loff_t)index << PAGE_SHIFT) >= i_size_read(inode))
+		return false;
+
+	folio = filemap_get_folio(inode->i_mapping, index);
+	if (IS_ERR(folio))
+		return true;
+
+	uptodate = folio_test_uptodate(folio);
+	folio_put(folio);
+	return !uptodate;
+}
+
+/*
+ * Batch size for fuse_fault_read_private_folios(): one fault-around
+ * window (64k with 4k pages), centred on the faulted page.  A
+ * spanning access (one instruction touching the tail of one page and
+ * the head of the next -- any unaligned copy does this constantly)
+ * needs BOTH pages mapped at once to retire, and every server round
+ * trip gets this client's grant revoked and its page cache dropped
+ * (the server does not exempt the requester, and the notification
+ * runs one op behind).  A one-page grant-and-populate therefore
+ * ping-pongs forever: mapping each page costs a round trip whose
+ * revoke drops the other.  A window covering both pages makes the
+ * neighbour's fault a pure fast-path hit -- recorded grant, resident
+ * folio, NO server op and no new revoke -- and the spanning access
+ * completes.  Centred, not aligned: an aligned window has edges
+ * (every 16th page boundary), and a spanning access sitting on an
+ * edge gets two one-page-covering windows and ping-pongs just the
+ * same (generic/263); a centred window always covers both of the
+ * faulted page's neighbours, so no boundary has the problem.
+ */
+#define FUSE_FAULT_BATCH_PAGES 16
+
+/* First page of the populate/grant window centred on @index. */
+static pgoff_t fuse_fault_batch_base(pgoff_t index)
+{
+	if (index < FUSE_FAULT_BATCH_PAGES / 2)
+		return 0;
+	return index - FUSE_FAULT_BATCH_PAGES / 2;
+}
+
+/*
+ * Read a batch of pages centred on @index into freshly
+ * allocated folios that are NOT in the page cache.  Unlike
+ * read_cache_folio(), nothing contested is held while the READ waits
+ * on the server: no page-cache folio lock (an invalidation laundering
+ * the range would block on it, while the server holds this READ
+ * behind the revoke that triggered the invalidation -- the same cycle
+ * as the range-lock one, one lock over), and the caller holds its
+ * range lock only in INIT state.  The folios are returned with a
+ * reference each and no mapping; the caller installs them with
+ * fuse_fault_install_folio() under its range lock LOCKED.
+ *
+ * A short read (EOF) leaves the tails zeroed (page_zeroing), which is
+ * what the page cache stores for the EOF pages anyway.  i_size is
+ * deliberately NOT shrunk here (no fuse_short_read()), to keep this
+ * reader free of attribute side effects.
+ *
+ * On success returns the number of folios in @folios (>= 1, @index
+ * always covered) and sets @basep to the first folio's page index;
+ * negative error otherwise.
+ */
+static int fuse_fault_read_private_folios(struct file *file,
+					  struct inode *inode,
+					  pgoff_t index, pgoff_t *basep,
+					  struct folio **folios)
+{
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_page_desc descs[FUSE_FAULT_BATCH_PAGES];
+	struct page *pages[FUSE_FAULT_BATCH_PAGES];
+	struct fuse_io_args ia = {
+		.ap.args.page_zeroing = true,
+		.ap.args.out_pages = true,
+		.ap.descs = descs,
+		.ap.pages = pages,
+	};
+	pgoff_t base = fuse_fault_batch_base(index);
+	loff_t isize = i_size_read(inode);
+	loff_t pos = (loff_t)base << PAGE_SHIFT;
+	pgoff_t last = (isize - 1) >> PAGE_SHIFT;
+	unsigned int nr, i;
+	size_t count;
+	ssize_t res;
+
+	/* Caller checked index < i_size; clip the window to EOF. */
+	nr = min_t(pgoff_t, FUSE_FAULT_BATCH_PAGES, last - base + 1);
+
+	for (i = 0; i < nr; i++) {
+		folios[i] = filemap_alloc_folio(
+			mapping_gfp_mask(inode->i_mapping), 0);
+		if (!folios[i])
+			break;
+		pages[i] = &folios[i]->page;
+		descs[i].offset = 0;
+		descs[i].length = PAGE_SIZE;
+	}
+	if (i <= index - base) {
+		/* Not even the faulted page: fail with what we freed. */
+		while (i--)
+			folio_put(folios[i]);
+		return -ENOMEM;
+	}
+	nr = i;
+	ia.ap.num_pages = nr;
+	count = (size_t)nr << PAGE_SHIFT;
+
+	/* Don't overflow end offset */
+	if (pos + (count - 1) == LLONG_MAX) {
+		count--;
+		descs[nr - 1].length--;
+	}
+
+	fuse_read_args_fill(&ia, file, pos, count, FUSE_READ);
+	res = fuse_simple_request(fm, &ia.ap.args);
+	if (res < 0) {
+		for (i = 0; i < nr; i++)
+			folio_put(folios[i]);
+		return res;
+	}
+
+	*basep = base;
+	return nr;
+}
+
+/*
+ * Install a folio filled by fuse_fault_read_private_folios() into the
+ * page cache.  Only called with the caller's range lock LOCKED.
+ * filemap_add_folio() returns the folio locked; it is held only over
+ * the uptodate marking, never over a server wait.  If another path
+ * populated the index meanwhile (-EEXIST), that copy is just as good
+ * -- the caller re-checks residency either way.  Does not consume the
+ * caller's reference.
+ *
+ * No freshness test gates the install, deliberately.  The server
+ * revokes this client's own grant to serve the private READ (it does
+ * not exempt the requester), so the READ's own revoke notification is
+ * in flight more or less whenever this is called, and any
+ * "nothing invalidated this inode across the READ window" check
+ * (grant record, attr_version, a data-inval counter -- all were
+ * tried) fails on every pass: the probe destroys what it measures,
+ * and the fault livelocks re-reading forever.  Instead the caller
+ * keeps the range lock LOCKED from here through filemap_fault(), so
+ * the notification (which takes the range lock in LOCKED state to
+ * drop pages) cannot remove the folio before the PTE is mapped --
+ * exactly the guarantee the pre-patch code got from holding the
+ * range lock across the whole fault.  A revoke that lands after the
+ * release drops the folio and unmaps the PTE, and the next access
+ * refaults and re-reads: coherent at the protocol's
+ * notification-latency granularity, same as every other cached page.
+ */
+static void fuse_fault_install_folio(struct inode *inode,
+				     struct folio *folio, pgoff_t index)
+{
+	if (!filemap_add_folio(inode->i_mapping, folio, index,
+			       mapping_gfp_mask(inode->i_mapping))) {
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+	}
+}
+
 static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 {
 	struct file *file = vmf->vma->vm_file;
@@ -3410,9 +3584,25 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 		struct fuse_inode *fi = get_fuse_inode(inode);
 		struct fuse_range_lock rlock;
 		loff_t pos = vmf->pgoff << PAGE_SHIFT;
+		/*
+		 * Grant and populate in whole batch windows.  A one-page
+		 * grant breaks spanning accesses (one instruction
+		 * touching two pages): the neighbour's fault finds no
+		 * recorded grant, and its own fuse_get_dlm_lock() round
+		 * trip costs a revoke that drops the page just mapped --
+		 * a deterministic ping-pong (the generic/091 livelock).
+		 * With the grant covering the same window the populate
+		 * read fills, the neighbour's fault passes the fast
+		 * path's is_held() and residency checks and maps with no
+		 * server op at all.
+		 */
+		loff_t bpos = (loff_t)fuse_fault_batch_base(vmf->pgoff)
+			<< PAGE_SHIFT;
+		size_t blen = (size_t)FUSE_FAULT_BATCH_PAGES << PAGE_SHIFT;
 		enum fuse_page_lock_mode mode = FUSE_PAGE_LOCK_READ;
 		enum fuse_range_lock_mode range_mode = FUSE_RANGE_LOCK_READ;
 		vm_fault_t ret;
+		int tries;
 		int err;
 
 		if ((vmf->vma->vm_flags & (VM_SHARED | VM_MAYWRITE)) ==
@@ -3422,18 +3612,24 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 		}
 
 		/*
-		 * Fast path: range lock uncontended and the grant already
-		 * recorded.  Nothing here blocks, so it is safe under
-		 * mmap_lock (or the per-VMA lock).  LOCKED first, then
-		 * is_held(): only once LOCKED, which fences any concurrent
-		 * revoke, can the recorded grant be trusted -- same order
-		 * as fuse_get_dlm_lock()'s own fast path.
+		 * Fast path: range lock uncontended, the grant already
+		 * recorded, and the folio already resident.  Nothing here
+		 * blocks, so it is safe under mmap_lock (or the per-VMA
+		 * lock).  LOCKED first, then is_held(): only once LOCKED,
+		 * which fences any concurrent revoke, can the recorded
+		 * grant be trusted -- same order as fuse_get_dlm_lock()'s
+		 * own fast path.  The folio check keeps filemap_fault()
+		 * from issuing a synchronous READ with the range LOCKED:
+		 * nothing held once LOCKED may wait on the server (see the
+		 * blocking path below), so a missing folio falls through
+		 * to the slow path, which populates it under INIT.
 		 */
 		if (fuse_range_lock_try_acquire_init(fi, &rlock, pos,
 						     pos + PAGE_SIZE - 1,
 						     range_mode)) {
 			if (fuse_range_lock_try_mark_locked(fi, &rlock) &&
-			    fuse_dlm_lock_is_held(fi, pos, PAGE_SIZE, mode)) {
+			    fuse_dlm_lock_is_held(fi, pos, PAGE_SIZE, mode) &&
+			    !fuse_fault_needs_read(inode, vmf->pgoff)) {
 				ret = filemap_fault(vmf);
 				fuse_range_lock_release(fi, &rlock);
 				return ret;
@@ -3466,8 +3662,8 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 			file = get_file(file);
 			release_fault_lock(vmf);
 
-			err = fuse_range_lock_acquire_init(fi, &rlock, pos,
-							   pos + PAGE_SIZE - 1,
+			err = fuse_range_lock_acquire_init(fi, &rlock, bpos,
+							   bpos + blen - 1,
 							   range_mode);
 			if (!err) {
 				/*
@@ -3476,8 +3672,36 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 				 * path below, which turns a persistent
 				 * error into SIGBUS.
 				 */
-				fuse_get_dlm_lock(file, pos, PAGE_SIZE,
+				fuse_get_dlm_lock(file, bpos, blen,
 						  mode, &rlock);
+				/*
+				 * Populate the folios too, or the retried
+				 * fault's fast path would refuse the grant
+				 * it just recorded (missing folio) and come
+				 * straight back here.  Read under INIT,
+				 * install under LOCKED; see the blocking
+				 * path below.
+				 */
+				if (fuse_fault_needs_read(inode,
+							  vmf->pgoff)) {
+					struct folio *folios[FUSE_FAULT_BATCH_PAGES];
+					pgoff_t fbase;
+					int nr, i;
+
+					fuse_range_lock_mark_init(fi, &rlock);
+					nr = fuse_fault_read_private_folios(
+						file, inode, vmf->pgoff,
+						&fbase, folios);
+					if (nr > 0) {
+						bool locked = !fuse_range_lock_mark_locked(fi, &rlock);
+
+						for (i = 0; i < nr; i++) {
+							if (locked)
+								fuse_fault_install_folio(inode, folios[i], fbase + i);
+							folio_put(folios[i]);
+						}
+					}
+				}
 				fuse_range_lock_release(fi, &rlock);
 			}
 			fput(file);
@@ -3490,22 +3714,125 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 		 * conflicts with its own IO's range lock, so this cannot
 		 * deadlock on itself; it can still stack behind a pending
 		 * mmap_lock writer the way any blocking fault can.
+		 *
+		 * Nothing held once the range lock is LOCKED may wait for
+		 * the server (see fuse_cache_read_iter), and
+		 * filemap_fault() on a non-resident folio does exactly
+		 * that: a synchronous READ the server can queue behind a
+		 * revoke already in flight for this range, whose
+		 * invalidation then waits on this LOCKED range.  ABBA
+		 * through the server (the generic/091 hang).  Nor can the
+		 * page-cache read path be used with the range lock merely
+		 * demoted: it keeps the folio locked in the mapping across
+		 * the READ, and the invalidation blocks on that folio lock
+		 * instead -- same cycle, one lock over.  So read into a
+		 * private folio with the range lock demoted to INIT
+		 * (nothing the invalidation needs is held), then promote
+		 * and install it, and keep the range LOCKED from the
+		 * install through filemap_fault() so the READ's own
+		 * revoke notification (the server revokes the requester's
+		 * grant to serve the READ) cannot drop the folio before
+		 * the PTE is mapped; see fuse_fault_install_folio().
 		 */
-		err = fuse_range_lock_acquire_init(fi, &rlock, pos,
-						   pos + PAGE_SIZE - 1,
+		err = fuse_range_lock_acquire_init(fi, &rlock, bpos,
+						   bpos + blen - 1,
 						   range_mode);
 		if (err)
 			return vmf_error(err);
-		err = fuse_get_dlm_lock(file, pos, PAGE_SIZE, mode, &rlock);
-		if (err < 0 && err != -ENOSYS) {
-			fuse_range_lock_release(fi, &rlock);
-			return vmf_error(err);
-		}
 
-		err = fuse_range_lock_mark_locked(fi, &rlock);
-		if (err) {
-			fuse_range_lock_release(fi, &rlock);
-			return vmf_error(err);
+		for (tries = 0; ; tries++) {
+			struct folio *folios[FUSE_FAULT_BATCH_PAGES];
+			pgoff_t fbase;
+			int nr, i;
+
+			err = fuse_get_dlm_lock(file, bpos, blen, mode,
+						&rlock);
+			if (err < 0 && err != -ENOSYS) {
+				fuse_range_lock_release(fi, &rlock);
+				return vmf_error(err);
+			}
+
+			err = fuse_range_lock_mark_locked(fi, &rlock);
+			if (err) {
+				fuse_range_lock_release(fi, &rlock);
+				return vmf_error(err);
+			}
+
+			if (!fuse_fault_needs_read(inode, vmf->pgoff))
+				break;
+
+			/*
+			 * A pass loops only when the folio went missing
+			 * again between the previous install and this
+			 * pass's residency check (a revoke landed in the
+			 * gap), or on a bounced READ.  Each successful
+			 * install exits the loop under LOCKED, so a storm
+			 * costs refaults, not loop passes; still killable
+			 * in case the server bounces READs indefinitely.
+			 */
+			if (fatal_signal_pending(current)) {
+				fuse_range_lock_release(fi, &rlock);
+				return vmf_error(-EINTR);
+			}
+			if (tries && (tries % 64) == 0)
+				pr_warn_ratelimited("fuse: fault populate slow, nodeid %llu idx %lu: %d passes\n",
+						    fi->nodeid, vmf->pgoff,
+						    tries);
+
+			fuse_range_lock_mark_init(fi, &rlock);
+			nr = fuse_fault_read_private_folios(file, inode,
+							    vmf->pgoff,
+							    &fbase, folios);
+			if (nr < 0) {
+				/*
+				 * -EDEADLK/-EAGAIN is the server bouncing
+				 * a READ it cannot serve yet (a revoke in
+				 * flight); back off and retry, the same
+				 * thing AOP_TRUNCATED_PAGE does for the
+				 * page-cache read path.  Anything else is
+				 * a real read error: let filemap_fault()
+				 * run and turn it into SIGBUS -- the
+				 * server answers (with the error) rather
+				 * than queueing, so nothing hangs.
+				 */
+				if (nr == -EDEADLK || nr == -EAGAIN) {
+					msleep_interruptible(2);
+					continue;
+				}
+				err = fuse_range_lock_mark_locked(fi, &rlock);
+				if (err) {
+					fuse_range_lock_release(fi, &rlock);
+					return vmf_error(err);
+				}
+				break;
+			}
+
+			err = fuse_range_lock_mark_locked(fi, &rlock);
+			if (err) {
+				for (i = 0; i < nr; i++)
+					folio_put(folios[i]);
+				fuse_range_lock_release(fi, &rlock);
+				return vmf_error(err);
+			}
+			for (i = 0; i < nr; i++) {
+				fuse_fault_install_folio(inode, folios[i],
+							 fbase + i);
+				folio_put(folios[i]);
+			}
+			/*
+			 * Exit under LOCKED: filemap_fault() below maps
+			 * the just-installed folio without a server wait
+			 * (present and uptodate), and the range lock --
+			 * spanning the whole batch window -- keeps any
+			 * pending revoke's page drop out until the PTE is
+			 * in place.  If the install lost to -EEXIST on a
+			 * !uptodate foreign folio, loop instead: mapping
+			 * it would trigger a synchronous READ with the
+			 * range LOCKED.
+			 */
+			if (!fuse_fault_needs_read(inode, vmf->pgoff))
+				break;
+			fuse_range_lock_mark_init(fi, &rlock);
 		}
 
 		ret = filemap_fault(vmf);
