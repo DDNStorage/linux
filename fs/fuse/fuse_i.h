@@ -432,6 +432,7 @@ struct fuse_args {
 	bool is_ext:1;
 	bool is_pinned:1;
 	bool invalidate_vmap:1;
+	bool no_fg_limit:1;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
@@ -520,6 +521,7 @@ struct fuse_io_priv {
  * FR_PRIVATE:		request is on private list
  * FR_ASYNC:		request is asynchronous
  * FR_URING:		request is handled through fuse-io-uring
+ * FR_URING_FG:		request is counted in the io-uring queue foreground limit
  */
 enum fuse_req_flag {
 	FR_ISREPLY,
@@ -536,6 +538,7 @@ enum fuse_req_flag {
 	FR_PRIVATE,
 	FR_ASYNC,
 	FR_URING,
+	FR_URING_FG,
 };
 
 /**
