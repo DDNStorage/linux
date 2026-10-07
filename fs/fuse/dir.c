@@ -2185,6 +2185,19 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			return err;
 	}
 
+	/*
+	 * Write dirty folios back before a truncating SETATTR, like the
+	 * atomic-O_TRUNC case in fuse_open(): under DLM the server's
+	 * truncate revokes this client's locks, and the invalidate that
+	 * follows would otherwise launder dirty folios with writes the
+	 * server holds behind the same truncate.
+	 */
+	if (is_truncate && is_wb && fc->dlm) {
+		err = filemap_write_and_wait(mapping);
+		if (err)
+			goto error;
+	}
+
 	if (is_truncate) {
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 		if (trust_local_cmtime && attr->ia_size != inode->i_size)
