@@ -3543,9 +3543,19 @@ static int fuse_fault_read_private_folios(struct file *file,
  * page cache.  Only called with the caller's range lock LOCKED.
  * filemap_add_folio() returns the folio locked; it is held only over
  * the uptodate marking, never over a server wait.  If another path
- * populated the index meanwhile (-EEXIST), that copy is just as good
- * -- the caller re-checks residency either way.  Does not consume the
- * caller's reference.
+ * populated the index meanwhile (-EEXIST) with an uptodate folio,
+ * that copy is just as good.  A resident !uptodate folio, though,
+ * may have NO read in flight to ever complete it -- an errored
+ * readahead (the server bounces READs behind a revoke in flight)
+ * leaves exactly that: unlocked, resident, !uptodate.  The buffered
+ * read path would lock and re-read it, but this path reads privately
+ * and would -EEXIST against it on every pass, and the caller's
+ * residency re-check would loop forever (the generic/120 livelock:
+ * an exec fault spun 20M passes against one stale folio).  So fill
+ * it from the just-read data under a trylock: trylock never waits
+ * (no server wait is allowed under the caller's LOCKED range), and
+ * losing the trylock means a read IS in flight, which resolves the
+ * index on its own.  Does not consume the caller's reference.
  *
  * No freshness test gates the install, deliberately.  The server
  * revokes this client's own grant to serve the private READ (it does
@@ -3567,11 +3577,35 @@ static int fuse_fault_read_private_folios(struct file *file,
 static void fuse_fault_install_folio(struct inode *inode,
 				     struct folio *folio, pgoff_t index)
 {
+	struct folio *stale;
+
 	if (!filemap_add_folio(inode->i_mapping, folio, index,
 			       mapping_gfp_mask(inode->i_mapping))) {
 		folio_mark_uptodate(folio);
 		folio_unlock(folio);
+		return;
 	}
+
+	stale = filemap_get_folio(inode->i_mapping, index);
+	if (IS_ERR(stale))
+		return;
+	if (!folio_test_uptodate(stale) && !folio_test_large(stale) &&
+	    folio_trylock(stale)) {
+		/* Re-check under the lock; skip if truncated away. */
+		if (!folio_test_uptodate(stale) &&
+		    stale->mapping == inode->i_mapping) {
+			void *src = kmap_local_folio(folio, 0);
+			void *dst = kmap_local_folio(stale, 0);
+
+			memcpy(dst, src, PAGE_SIZE);
+			kunmap_local(dst);
+			kunmap_local(src);
+			flush_dcache_folio(stale);
+			folio_mark_uptodate(stale);
+		}
+		folio_unlock(stale);
+	}
+	folio_put(stale);
 }
 
 static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
@@ -3826,9 +3860,11 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 			 * spanning the whole batch window -- keeps any
 			 * pending revoke's page drop out until the PTE is
 			 * in place.  If the install lost to -EEXIST on a
-			 * !uptodate foreign folio, loop instead: mapping
-			 * it would trigger a synchronous READ with the
-			 * range LOCKED.
+			 * !uptodate foreign folio it could not fill (a
+			 * read in flight holds the folio lock), loop
+			 * instead: mapping it would trigger a
+			 * synchronous READ with the range LOCKED, and
+			 * the in-flight read resolves the index anyway.
 			 */
 			if (!fuse_fault_needs_read(inode, vmf->pgoff))
 				break;
