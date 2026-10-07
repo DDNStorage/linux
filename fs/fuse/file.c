@@ -373,6 +373,20 @@ static int fuse_open(struct inode *inode, struct file *file)
 	if (is_wb_truncate || dax_truncate)
 		inode_lock(inode);
 
+	/*
+	 * Write dirty folios back before FUSE_OPEN truncates on the server.
+	 * Under DLM that truncate revokes this client's locks, and the
+	 * NOTIFY_INVAL_INODE it triggers would have to launder any folio
+	 * still dirty: a write the server holds behind the same truncate,
+	 * while the truncate waits for the invalidate to finish.  i_rwsem
+	 * keeps cached writers from redirtying the cache until the OPEN.
+	 */
+	if (range_locked) {
+		err = filemap_write_and_wait(inode->i_mapping);
+		if (err)
+			goto out_inode_unlock;
+	}
+
 	if (dax_truncate) {
 		filemap_invalidate_lock(inode->i_mapping);
 		err = fuse_dax_break_layouts(inode, 0, -1);
