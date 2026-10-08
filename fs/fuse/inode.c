@@ -37,7 +37,7 @@ static bool __read_mostly enable_compound;
 module_param(enable_compound, bool, 0644);
 MODULE_PARM_DESC(enable_uring, "Enable fuse compounds");
 
-bool __read_mostly enable_large_folios = true;
+bool __read_mostly enable_large_folios = false;
 module_param(enable_large_folios, bool, 0644);
 MODULE_PARM_DESC(enable_large_folios, "Enable large folios support");
 
@@ -219,23 +219,6 @@ static void fuse_evict_inode(struct inode *inode)
 		WARN_ON(!list_empty(&fi->queued_writes));
 		fuse_dlm_cache_release_locks(fi);
 	}
-
-	/*
-	 * Free the coherency gate here rather than in ->free_inode: that runs
-	 * from an RCU callback, where percpu_free_rwsem() may sleep in
-	 * rcu_sync_dtor() if the write side has not fully quiesced.  No user
-	 * can remain by eviction time: gate readers hold a file reference and
-	 * a concurrent notify holds an inode reference.  wb_inval_rwsem lives
-	 * in the regular-file union arm and is only ever allocated for regular
-	 * files, so gate on S_ISREG (but not fuse_is_bad() -- bad-marked
-	 * regular files still own a gate); a directory's overlapping
-	 * readdir-cache fields must not be misread.
-	 */
-	if (S_ISREG(inode->i_mode) && fi->wb_inval_rwsem) {
-		percpu_free_rwsem(fi->wb_inval_rwsem);
-		kfree(fi->wb_inval_rwsem);
-		fi->wb_inval_rwsem = NULL;
-	}
 }
 
 static int fuse_reconfigure(struct fs_context *fsc)
@@ -261,6 +244,143 @@ static ino_t fuse_squash_ino(u64 ino64)
 	return ino;
 }
 
+/*
+ * Handle statx-specific attribute updates with partial attribute support.
+ */
+static void fuse_change_attributes_common_sx(struct inode *inode,
+					     struct fuse_attr *attr,
+					     struct fuse_statx *sx,
+					     u64 attr_valid, u32 cache_mask,
+					     u64 evict_ctr)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	u32 returned_attrs = sx->mask & STATX_BASIC_STATS;
+
+	lockdep_assert_held(&fi->lock);
+
+	/*
+	 * Clear returned basic stats from invalid mask.
+	 *
+	 * Don't do this if this is coming from a fuse_iget() call and there
+	 * might have been a racing evict which would've invalidated the result
+	 * if the attr_version would've been preserved.
+	 *
+	 * !evict_ctr -> this is create
+	 * fi->attr_version != 0 -> this is not a new inode
+	 * evict_ctr == fuse_get_evict_ctr() -> no evicts while during request
+	 */
+	if (!evict_ctr || fi->attr_version || evict_ctr == fuse_get_evict_ctr(fc))
+		set_mask_bits(&fi->inval_mask, returned_attrs, 0);
+
+	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+
+	/*
+	 * Only update i_time if we got all the attributes we care about.
+	 *
+	 * With writeback_cache (cache_mask set): cache_mask attributes are
+	 * managed locally and their values from the server are ignored.
+	 * So we only need all the OTHER attributes (non-cache_mask).
+	 */
+	if (cache_mask) {
+		/* writeback_cache: ignore cache_mask attrs, check everything else */
+		if ((returned_attrs | cache_mask) == STATX_BASIC_STATS)
+			fi->i_time = attr_valid;
+	} else {
+		/* no writeback_cache: need all basic stats */
+		if (returned_attrs == STATX_BASIC_STATS)
+			fi->i_time = attr_valid;
+	}
+
+	/*
+	 * Permission-check cache: independent of i_time so that a partial
+	 * refresh which covers only mode/uid/gid (e.g. fuse_perm_getattr())
+	 * still extends the window during which fuse_permission() can hit
+	 * the cache. Requires all three perm bits because generic_permission()
+	 * needs the full triple.
+	 */
+	if ((returned_attrs & (STATX_MODE | STATX_UID | STATX_GID)) ==
+	    (STATX_MODE | STATX_UID | STATX_GID))
+		fi->i_perm_time = attr_valid;
+
+	/*
+	 * Only update inode fields for attributes that were actually returned.
+	 * TYPE is part of i_mode but already set during inode creation.
+	 */
+	if (returned_attrs & STATX_INO)
+		inode->i_ino = fuse_squash_ino(attr->ino);
+	if (returned_attrs & STATX_MODE)
+		inode->i_mode = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
+	if (returned_attrs & STATX_NLINK)
+		set_nlink(inode, attr->nlink);
+	if (returned_attrs & STATX_UID)
+		inode->i_uid = make_kuid(fc->user_ns, attr->uid);
+	if (returned_attrs & STATX_GID)
+		inode->i_gid = make_kgid(fc->user_ns, attr->gid);
+	if (returned_attrs & STATX_BLOCKS)
+		inode->i_blocks = attr->blocks;
+
+	if (returned_attrs & STATX_ATIME) {
+		attr->atimensec = min_t(u32, attr->atimensec, NSEC_PER_SEC - 1);
+		inode_set_atime(inode, attr->atime, attr->atimensec);
+	}
+	/* mtime from server may be stale due to local buffered write */
+	if ((returned_attrs & STATX_MTIME) && !(cache_mask & STATX_MTIME)) {
+		attr->mtimensec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
+		inode_set_mtime(inode, attr->mtime, attr->mtimensec);
+	}
+	if ((returned_attrs & STATX_CTIME) && !(cache_mask & STATX_CTIME)) {
+		attr->ctimensec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
+		inode_set_ctime(inode, attr->ctime, attr->ctimensec);
+	}
+	if (sx) {
+		/* Sanitize nsecs */
+		sx->btime.tv_nsec =
+			min_t(u32, sx->btime.tv_nsec, NSEC_PER_SEC - 1);
+
+		/*
+		 * Btime has been queried, cache is valid (whether or not btime
+		 * is available or not) so clear STATX_BTIME from inval_mask.
+		 *
+		 * Availability of the btime attribute is indicated in
+		 * FUSE_I_BTIME
+		 */
+		set_mask_bits(&fi->inval_mask, STATX_BTIME, 0);
+		if (sx->mask & STATX_BTIME) {
+			set_bit(FUSE_I_BTIME, &fi->state);
+			fi->i_btime.tv_sec = sx->btime.tv_sec;
+			fi->i_btime.tv_nsec = sx->btime.tv_nsec;
+		}
+	}
+
+	/* Common fields for both statx and getattr */
+	if (attr->blksize != 0)
+		fi->cached_i_blkbits = ilog2(attr->blksize);
+	else
+		fi->cached_i_blkbits = inode->i_sb->s_blocksize_bits;
+
+	/*
+	 * Don't set the sticky bit in i_mode, unless we want the VFS
+	 * to check permissions.  This prevents failures due to the
+	 * check in may_delete().
+	 */
+	fi->orig_i_mode = inode->i_mode;
+	if (!fc->default_permissions)
+		inode->i_mode &= ~S_ISVTX;
+
+	fi->orig_ino = attr->ino;
+
+	/*
+	 * We are refreshing inode data and it is possible that another
+	 * client set suid/sgid or security.capability xattr. So clear
+	 * S_NOSEC. Ideally, we could have cleared it only if suid/sgid
+	 * was set or if security.capability xattr was set. But we don't
+	 * know if security.capability has been set or not. So clear it
+	 * anyway. Its less efficient but should be safe.
+	 */
+	inode->i_flags &= ~S_NOSEC;
+}
+
 void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 				   struct fuse_statx *sx,
 				   u64 attr_valid, u32 cache_mask,
@@ -270,6 +390,12 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
 	lockdep_assert_held(&fi->lock);
+
+	if (sx) {
+		return fuse_change_attributes_common_sx(inode, attr, sx,
+							attr_valid, cache_mask,
+							evict_ctr);
+	}
 
 	/*
 	 * Clear basic stats from invalid mask.
@@ -288,6 +414,7 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	wake_up_all(&fc->attr_version_waitq);
 	fi->i_time = attr_valid;
+	fi->i_perm_time = attr_valid;
 
 	inode->i_ino     = fuse_squash_ino(attr->ino);
 	inode->i_mode    = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
@@ -381,10 +508,17 @@ u32 fuse_get_cache_mask(struct inode *inode)
  * and older if we still have unwritten data there.  Keep the cached values
  * for exactly what the grant covers:
  *
- *  - size, when the server reports less than i_size and the tail it does not
- *    know about, [srv_size, i_size), is entirely under a write grant.  Taking
- *    the server's answer would shrink i_size and have truncate_pagecache()
- *    throw the unwritten tail away.
+ *  - size, when the server reports less than i_size and the last page of the
+ *    file is under a write grant.  The server reports less for one of two
+ *    reasons: our extension is still unwritten, or a remote truncate cut the
+ *    file.  A remote truncate revokes every grant above its new size before
+ *    it proceeds, so a write grant still covering the page holding i_size - 1
+ *    rules it out and leaves the extension as the only explanation.  Taking
+ *    the server's answer then would shrink i_size and have
+ *    truncate_pagecache() throw the unwritten tail away.  The bytes between
+ *    the server's size and the extension need no grant of their own: a
+ *    write past EOF leaves them a hole, and another node reading or writing
+ *    the hole revokes nothing the extension rests on.
  *  - mtime and ctime, while a write grant covers unwritten data: our writes
  *    have stamped them locally and the server's stamps predate them.  Only
  *    while the cache is actually dirty, not for as long as the grant lives:
@@ -394,20 +528,24 @@ u32 fuse_get_cache_mask(struct inode *inode)
  *
  * A remote truncate cannot slip through.  It has to revoke the grant first,
  * and the revoke launders the tail and drops the grant, so by the time the
- * smaller size is reported neither check holds and the server's answer is
- * applied as usual.  A grant the server made but that could not be recorded
- * (FUSE_DLM_GRANT_UNRECORDED) is invisible to the lock tree and falls back to
- * trusting the server, as before.
+ * smaller size is reported the last page is uncovered and the server's
+ * answer is applied as usual.  A grant the server made but that could not be
+ * recorded (FUSE_DLM_GRANT_UNRECORDED) is invisible to the lock tree and
+ * falls back to trusting the server, as before.
  *
- * Must be called without fi->lock: the lock tree query sleeps.
+ * Must be called without fi->lock: the lock tree query sleeps.  @size_seen
+ * returns the i_size the decision was made on, for the caller to notice an
+ * extension claimed in the meantime under fi->lock.
  */
 static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
-				bool have_size)
+				bool have_size, loff_t *size_seen)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	u32 cache_mask = fuse_get_cache_mask(inode);
 	loff_t size = i_size_read(inode);
+
+	*size_seen = size;
 
 	if (cache_mask || !fc->dlm || !fc->writeback_cache ||
 	    !S_ISREG(inode->i_mode))
@@ -421,11 +559,36 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 		cache_mask |= STATX_MTIME | STATX_CTIME;
 
 	if (have_size && size > (loff_t) attr->size &&
-	    fuse_dlm_lock_is_held(fi, attr->size, size - attr->size,
-				  FUSE_PAGE_LOCK_WRITE))
+	    fuse_dlm_lock_is_held(fi, size - 1, 1, FUSE_PAGE_LOCK_WRITE))
 		cache_mask |= STATX_SIZE;
 
 	return cache_mask;
+}
+
+/*
+ * Whether a cached time stamp stays over the one the server reported.
+ *
+ * Without dlm the kernel owns the stamps of a writeback inode and the
+ * server's are ignored.  With dlm the cached stamp is kept only while the
+ * page cache is dirty, because the local writes set it and the server has
+ * not seen them.  That makes it a placeholder, not an authority: a later
+ * stamp from the server records a modification the server did see, our own
+ * earlier writeback or another node's write, and stat() has to report it.
+ * The dirty data stamps again when it is written back.
+ */
+static bool fuse_cached_time_wins(struct fuse_conn *fc,
+				  const struct timespec64 *cached,
+				  u64 sec, u32 nsec, bool have)
+{
+	struct timespec64 reported = {
+		.tv_sec = sec,
+		.tv_nsec = min_t(u32, nsec, NSEC_PER_SEC - 1),
+	};
+
+	if (!fc->dlm || !have)
+		return true;
+
+	return timespec64_compare(cached, &reported) >= 0;
 }
 
 static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr,
@@ -437,24 +600,48 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	u32 cache_mask;
 	loff_t oldsize;
 	struct timespec64 old_mtime;
+	loff_t size_seen;
 	bool have_size = !sx || (sx->mask & STATX_SIZE);
-	u64 srv_size;
+	bool have_mtime = !sx || (sx->mask & STATX_MTIME);
+	bool have_ctime = !sx || (sx->mask & STATX_CTIME);
 
-	cache_mask = fuse_attr_cache_mask(inode, attr, have_size);
+	cache_mask = fuse_attr_cache_mask(inode, attr, have_size, &size_seen);
 
 	spin_lock(&fi->lock);
-	srv_size = attr->size;
-
+	/*
+	 * The size decision was made on a snapshot of i_size taken outside
+	 * fi->lock.  A write claiming an extension since holds a grant the
+	 * snapshot did not see, and the server's answer predates that claim,
+	 * so it cannot shrink i_size past it: keep the cached size and let
+	 * the next reply decide against the new i_size.
+	 */
+	if (have_size && !(cache_mask & STATX_SIZE) &&
+	    inode->i_size != size_seen)
+		cache_mask |= STATX_SIZE;
 	if (cache_mask & STATX_SIZE)
 		attr->size = i_size_read(inode);
 
 	if (cache_mask & STATX_MTIME) {
-		attr->mtime = inode_get_mtime_sec(inode);
-		attr->mtimensec = inode_get_mtime_nsec(inode);
+		struct timespec64 cached = inode_get_mtime(inode);
+
+		if (fuse_cached_time_wins(fc, &cached, attr->mtime,
+					  attr->mtimensec, have_mtime)) {
+			attr->mtime = cached.tv_sec;
+			attr->mtimensec = cached.tv_nsec;
+		} else {
+			cache_mask &= ~STATX_MTIME;
+		}
 	}
 	if (cache_mask & STATX_CTIME) {
-		attr->ctime = inode_get_ctime_sec(inode);
-		attr->ctimensec = inode_get_ctime_nsec(inode);
+		struct timespec64 cached = inode_get_ctime(inode);
+
+		if (fuse_cached_time_wins(fc, &cached, attr->ctime,
+					  attr->ctimensec, have_ctime)) {
+			attr->ctime = cached.tv_sec;
+			attr->ctimensec = cached.tv_nsec;
+		} else {
+			cache_mask &= ~STATX_CTIME;
+		}
 	}
 
 	if ((attr_version != 0 && fi->attr_version > attr_version) ||
@@ -462,19 +649,6 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 		spin_unlock(&fi->lock);
 		return;
 	}
-
-	/*
-	 * srv_size is the size the server reported before the writeback
-	 * cache_mask above replaced attr->size with the local value.  It
-	 * bounds how far the server can hold data, letting the iomap write
-	 * path zero-fill expansion read-modify-writes instead of sending
-	 * READ requests, see fuse_iomap_read_folio_range().  Only ever grow
-	 * it here: stale attributes were rejected above and truncation
-	 * lowers it directly.
-	 */
-	if (have_size && S_ISREG(inode->i_mode) &&
-	    (loff_t) srv_size > fi->server_size)
-		fi->server_size = srv_size;
 
 	old_mtime = inode_get_mtime(inode);
 	fuse_change_attributes_common(inode, attr, sx, attr_valid, cache_mask,
@@ -485,8 +659,9 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	 * In case of writeback_cache enabled, the cached writes beyond EOF
 	 * extend local i_size without keeping userspace server in sync. So,
 	 * attr->size coming from server can be stale. We cannot trust it.
+	 * Only update i_size if SIZE was actually returned by the server.
 	 */
-	if (!(cache_mask & STATX_SIZE))
+	if (have_size && !(cache_mask & STATX_SIZE))
 		i_size_write(inode, attr->size);
 	spin_unlock(&fi->lock);
 
@@ -503,11 +678,11 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	if (!(cache_mask & STATX_SIZE) && S_ISREG(inode->i_mode)) {
 		bool inval = false;
 
-		if (oldsize != attr->size) {
+		if (have_size && oldsize != attr->size) {
 			truncate_pagecache(inode, attr->size);
 			if (!fc->explicit_inval_data)
 				inval = true;
-		} else if (fc->auto_inval_data) {
+		} else if (have_mtime && fc->auto_inval_data) {
 			struct timespec64 new_mtime = {
 				.tv_sec = attr->mtime,
 				.tv_nsec = attr->mtimensec,
@@ -596,6 +771,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
 	struct inode *inode;
 	struct fuse_inode *fi;
 	struct fuse_conn *fc = get_fuse_conn_super(sb);
+	bool is_new_inode = false;
 
 	/*
 	 * Auto mount points get their node id from the submount root, which is
@@ -631,13 +807,13 @@ retry:
 	if (!inode)
 		return NULL;
 
-	if ((inode_state_read_once(inode) & I_NEW)) {
+	is_new_inode = inode_state_read_once(inode) & I_NEW;
+	if (is_new_inode) {
 		inode->i_flags |= S_NOATIME;
 		if (!fc->writeback_cache || !S_ISREG(attr->mode))
 			inode->i_flags |= S_NOCMTIME;
 		inode->i_generation = generation;
 		fuse_init_inode(inode, attr, fc);
-		unlock_new_inode(inode);
 	} else if (fuse_stale_inode(inode, generation, attr)) {
 		/* nodeid was reused, any I/O on the old inode should fail */
 		fuse_make_bad(inode);
@@ -654,6 +830,8 @@ retry:
 done:
 	fuse_change_attributes_i(inode, attr, NULL, attr_valid, attr_version,
 				 evict_ctr);
+	if (is_new_inode)
+		unlock_new_inode(inode);
 	return inode;
 }
 
@@ -766,48 +944,16 @@ static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
 	fuse_dlm_unlock_range(fi, start, end);
 }
 
-/*
- * Drop a page-cache range on behalf of a NOTIFY invalidate.
- *
- * invalidate_inode_pages2_range() waits out folios under writeback and
- * launders dirty ones, both of which need a FUSE_WRITE reply.  While
- * writepages are frozen (fuse_set_nowrite(): truncate, O_TRUNC open, fsync,
- * pre-SETATTR flush) no reply can arrive, because fuse_flush_writepages()
- * parks the request on fi->queued_writes until fuse_release_nowrite().  A
- * server that revokes from inside the handler it is revoking for then
- * deadlocks against its own reply.  fuse_do_setattr() states the same rule
- * for its own invalidate.
- *
- * So while frozen use invalidate_mapping_pages(), which skips dirty and
- * under-writeback folios and never blocks.  The stale clean folios still
- * go, and the freezes that span a request drop the cache themselves once
- * they complete: fuse_do_setattr() invalidates the mapping after releasing
- * the freeze, the O_TRUNC open path calls truncate_pagecache().
- */
-static void fuse_notify_invalidate_range(struct inode *inode, pgoff_t start,
-					 pgoff_t end)
-{
-	struct fuse_inode *fi = get_fuse_inode(inode);
-	bool frozen;
-
-	spin_lock(&fi->lock);
-	frozen = fi->writectr < 0;
-	spin_unlock(&fi->lock);
-
-	if (frozen)
-		invalidate_mapping_pages(inode->i_mapping, start, end);
-	else
-		invalidate_inode_pages2_range(inode->i_mapping, start, end);
-}
-
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len)
 {
-	struct percpu_rw_semaphore *wb_sem = NULL;
+	struct fuse_range_lock rlock;
 	struct fuse_inode *fi;
 	struct inode *inode;
 	pgoff_t pg_start;
 	pgoff_t pg_end;
+	uint64_t lock_start;
+	uint64_t lock_end;
 
 	inode = fuse_ilookup(fc, nodeid, NULL);
 	if (!inode)
@@ -824,7 +970,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	spin_unlock(&fi->lock);
-	
+
 	if (fc->inval_inode_entries)
 		fuse_invalidate_inode_entry(inode);
 	else if (fc->expire_inode_entries)
@@ -834,6 +980,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	forget_all_cached_acls(inode);
 	security_inode_invalidate_secctx(inode);
 	if (offset >= 0) {
+		bool range_locked = S_ISREG(inode->i_mode) &&
+				   fc->writeback_cache && fc->dlm;
+		bool hot = false, has_writer = false, latched = false;
+		bool track_latch;
+
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)
 			pg_end = -1;
@@ -841,23 +992,22 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
 
 		/*
-		 * A data invalidation means another (remote) entity is modifying
-		 * the file.  Two things happen here:
+		 * A data invalidation means another (remote) entity is
+		 * modifying the file.  Two things happen here:
 		 *
-		 * 1. Coherency.  Drop the affected page-cache range so no local
-		 *    read returns a folio the remote modify has superseded.  This
-		 *    runs under the write side of the per-inode coherency gate
-		 *    (wb_inval_rwsem), which fences cache-serving buffered reads
-		 *    and buffered writes out for the whole invalidate.  Unlike the
-		 *    old best-effort trylock this BLOCKS -- the notify has
-		 *    priority: percpu_down_write() parks new gate readers, drains
-		 *    in-flight ones, then invalidates.  A blocking writer here is
-		 *    safe only under a server that services request replies on
-		 *    threads other than the one delivering this notify: the write
-		 *    side waits for gate readers to drain, and a cache-miss read
-		 *    holds the read side across its FUSE_READ round-trip.  redfs'
-		 *    dlm server provides that contract; a server that cannot must
-		 *    not enable writeback+dlm.
+		 * 1. Coherency.  Drop the affected page-cache range so no
+		 *    local read returns a folio the remote modify has
+		 *    superseded.  fuse_range_lock_acquire_locked() blocks
+		 *    only on an overlapping range already in LOCKED state --
+		 *    i.e. one actually touching, or about to touch, the page
+		 *    cache -- and ignores one still in INIT state, i.e. a
+		 *    cached read/write that has only reserved the range
+		 *    while its (possibly unbounded, cluster round trip) DLM
+		 *    request is in flight; see fuse_range_lock.h.  This
+		 *    invalidate is thus never parked behind such a request.
+		 *    Once acquired, the range lock fences overlapping cached
+		 *    reads/writes out for the DLM revoke and page drop
+		 *    below.
 		 *
 		 * 2. Latch.  Keep a moving average (fuse_notify_inval_hot(), under
 		 *    fi->lock, updated for every data invalidation) of how fast
@@ -875,45 +1025,32 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 *    already-latched inodes run out on the usual exits (last
 		 *    writer closes, or mmap).
 		 *
-		 * The gate (and the average) exist only for writeback+dlm regular
-		 * files; elsewhere wb_sem is NULL and the invalidate runs
-		 * unserialized (best-effort), as before.  An mmapped inode
-		 * keeps the gate -- fuse_cache_read_iter() and
-		 * fuse_cache_write_iter() enter it unconditionally and rely
-		 * on the revoke staying fenced -- but is never latched:
-		 * a mapping needs the page cache, and fuse_file_mmap()
-		 * reverts any latch it races with.
+		 * The average and latch exist only for writeback+dlm regular
+		 * files; elsewhere the invalidate just drops the range
+		 * (best-effort), as before.  An mmapped inode is never
+		 * latched: a mapping needs the page cache, and
+		 * fuse_file_mmap() reverts any latch it races with.
 		 */
-		if (S_ISREG(inode->i_mode) && fc->writeback_cache &&
-		    fc->dlm && !FUSE_IS_DAX(inode) &&
-		    !fuse_inode_backing(fi))
-			wb_sem = fi->wb_inval_rwsem;
+		if (range_locked) {
+			lock_start = offset;
+			lock_end = len <= 0 ? ~0ULL : (uint64_t)offset + len - 1;
 
-		if (wb_sem) {
-			bool hot, has_writer, latched = false;
+			fuse_range_lock_acquire_locked(fi, &rlock, lock_start,
+						       lock_end,
+						       FUSE_RANGE_LOCK_WRITE);
+		}
 
+		if (fc->dlm && fc->writeback_cache)
+			fuse_dlm_revoke_inval_range(fi, offset, len);
+
+		track_latch = S_ISREG(inode->i_mode) && fc->writeback_cache &&
+			      fc->dlm && !FUSE_IS_DAX(inode) &&
+			      !fuse_inode_backing(fi);
+		if (track_latch) {
 			spin_lock(&fi->lock);
 			hot = fuse_notify_inval_hot(fi);
 			has_writer = !list_empty(&fi->write_files);
 			spin_unlock(&fi->lock);
-
-			/*
-			 * Priority write side: park new gate readers,
-			 * drain in-flight ones, then invalidate.  Blocks
-			 * (unlike the old trylock) -- see the contract in
-			 * the comment above.
-			 */
-			percpu_down_write(wb_sem);
-
-			/*
-			 * Revoke the DLM lock range under the gate write
-			 * side, atomically with the page drop: gate readers
-			 * re-validate their grant right after entering, and
-			 * a grant that passed that check must stay visible
-			 * for their whole gate hold.
-			 */
-			if (fc->dlm && fc->writeback_cache)
-				fuse_dlm_revoke_inval_range(fi, offset, len);
 
 			if (enable_notify_dio && hot && has_writer &&
 			    !mapping_mapped(inode->i_mapping) &&
@@ -925,32 +1062,26 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				}
 				spin_unlock(&fi->lock);
 			}
-
-			/*
-			 * Latched: drop the whole mapping (dirty folios
-			 * outside the notified range would be invisible to
-			 * the forced direct reads).  Otherwise just the
-			 * notified range.
-			 */
-			if (fuse_inode_force_dio(inode))
-				fuse_notify_invalidate_range(inode, 0, -1);
-			else
-				fuse_notify_invalidate_range(inode, pg_start,
-							     pg_end);
-
-			percpu_up_write(wb_sem);
-
-			if (latched)
-				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
-						    nodeid);
-		} else {
-			/* No gate on this inode (DAX, backing, non-regular,
-			 * or the gate allocation failed): drop the lock
-			 * range unserialized (best-effort), as before. */
-			if (fc->dlm && fc->writeback_cache)
-				fuse_dlm_revoke_inval_range(fi, offset, len);
-			fuse_notify_invalidate_range(inode, pg_start, pg_end);
 		}
+
+		/*
+		 * Latched: drop the whole mapping (dirty folios
+		 * outside the notified range would be invisible to
+		 * the forced direct reads).  Otherwise just the
+		 * notified range.
+		 */
+		if (fuse_inode_force_dio(inode))
+			invalidate_inode_pages2_range(inode->i_mapping, 0, -1);
+		else
+			invalidate_inode_pages2_range(inode->i_mapping,
+						      pg_start, pg_end);
+
+		if (latched)
+			pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
+					    nodeid);
+
+		if (range_locked)
+			fuse_range_lock_release(fi, &rlock);
 	}
 	iput(inode);
 	return 0;
@@ -1364,6 +1495,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->initialized = 0;
 	fc->connected = 1;
 	fc->dlm = 1;
+	fc->lookupx = 1;
 
 	/* module option for now */
 	fc->compound_open_getattr = enable_compound;
@@ -1821,6 +1953,14 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->passthrough = 1;
 				fc->max_stack_depth = arg->max_stack_depth;
 				fm->sb->s_stack_depth = arg->max_stack_depth;
+			}
+
+			if (flags & FUSE_ALIGN_PG_ORDER) {
+				if (arg->align_page_order > 0) {
+					fc->alignment_pages =
+					(1UL << arg->align_page_order)
+					>> PAGE_SHIFT;
+				}
 			}
 			if (flags & FUSE_NO_EXPORT_SUPPORT)
 				fm->sb->s_export_op = &fuse_export_fid_operations;

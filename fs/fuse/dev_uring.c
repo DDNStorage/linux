@@ -12,6 +12,7 @@
 #include <linux/fs.h>
 #include <linux/io_uring/cmd.h>
 #include <linux/page-flags.h>
+#include <linux/task_work.h>
 
 static bool __read_mostly enable_uring;
 module_param(enable_uring, bool, 0644);
@@ -27,7 +28,6 @@ MODULE_PARM_DESC(enable_uring,
 
 /* Number of (re)tries to find a better queue */
 #define FUSE_URING_Q_TRIES 3
-
 
 bool fuse_uring_enabled(void)
 {
@@ -85,8 +85,8 @@ static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
 	}
 }
 
-static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
-			       int error)
+static void __fuse_uring_req_end(struct fuse_ring_ent *ent,
+				 struct fuse_req *req, int error)
 {
 	struct fuse_ring_queue *queue = ent->queue;
 	struct fuse_ring *ring = queue->ring;
@@ -109,6 +109,43 @@ static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
 		req->out.h.error = error;
 
 	clear_bit(FR_SENT, &req->flags);
+}
+
+static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
+			       int error)
+{
+	__fuse_uring_req_end(ent, req, error);
+	fuse_request_end(req);
+}
+
+static void fuse_uring_req_end_work(struct callback_head *work)
+{
+	struct fuse_req *req = container_of(work, struct fuse_req,
+					    ring_end_work);
+
+	fuse_request_end(req);
+}
+
+/*
+ * On the commit path ->uring_cmd() runs with ctx->uring_lock held by
+ * io_uring_enter(). fuse_request_end() wakes the request submitter, which
+ * typically preempts the ring task right away (same CPU) - while the mutex
+ * is still held. Defer the completion to task work, which runs once the
+ * submission path has released the lock (in io_cqring_wait() or on return
+ * to userspace), so the ring task can finish its critical section first.
+ */
+static void fuse_uring_req_end_deferred(struct fuse_ring_ent *ent,
+					struct fuse_req *req, int error,
+					unsigned int issue_flags)
+{
+	__fuse_uring_req_end(ent, req, error);
+
+	if (!(issue_flags & IO_URING_F_UNLOCKED)) {
+		init_task_work(&req->ring_end_work, fuse_uring_req_end_work);
+		if (!task_work_add(current, &req->ring_end_work, TWA_RESUME))
+			return;
+	}
+
 	fuse_request_end(req);
 }
 
@@ -153,41 +190,6 @@ void fuse_uring_flush_bg(struct fuse_conn *fc)
 	}
 }
 
-/*
- * Copy from memmap.c, should be exported
- */
-static void io_pages_free(struct page ***pages, int npages)
-{
-	struct page **page_array = *pages;
-
-	if (!page_array)
-		return;
-
-	unpin_user_pages(page_array, npages);
-	kvfree(page_array);
-	*pages = NULL;
-}
-
-
-static void fuse_ring_destruct_q_map(struct fuse_queue_map *q_map)
-{
-	free_cpumask_var(q_map->registered_q_mask);
-	kfree(q_map->cpu_to_qid);
-}
-
-static void fuse_uring_destruct_q_masks(struct fuse_ring *ring)
-{
-	int node;
-
-	fuse_ring_destruct_q_map(&ring->q_map);
-
-	if (ring->numa_q_map) {
-		for (node = 0; node < ring->nr_numa_nodes; node++)
-			fuse_ring_destruct_q_map(&ring->numa_q_map[node]);
-		kfree(ring->numa_q_map);
-	}
-}
-
 static bool ent_list_request_expired(struct fuse_conn *fc, struct list_head *list)
 {
 	struct fuse_ring_ent *ent;
@@ -229,6 +231,40 @@ bool fuse_uring_request_expired(struct fuse_conn *fc)
 	}
 
 	return false;
+}
+
+/*
+ * Copy from memmap.c, should be exported
+ */
+static void io_pages_free(struct page ***pages, int npages)
+{
+	struct page **page_array = *pages;
+
+	if (!page_array)
+		return;
+
+	unpin_user_pages(page_array, npages);
+	kvfree(page_array);
+	*pages = NULL;
+}
+
+static void fuse_ring_destruct_q_map(struct fuse_queue_map *q_map)
+{
+	free_cpumask_var(q_map->registered_q_mask);
+	kfree(q_map->cpu_to_qid);
+}
+
+static void fuse_uring_destruct_q_masks(struct fuse_ring *ring)
+{
+	int node;
+
+	fuse_ring_destruct_q_map(&ring->q_map);
+
+	if (ring->numa_q_map) {
+		for (node = 0; node < ring->nr_numa_nodes; node++)
+			fuse_ring_destruct_q_map(&ring->numa_q_map[node]);
+		kfree(ring->numa_q_map);
+	}
 }
 
 void fuse_uring_destruct(struct fuse_conn *fc)
@@ -323,8 +359,8 @@ static struct fuse_ring *fuse_uring_create(struct fuse_conn *fc)
 
 	ring->nr_numa_nodes = num_online_nodes();
 
-	ring->queues = kcalloc(nr_queues, sizeof(struct fuse_ring_queue *),
-		       GFP_KERNEL_ACCOUNT);
+	ring->queues = kzalloc_objs(struct fuse_ring_queue *, nr_queues,
+				    GFP_KERNEL_ACCOUNT);
 	if (!ring->queues)
 		goto out_err;
 
@@ -849,7 +885,6 @@ static int fuse_uring_args_to_ring(struct fuse_ring *ring, struct fuse_req *req,
 	/* copy the payload */
 	err = fuse_copy_args(&cs, num_args, args->in_pages,
 			     (struct fuse_arg *)in_args, 0);
-	fuse_copy_finish(&cs);
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
 		goto copy_finish;
@@ -921,6 +956,21 @@ static int fuse_uring_prepare_send(struct fuse_ring_ent *ent,
 	return err;
 }
 
+static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
+			    ssize_t ret, unsigned int issue_flags)
+{
+	struct fuse_ring_queue *queue = ent->queue;
+
+	spin_lock(&queue->lock);
+	ent->state = FRRS_USERSPACE;
+	list_move_tail(&ent->list, &queue->ent_in_userspace);
+	ent->cmd = NULL;
+	spin_unlock(&queue->lock);
+
+	trace_fuse_request_send(ent->fuse_req);
+	io_uring_cmd_done(cmd, ret, issue_flags);
+}
+
 /*
  * Write data to the ring buffer and send the request to userspace,
  * userspace will read it
@@ -930,22 +980,13 @@ static int fuse_uring_send_next_to_ring(struct fuse_ring_ent *ent,
 					struct fuse_req *req,
 					unsigned int issue_flags)
 {
-	struct fuse_ring_queue *queue = ent->queue;
 	int err;
-	struct io_uring_cmd *cmd;
 
 	err = fuse_uring_prepare_send(ent, req);
 	if (err)
 		return err;
 
-	spin_lock(&queue->lock);
-	cmd = ent->cmd;
-	ent->cmd = NULL;
-	ent->state = FRRS_USERSPACE;
-	list_move_tail(&ent->list, &queue->ent_in_userspace);
-	spin_unlock(&queue->lock);
-
-	io_uring_cmd_done(cmd, 0, issue_flags);
+	fuse_uring_send(ent, ent->cmd, 0, issue_flags);
 	return 0;
 }
 
@@ -1041,7 +1082,7 @@ static void fuse_uring_commit(struct fuse_ring_ent *ent, struct fuse_req *req,
 
 	err = fuse_uring_copy_from_ring(ring, req, ent);
 out:
-	fuse_uring_req_end(ent, req, err);
+	fuse_uring_req_end_deferred(ent, req, err, issue_flags);
 }
 
 /*
@@ -1459,21 +1500,6 @@ int fuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	return -EIOCBQUEUED;
 }
 
-static void fuse_uring_send(struct fuse_ring_ent *ent, struct io_uring_cmd *cmd,
-			    ssize_t ret, unsigned int issue_flags)
-{
-	struct fuse_ring_queue *queue = ent->queue;
-
-	spin_lock(&queue->lock);
-	ent->state = FRRS_USERSPACE;
-	list_move_tail(&ent->list, &queue->ent_in_userspace);
-	ent->cmd = NULL;
-	spin_unlock(&queue->lock);
-
-	trace_fuse_request_send(ent->fuse_req);
-	io_uring_cmd_done(cmd, ret, issue_flags);
-}
-
 /*
  * This prepares and sends the ring request in fuse-uring task context.
  * User buffers are not mapped yet - the application does not have permission
@@ -1496,6 +1522,28 @@ static void fuse_uring_send_in_task(struct io_tw_req tw_req, io_tw_token_t tw)
 	} else {
 		err = -ECANCELED;
 	}
+
+	fuse_uring_send(ent, cmd, err, issue_flags);
+}
+
+/*
+ * The request was already copied to the ring buffer in the submitter's
+ * context, only the io_uring cmd completion is left to do.
+ * io_uring_cmd_done() must not run in the submitter's context as it would
+ * have to take ctx->uring_lock (io_uring_cmd_del_cancelable()) - a mutex
+ * the ring task holds across its whole submission path and frequently gets
+ * preempted under while the just-woken submitter runs.
+ */
+static void fuse_uring_send_prepared_in_task(struct io_tw_req tw_req,
+					     io_tw_token_t tw)
+{
+	unsigned int issue_flags = IO_URING_CMD_TASK_WORK_ISSUE_FLAGS;
+	struct io_uring_cmd *cmd = io_uring_cmd_from_tw(tw_req);
+	struct fuse_ring_ent *ent = uring_cmd_to_ring_ent(cmd);
+	int err = 0;
+
+	if (unlikely(tw.cancel))
+		err = -ECANCELED;
 
 	fuse_uring_send(ent, cmd, err, issue_flags);
 }
@@ -1599,7 +1647,9 @@ static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg)
 						 IO_URING_F_UNLOCKED);
 			return;
 		}
-		fuse_uring_send(ent, cmd, 0, IO_URING_F_UNLOCKED);
+		uring_cmd_set_ring_ent(cmd, ent);
+		io_uring_cmd_complete_in_task(cmd,
+					      fuse_uring_send_prepared_in_task);
 	}
 }
 

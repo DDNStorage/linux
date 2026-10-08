@@ -461,6 +461,8 @@ struct fuse_file_lock {
  *			 init_out.request_timeout contains the timeout (in secs)
  * FUSE_INVAL_INODE_ENTRY: invalidate inode aliases when doing inode invalidation
  * FUSE_EXPIRE_INODE_ENTRY: expire inode aliases when doing inode invalidation
+ * FUSE_ALIGN_PG_ORDER: page order (power of 2 exponent for number of pages) for
+ *			optimal io-size alignment
  * FUSE_URING_REDUCED_Q: Client (kernel) supports less queues - Server is free
  *			 to register between 1 and nr-core io-uring queues
  * FUSE_SETATTR_WRITEBACK: kernel marks writeback-initiated SETATTR requests
@@ -611,6 +613,14 @@ struct fuse_file_lock {
 #define FUSE_OPEN_KILL_SUIDGID	(1 << 0)
 
 /**
+ * Lookup flags
+ * FUSE_LOOKUPX_FOR_REVALIDATE: lookup called from revalidate
+ * FUSE_LOOKUPX_TARGET_WASDIR: (hint) the lookup target was a directory
+ */
+#define FUSE_LOOKUPX_FOR_REVALIDATE (1 << 0)
+#define FUSE_LOOKUPX_TARGET_WAS_DIR (1 << 1)
+
+/**
  * setxattr flags
  * FUSE_SETXATTR_ACL_KILL_SGID: Clear SGID when system.posix_acl_access is set
  */
@@ -696,6 +706,9 @@ enum fuse_opcode {
 	 */
 	FUSE_COMPOUND		= 101,
 
+	/* Extented lookup operation */
+	FUSE_LOOKUPX		= 102,
+
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
 
@@ -730,6 +743,15 @@ struct fuse_entry_out {
 	uint32_t	entry_valid_nsec;
 	uint32_t	attr_valid_nsec;
 	struct fuse_attr attr;
+};
+
+struct fuse_lookupx_in {
+	uint32_t	lookup_flags;
+};
+
+struct fuse_lookupx_out {
+	struct fuse_entry_out	entry;
+	uint32_t		mask;	/* Mask of valid attributes in statx format */
 };
 
 struct fuse_forget_in {
@@ -943,6 +965,9 @@ struct fuse_init_in {
 #define FUSE_COMPAT_INIT_OUT_SIZE 8
 #define FUSE_COMPAT_22_INIT_OUT_SIZE 24
 
+/*
+ * align_page_order: Number of pages for optimal IO, or a multiple of that
+ */
 struct fuse_init_out {
 	uint32_t	major;
 	uint32_t	minor;
@@ -957,7 +982,9 @@ struct fuse_init_out {
 	uint32_t	flags2;
 	uint32_t	max_stack_depth;
 	uint16_t	request_timeout;
-	uint16_t	unused[11];
+	uint8_t		align_page_order;
+	uint8_t		padding;
+	uint16_t	unused[10];
 };
 
 #define CUSE_INIT_INFO_MAX 4096

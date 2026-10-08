@@ -231,10 +231,6 @@ static inline bool fuse_uring_request_expired(struct fuse_conn *fc)
 	return false;
 }
 
-static inline bool fuse_uring_request_expired(struct fuse_conn *fc)
-{
-}
-
 static inline void fuse_uring_flush_bg(struct fuse_conn *fc)
 {
 }
