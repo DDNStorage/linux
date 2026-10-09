@@ -1324,9 +1324,11 @@ static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, ui
  * @param sx_mask request mask send to to fuse-server
  * @param mandatory_sx_mask subset of (or complete) sx_mask that the server
  * has to fulfill
+ * @param srv_size where to report the size the server sent, or NULL
 */
 static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
-			 struct file *file, struct kstat *stat, u32 sx_mask, u32 mandatory_sx_mask)
+			 struct file *file, struct kstat *stat, u32 sx_mask,
+			 u32 mandatory_sx_mask, loff_t *srv_size)
 {
 	int err;
 	struct fuse_attr attr;
@@ -1389,6 +1391,14 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 		return -EIO;
 	}
 
+	/*
+	 * Before fuse_change_attributes(), which rewrites attr->size to the
+	 * cached one where that wins and drops the reply where an update
+	 * landing since has overtaken it.
+	 */
+	if (srv_size && (sx->mask & STATX_SIZE))
+		*srv_size = sx->size;
+
 	fuse_statx_to_attr(&outarg.stat, &attr);
 	if (sx->mask & STATX_BASIC_STATS) {
 		fuse_change_attributes(inode, &attr, &outarg.stat,
@@ -1407,7 +1417,8 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 }
 
 static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
-			   struct kstat *stat, struct file *file)
+			   struct kstat *stat, struct file *file,
+			   loff_t *srv_size)
 {
 	int err;
 	struct fuse_getattr_in inarg;
@@ -1435,6 +1446,9 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 			fuse_make_bad(inode);
 			err = -EIO;
 		} else {
+			/* before fuse_change_attributes() rewrites it */
+			if (srv_size)
+				*srv_size = outarg.attr.size;
 			fuse_change_attributes(inode, &outarg.attr, NULL,
 					       ATTR_TIMEOUT(&outarg),
 					       attr_version);
@@ -1447,7 +1461,8 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 
 static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
 				struct file *file, struct kstat *stat,
-				u32 request_mask, unsigned int flags)
+				u32 request_mask, unsigned int flags,
+				loff_t *srv_size)
 {
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1479,14 +1494,15 @@ retry:
 		forget_all_cached_acls(inode);
 		if (!fc->no_statx) {
 			err = fuse_do_statx(idmap, inode, file, stat, sx_mask,
-					    mandatory_sx_mask);
+					    mandatory_sx_mask, srv_size);
 			if (err == -ENOSYS) {
 				fc->no_statx = 1;
 				err = 0;
 				goto retry;
 			}
 		} else {
-			err = fuse_do_getattr(idmap, inode, stat, file);
+			err = fuse_do_getattr(idmap, inode, stat, file,
+					      srv_size);
 		}
 	} else if (stat) {
 		generic_fillattr(idmap, sx_mask, inode, stat);
@@ -1504,7 +1520,44 @@ retry:
 
 int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
 {
-	return fuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL, mask, 0);
+	return fuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL, mask, 0,
+				    NULL);
+}
+
+/*
+ * Ask the server, whatever the attribute cache says, and take a size beyond
+ * i_size from the reply.  fuse_change_attributes() returns without applying
+ * a reply that an update landing since has overtaken, so the call returning
+ * is no statement about i_size, and a caller resolving EOF against it would
+ * report EOF over bytes that are there.  A larger size is a lower bound on
+ * the file: only a truncate racing the request makes it stale, and its own
+ * reply corrects that.  A smaller one is the cache's to keep where unwritten
+ * data is behind it, and stays with fuse_change_attributes().  The version
+ * bump keeps a short read answered before the growth from shrinking it back.
+ *
+ * For attributes the timeout cannot speak for, see fuse_size_needs_server().
+ */
+int fuse_update_attributes_sync(struct inode *inode, struct file *file,
+				u32 mask)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t size = 0;
+	int err;
+
+	err = fuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL, mask,
+				   AT_STATX_FORCE_SYNC, &size);
+	if (err || !(mask & STATX_SIZE))
+		return err;
+
+	spin_lock(&fi->lock);
+	if (size > inode->i_size) {
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
+		i_size_write(inode, size);
+	}
+	spin_unlock(&fi->lock);
+
+	return 0;
 }
 
 int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
@@ -1657,7 +1710,7 @@ static int fuse_perm_getattr(struct inode *inode, int mask, int perm_mask)
 
 	forget_all_cached_acls(inode);
 	return fuse_update_get_attr(&nop_mnt_idmap, inode, NULL, NULL, perm_mask,
-				    AT_STATX_FORCE_SYNC);
+				    AT_STATX_FORCE_SYNC, NULL);
 }
 
 /*
@@ -2040,6 +2093,12 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
 		inarg.valid |= FATTR_FH;
 		inarg.fh = ff->fh;
 	}
+	/*
+	 * This is ->write_inode() flushing times the kernel owns locally, not
+	 * a userspace utimes(); let the server tell the two apart.
+	 */
+	if (fm->fc->setattr_writeback)
+		inarg.valid |= FATTR_WRITEBACK;
 	fuse_setattr_fill(fm->fc, &args, inode, &inarg, &outarg);
 
 	return fuse_simple_request(fm, &args);
@@ -2100,18 +2159,41 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		WARN_ON(!(attr->ia_valid & ATTR_SIZE));
 		WARN_ON(attr->ia_size != 0);
 		if (fc->atomic_o_trunc) {
+			struct fuse_range_lock rlock;
+			bool range_locked = fc->writeback_cache && fc->dlm;
+
 			/*
 			 * No need to send request to userspace, since actual
 			 * truncation has already been done by OPEN.  But still
 			 * need to truncate page cache.
+			 *
+			 * Revoke and drop under the full-range IO range lock,
+			 * like the NOTIFY invalidate path
+			 * (fuse_reverse_inval_inode()): a reader/writer that
+			 * already reached LOCKED state must not have the lock
+			 * tree and the cache yanked mid-hold, or it would
+			 * repopulate the truncated range trusting a grant that
+			 * no longer exists.  fuse_range_lock_acquire_locked()
+			 * ignores an overlapping INIT range (a read/write with
+			 * only a DLM request in flight), so waiting here is
+			 * bounded.  Blocking is also safe: we hold i_rwsem
+			 * exclusive, so no cached writer can be waiting on this
+			 * range lock (the write path takes i_rwsem before it,
+			 * the read path never takes i_rwsem at all).  Only
+			 * meaningful under DLM with the writeback cache; see
+			 * fuse_range_lock.h.
 			 */
+			if (range_locked)
+				fuse_range_lock_acquire_locked(fi, &rlock, 0, ~0ULL,
+							       FUSE_RANGE_LOCK_WRITE);
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_cache_release_locks(fi);
 			spin_lock(&fi->lock);
-			fi->server_size = 0;
 			i_size_write(inode, 0);
 			spin_unlock(&fi->lock);
 			truncate_pagecache(inode, 0);
+			if (range_locked)
+				fuse_range_lock_release(fi, &rlock);
 			goto out;
 		}
 		file = NULL;
@@ -2125,13 +2207,22 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		err = write_inode_now(inode, true);
 		if (err)
 			return err;
+	}
 
-		fuse_set_nowrite(inode);
-		fuse_release_nowrite(inode);
+	/*
+	 * Write dirty folios back before a truncating SETATTR, like the
+	 * atomic-O_TRUNC case in fuse_open(): under DLM the server's
+	 * truncate revokes this client's locks, and the invalidate that
+	 * follows would otherwise launder dirty folios with writes the
+	 * server holds behind the same truncate.
+	 */
+	if (is_truncate && is_wb && fc->dlm) {
+		err = filemap_write_and_wait(mapping);
+		if (err)
+			goto error;
 	}
 
 	if (is_truncate) {
-		fuse_set_nowrite(inode);
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 		if (trust_local_cmtime && attr->ia_size != inode->i_size)
 			attr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
@@ -2202,31 +2293,31 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	/* see the comment in fuse_change_attributes() */
 	if (!is_wb || is_truncate)
 		i_size_write(inode, outarg.attr.size);
-	/*
-	 * A truncate settles the size on the server; only shrink the
-	 * server-materialized bound: growing just exposes zeros, which the
-	 * bound need not cover (see fuse_iomap_read_folio_range()).
-	 */
-	if (is_truncate && (loff_t) outarg.attr.size < fi->server_size)
-		fi->server_size = outarg.attr.size;
 
-	if (is_truncate) {
-		/* NOTE: this may release/reacquire fi->lock */
-		__fuse_release_nowrite(inode);
-	}
 	spin_unlock(&fi->lock);
 
-	/*
-	 * Only call invalidate_inode_pages2() after removing
-	 * FUSE_NOWRITE, otherwise fuse_launder_folio() would deadlock.
-	 */
 	if ((is_truncate || !is_wb) &&
 	    S_ISREG(inode->i_mode) && oldsize != outarg.attr.size) {
+		struct fuse_range_lock rlock;
+		bool range_locked = fc->writeback_cache && fc->dlm;
+
+		/*
+		 * Revoke and drop under the full-range IO range lock; see
+		 * the atomic-O_TRUNC branch above.  i_rwsem is held
+		 * exclusive here as well (setattr), so waiting out
+		 * in-progress LOCKED IO cannot deadlock.  Only meaningful
+		 * under DLM with the writeback cache; see fuse_range_lock.h.
+		 */
+		if (range_locked)
+			fuse_range_lock_acquire_locked(fi, &rlock, 0, ~0ULL,
+						       FUSE_RANGE_LOCK_WRITE);
 		if (fc->dlm && fc->writeback_cache)
 			fuse_dlm_unlock_range(fi, outarg.attr.size & PAGE_MASK, -1);
 
 		truncate_pagecache(inode, outarg.attr.size);
 		invalidate_inode_pages2(mapping);
+		if (range_locked)
+			fuse_range_lock_release(fi, &rlock);
 	}
 
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
@@ -2237,9 +2328,6 @@ out:
 	return 0;
 
 error:
-	if (is_truncate)
-		fuse_release_nowrite(inode);
-
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
 	if (fault_blocked)
@@ -2276,7 +2364,7 @@ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
 			 * ia_mode calculation may have used stale i_mode.
 			 * Refresh and recalculate.
 			 */
-			ret = fuse_do_getattr(idmap, inode, NULL, file);
+			ret = fuse_do_getattr(idmap, inode, NULL, file, NULL);
 			if (ret)
 				return ret;
 
@@ -2333,7 +2421,8 @@ static int fuse_getattr(struct mnt_idmap *idmap,
 		return -EACCES;
 	}
 
-	return fuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags);
+	return fuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags,
+				    NULL);
 }
 
 static const struct inode_operations fuse_dir_inode_operations = {

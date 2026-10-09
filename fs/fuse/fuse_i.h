@@ -134,6 +134,22 @@ struct dlm_locked_area
 #define FUSE_NOTIFY_EWMA_SHIFT		2
 #define FUSE_NOTIFY_EWMA_SEED		(2 * FUSE_NOTIFY_DIO_INTERVAL)
 
+/*
+ * Streamed file trigger: the same buffer size arriving over and over is a
+ * writer working through a file a record at a time.  The sizes are folded into
+ * a rolling mean (an exponentially weighted moving average of weight 1/2^SHIFT,
+ * kept shifted), and a run of FUSE_WRITE_STREAM_RUN writes landing within
+ * 1/2^FUSE_WRITE_TOL_SHIFT of it says the writer is still on it.  The sample is
+ * capped to keep the shifted accumulator inside an unsigned int.
+ */
+#define FUSE_WRITE_EWMA_SHIFT		2
+#define FUSE_WRITE_TOL_SHIFT		3
+#define FUSE_WRITE_STREAM_RUN		4
+#define FUSE_WRITE_EWMA_MAX		(UINT_MAX >> FUSE_WRITE_EWMA_SHIFT)
+
+/* Under this size a record is not worth a write of its own */
+#define FUSE_WRITE_STREAM_MIN		(64 * 1024)
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -203,35 +219,6 @@ struct fuse_inode {
 			struct fuse_dlm_cache dlm_locked_areas;
 
 			/*
-			 * Server-materialized size: an upper bound for how far
-			 * the server holds file data.  Seeded from
-			 * server-reported attributes, advanced when the server
-			 * acknowledges data (writeback completion,
-			 * fuse_write_update_attr()), lowered again on
-			 * truncate.  A read-modify-write of a block starting
-			 * at or past this bound needs no READ request under a
-			 * held DLM write lock: the server has no data there
-			 * (see fuse_iomap_read_folio_range()).  Protected by
-			 * fi->lock.
-			 */
-			loff_t server_size;
-
-			/*
-			 * Serializes buffered-write page-cache dirtying against
-			 * the forced-direct-IO latch transition driven by
-			 * NOTIFY_INVAL_INODE (fuse_reverse_inval_inode()), which
-			 * may be delivered by the same server thread that still
-			 * owes a reply to an in-flight write holding the inode
-			 * lock.  The buffered writer holds this for read around
-			 * the dirtying and re-checks the latch under it; the
-			 * NOTIFY latch site takes it for write (trylock, never
-			 * blocking) around its page-cache invalidate + latch set.
-			 * Only regular files initialise it -- it shares storage
-			 * with the readdir-cache union arm.
-			 */
-			struct percpu_rw_semaphore *wb_inval_rwsem;
-
-			/*
 			 * Rate of FUSE_NOTIFY_INVAL_INODE data invalidations
 			 * for this whole file: notify_stamp is the jiffies of
 			 * the last one, notify_interval_ewma the EWMA of the
@@ -243,6 +230,28 @@ struct fuse_inode {
 			 */
 			unsigned long notify_stamp;
 			unsigned int notify_interval_ewma;
+
+			/*
+			 * Local byte-range lock tree, used to serialize
+			 * concurrent cached reads/writes that overlap, and to
+			 * let range-scoped invalidation (BRL/attr invalidation
+			 * notifications) block only on IO overlapping the
+			 * range being invalidated.
+			 */
+			struct fuse_range_lock_tree io_range_lock;
+
+			/*
+			 * The buffered writes of this inode, whatever
+			 * handle they come through: write_size_ewma is
+			 * the rolling mean of their sizes and
+			 * write_stream_run how many of the last ones
+			 * arrived at that size, which together say the
+			 * file is being streamed.  Hints only, read and
+			 * written without a lock; see
+			 * fuse_write_stream_update().
+			 */
+			unsigned int write_size_ewma;
+			unsigned int write_stream_run;
 		};
 
 		/* readdir cache (directory only) */
@@ -426,6 +435,23 @@ struct fuse_args {
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
+	/*
+	 * Called from fuse_request_end(), synchronously, on the thread
+	 * processing the reply -- before that thread sets FR_FINISHED, and
+	 * so while 'args' is still owned by the requester's stack frame,
+	 * before it wakes a requester blocked in request_wait_answer(),
+	 * runs any FR_BACKGROUND completion, or invokes 'end' above.
+	 * Unlike 'end' (gated on FR_ASYNC, and which for background
+	 * requests runs after the request has already been fully torn
+	 * down), 'complete' runs for every request that reaches
+	 * fuse_request_end(), synchronous or not, letting a caller do work
+	 * that must be visible before the requester resumes or the
+	 * reply-processing thread moves on to the next message -- e.g.
+	 * moving a range lock from INIT to READY as part of processing a
+	 * grant reply, instead of leaving that race window open until the
+	 * (possibly much later, descheduled) requester thread gets to run.
+	 */
+	void (*complete)(struct fuse_mount *fm, struct fuse_args *args, int error);
 	/* Used for kvec iter backed by vmalloc address */
 	void *vmap_base;
 };
@@ -489,7 +515,8 @@ struct fuse_io_priv {
  * FR_LOCKED:		data is being copied to/from the request
  * FR_PENDING:		request is not yet in userspace
  * FR_SENT:		request is in userspace, waiting for an answer
- * FR_FINISHED:		request is finished
+ * FR_FINISHED:		request is finished, the requester may return
+ * FR_ENDING:		fuse_request_end() has claimed the request
  * FR_PRIVATE:		request is on private list
  * FR_ASYNC:		request is asynchronous
  * FR_URING:		request is handled through fuse-io-uring
@@ -505,6 +532,7 @@ enum fuse_req_flag {
 	FR_PENDING,
 	FR_SENT,
 	FR_FINISHED,
+	FR_ENDING,
 	FR_PRIVATE,
 	FR_ASYNC,
 	FR_URING,
@@ -558,6 +586,8 @@ struct fuse_req {
 #ifdef CONFIG_FUSE_IO_URING
 	void *ring_entry;
 	void *ring_queue;
+	/** Defers fuse_request_end() to the ring task's task work */
+	struct callback_head ring_end_work;
 #endif
 	/** When (in jiffies) the request was created */
 	unsigned long create_time;
@@ -865,6 +895,9 @@ struct fuse_conn {
 
 	/*  expire inode entries when doing inode invalidation */
 	unsigned expire_inode_entries:1;
+
+	/*  mark writeback-initiated SETATTR requests with FATTR_WRITEBACK */
+	unsigned setattr_writeback:1;
 
 	/*
 	 * The following bitfields are only for optimization purposes
@@ -1531,6 +1564,8 @@ void fuse_flush_time_update(struct inode *inode);
 void fuse_update_ctime(struct inode *inode);
 
 int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask);
+int fuse_update_attributes_sync(struct inode *inode, struct file *file,
+				u32 mask);
 
 void fuse_flush_writepages(struct inode *inode);
 
@@ -1578,6 +1613,9 @@ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
 
 /** CUSE pass fuse_direct_io() a file which f_mapping->host is not from FUSE */
 #define FUSE_DIO_CUSE  (1 << 1)
+
+/** Caller holds i_rwsem shared, so writepages must not be frozen */
+#define FUSE_DIO_SHARED (1 << 2)
 
 ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		       loff_t *ppos, int flags);

@@ -120,26 +120,25 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 			       uint64_t end)
 {
 	struct fuse_dlm_range *range, *next;
-	struct rb_node *node;
+	uint64_t first = start ? start - 1 : start;
+	uint64_t last = end < U64_MAX ? end + 1 : end;
 
 	if (!cache)
 		return;
 
-	/* Find the first range that might need merging */
-	range = NULL;
-	node = rb_first_cached(&cache->ranges);
-	while (node) {
-		range = rb_entry(node, struct fuse_dlm_range, rb);
-		if (range->end >= start - 1)
-			break;
-		node = rb_next(node);
-	}
-
-	if (!range || range->start > end + 1)
-		return;
+	/*
+	 * Find the first range that might need merging.  Directly adjacent
+	 * ranges can merge, hence the region is widened by one unit to each
+	 * side (saturating at the type bounds).  This must stay an
+	 * interval-tree lookup: the tree holds every cached grant of the
+	 * inode and strided writers grow it for the lifetime of the file,
+	 * so seeding the merge by walking from the tree minimum would make
+	 * every new grant cost a full scan.
+	 */
+	range = fuse_page_it_iter_first(&cache->ranges, first, last);
 
 	/* Try to merge ranges in and around the specified region */
-	while (range && range->start <= end + 1) {
+	while (range && range->start <= last) {
 		/* Get next range before we potentially modify the tree */
 		next = NULL;
 		if (rb_next(&range->rb)) {
@@ -150,11 +149,11 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
 		/* Try to merge with next range if adjacent and same mode */
 		if (next && range->mode == next->mode &&
 		    range->end + 1 == next->start) {
-			/* Merge ranges */
-			range->end = next->end;
-
-			/* Remove next from tree */
+			/* Merge ranges: re-insert so __subtree_end is updated */
 			fuse_page_it_remove(next, &cache->ranges);
+			fuse_page_it_remove(range, &cache->ranges);
+			range->end = next->end;
+			fuse_page_it_insert(range, &cache->ranges);
 			kfree(next);
 
 			/* Continue with the same range */
@@ -188,6 +187,7 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
 	struct fuse_dlm_range *range, *new_range, *next;
 	int lock_mode;
+	bool covered_to_end = false;
 	int ret = 0;
 	LIST_HEAD(to_lock);
 	LIST_HEAD(to_upgrade);
@@ -233,14 +233,17 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 		}
 
 		/* Move current_start past this range */
-		current_start = max(current_start, range->end + 1);
+		if (range->end >= end)
+			covered_to_end = true;
+		else
+			current_start = max(current_start, range->end + 1);
 
 		/* Move to next range */
 		range = next;
 	}
 
 	/* If there's a gap after the last range to the end, extend the range */
-	if (current_start <= end) {
+	if (!covered_to_end && current_start <= end) {
 		new_range = kmalloc(sizeof(*new_range), GFP_KERNEL);
 		if (!new_range) {
 			ret = -ENOMEM;
@@ -322,13 +325,17 @@ static int fuse_dlm_punch_hole(struct fuse_dlm_cache *cache, uint64_t start,
 
 	/* If the hole is at the beginning of the range */
 	if (start == range->start) {
+		fuse_page_it_remove(range, &cache->ranges);
 		range->start = end + 1;
+		fuse_page_it_insert(range, &cache->ranges);
 		goto out;
 	}
 
 	/* If the hole is at the end of the range */
 	if (end == range->end) {
+		fuse_page_it_remove(range, &cache->ranges);
 		range->end = start - 1;
+		fuse_page_it_insert(range, &cache->ranges);
 		goto out;
 	}
 
@@ -362,8 +369,12 @@ out:
  * @start: Start page offset
  * @end: End page offset
  *
- * Release locks on the specified range of pages.
- * Note that if start and end are set to zero the cache is destroyed.
+ * Release locks on the specified range of pages.  An inverted range is
+ * rejected rather than silently removing nothing: the callers revoke
+ * coverage, and a revoke that quietly keeps the grant alive would let
+ * the re-validating IO paths trust a lock the server has taken away.
+ * To drop every grant use fuse_dlm_cache_release_locks() (there is no
+ * in-band sentinel range for it).
  *
  * Return: 0 on success, negative error code on failure
  */
@@ -374,13 +385,8 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 	struct fuse_dlm_range *range, *next;
 	int ret = 0;
 
-	if (!cache)
+	if (!cache || start > end)
 		return -EINVAL;
-
-	if (start == 0 && end == 0) {
-		fuse_dlm_cache_release_locks(inode);
-		return 0;
-	}
 
 	down_write(&cache->lock);
 
@@ -400,10 +406,14 @@ int fuse_dlm_unlock_range(struct fuse_inode *inode,
 			break;
 		} else if (start > range->start) {
 			/* Adjust the end of the range */
+			fuse_page_it_remove(range, &cache->ranges);
 			range->end = start - 1;
+			fuse_page_it_insert(range, &cache->ranges);
 		} else if (end < range->end) {
 			/* Adjust the start of the range */
+			fuse_page_it_remove(range, &cache->ranges);
 			range->start = end + 1;
+			fuse_page_it_insert(range, &cache->ranges);
 		} else {
 			/* Complete overlap, remove the range */
 			fuse_page_it_remove(range, &cache->ranges);
@@ -475,6 +485,12 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 			return false;
 		}
 
+		/* Covered through the end of the requested range? */
+		if (range->end >= end) {
+			up_read(&cache->lock);
+			return true;
+		}
+
 		/* Move current_start past this range */
 		current_start = range->end + 1;
 
@@ -494,74 +510,660 @@ bool fuse_dlm_range_is_locked(struct fuse_inode *inode, uint64_t start,
 }
 
 /**
+ * fuse_dlm_covered_end - how far a granted lock covers [@start, @end]
+ * @inode: the fuse inode
+ * @start: first byte to check
+ * @end:   last byte to check (inclusive, must be below U64_MAX)
+ * @mode:  FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ *
+ * For a caller that can fill part of a range: the page cache fill paths
+ * run with the folios locked and may not ask for a grant, so they fill
+ * what is covered and give the rest back.
+ *
+ * Return: the first byte at or after @start that no granted lock of at
+ * least @mode covers, i.e. @start when nothing is covered and @end + 1
+ * when all of it is.
+ */
+uint64_t fuse_dlm_covered_end(struct fuse_inode *inode, uint64_t start,
+			      uint64_t end, enum fuse_page_lock_mode mode)
+{
+	struct fuse_dlm_cache *cache = &inode->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+	uint64_t covered = start;
+	int lock_mode = 0;
+
+	if (start > end)
+		return start;
+
+	if (mode == FUSE_PAGE_LOCK_READ)
+		lock_mode = FUSE_PCACHE_LK_READ;
+	else if (mode == FUSE_PAGE_LOCK_WRITE)
+		lock_mode = FUSE_PCACHE_LK_WRITE;
+
+	down_read(&cache->lock);
+	for (range = fuse_dlm_find_overlapping(cache, start, end); range;
+	     range = fuse_page_it_iter_next(range, start, end)) {
+		/* A grant weaker than asked for covers nothing here. */
+		if (lock_mode && range->mode < lock_mode)
+			break;
+
+		/* A gap before this range ends the covered run. */
+		if (range->start > covered)
+			break;
+
+		if (range->end >= end) {
+			covered = end + 1;
+			break;
+		}
+
+		covered = range->end + 1;
+	}
+	up_read(&cache->lock);
+
+	return covered;
+}
+
+/**
+ * fuse_dlm_write_grant_exists - does the inode hold an exclusive grant anywhere
+ * @fi: the fuse inode
+ *
+ * Unlike fuse_dlm_range_is_locked(), which asks whether one range is fully
+ * covered, this asks whether any part of the file is held exclusively.  A
+ * client that holds a write grant may be sitting on dirty page cache the
+ * server has not seen, so its mtime and ctime run ahead of anything the
+ * server can report.
+ *
+ * Return: true if at least one recorded range is held for write
+ */
+bool fuse_dlm_write_grant_exists(struct fuse_inode *fi)
+{
+	struct fuse_dlm_cache *cache = &fi->dlm_locked_areas;
+	struct fuse_dlm_range *range;
+	bool held = false;
+
+	down_read(&cache->lock);
+	for (range = fuse_dlm_find_overlapping(cache, 0, U64_MAX); range;
+	     range = fuse_page_it_iter_next(range, 0, U64_MAX)) {
+		if (range->mode == FUSE_PCACHE_LK_WRITE) {
+			held = true;
+			break;
+		}
+	}
+	up_read(&cache->lock);
+
+	return held;
+}
+
+/**
+ * fuse_dlm_lock_is_held - check that a byte range is covered by a granted lock
+ * @fi:     the fuse inode
+ * @offset: byte offset into the file (need not be page-aligned)
+ * @length: length of the region in bytes (need not be page-aligned)
+ * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ *
+ * Re-validation helper for fuse_get_dlm_lock() callers: checks the same
+ * page-aligned range a fuse_get_dlm_lock() call with these arguments
+ * requests, against the live lock tree.
+ */
+bool fuse_dlm_lock_is_held(struct fuse_inode *fi, loff_t offset,
+			   size_t length, enum fuse_page_lock_mode mode)
+{
+	uint64_t end = (offset + length - 1) | (PAGE_SIZE - 1);
+
+	/*
+	 * An empty range needs no coverage.  Reporting it held keeps the
+	 * re-validating IO paths from re-requesting a lock the tree can
+	 * never show (the page-aligned end would invert below).
+	 */
+	if (!length)
+		return true;
+
+	return fuse_dlm_range_is_locked(fi, offset & PAGE_MASK, end, mode);
+}
+
+/* Context for a fuse_get_dlm_lock() request, embedding struct
+ * fuse_args as required by the request API. */
+struct fuse_dlm_lock_args {
+	struct fuse_args args;
+	struct fuse_inode *fi;
+	struct fuse_range_lock *rlock;
+};
+
+/*
+ * fuse_get_dlm_lock_complete - move the caller's range lock to READY
+ *
+ * Called from fuse_request_end() on the thread processing the reply,
+ * before it wakes the thread blocked in fuse_get_dlm_lock() or moves on
+ * to the next message (e.g. an invalidate notification for the same
+ * inode). This is what keeps the range invisible to invalidation for no
+ * longer than necessary: were this instead left to run on the (possibly
+ * not-yet-scheduled) requester thread after waking, an invalidate queued
+ * right behind this reply could be processed first and race ahead of a
+ * grant that, logically, already arrived first.
+ *
+ * Uses fuse_range_lock_mark_ready() rather than _mark_locked() because
+ * this runs on the (shared) thread processing replies/notifications for
+ * the connection: _mark_locked() can block on a conflicting overlapping
+ * range (e.g. an invalidate that is itself queued behind messages this
+ * thread has yet to process), which would stall that thread. READY is
+ * just as visible to invalidation's fuse_range_lock_acquire_locked() as
+ * LOCKED, so this does not widen the race window above; the requester
+ * thread promotes the range the rest of the way to LOCKED, blocking
+ * there instead if still necessary, right before it touches the page
+ * cache.
+ *
+ * Does not re-validate the granted range against what was requested --
+ * fuse_get_dlm_lock() still does that itself after being woken.
+ */
+static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
+				       struct fuse_args *args, int error)
+{
+	struct fuse_dlm_lock_args *dargs =
+		container_of(args, struct fuse_dlm_lock_args, args);
+
+	if (!dargs->rlock)
+		return;
+
+	/*
+	 * error is 0 (a grant) or -ENOSYS (the server has no DLM, so the
+	 * range is treated as covered) here: either way fuse_get_dlm_lock()
+	 * goes on to consider the range usable. Any other error fails the
+	 * IO instead, and the caller releases the still-INIT rlock directly
+	 * without ever touching the page cache under it -- leave it alone.
+	 */
+	if (error && error != -ENOSYS)
+		return;
+
+	fuse_range_lock_mark_ready(dargs->fi, dargs->rlock);
+}
+
+/**
  * fuse_get_dlm_lock - request a dlm lock from the fuse server
  * @file:   the file being accessed
  * @offset: byte offset into the file (need not be page-aligned)
  * @length: length of the region in bytes (need not be page-aligned)
  * @mode:   FUSE_PAGE_LOCK_READ or FUSE_PAGE_LOCK_WRITE
+ * @rlock:  optional IO range lock reserved by the caller in INIT state;
+ *	moved to READY as part of processing a reply that leaves the range
+ *	covered, before this function's caller is even woken up, or
+ *	directly to LOCKED when the range is already covered without a
+ *	round trip -- see fuse_get_dlm_lock_complete() and the declaration
+ *	in fuse_dlm_cache.h. In the later case, the grant is re-validated
+ *  one LOCKED (fencing further revokes) before being trusted; if a
+ *  concurrent invalidate is found to have revoked it, @rlock is put
+ *  back in INIT and a fresh grant is requested below instead.
+ *
+ * Return: 0 when the range is covered by a recorded grant on return,
+ * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
+ * recording it failed (covered cluster-wide, invisible to
+ * fuse_dlm_lock_is_held()), a negative error code otherwise.  Callers
+ * re-validating the grant must not re-request on a nonzero return or
+ * they would spin.
  */
-void fuse_get_dlm_lock(struct file *file, loff_t offset,
-		       size_t length, enum fuse_page_lock_mode mode)
+int fuse_get_dlm_lock(struct file *file, loff_t offset,
+		      size_t length, enum fuse_page_lock_mode mode,
+		      struct fuse_range_lock *rlock)
 {
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_mount *fm = ff->fm;
-	uint64_t end = (offset + length - 1) | (PAGE_SIZE - 1);
 
-	/* note that the offset and length don't have to be page aligned here
-	 * but since we only get here on writeback caching we will send out
-	 * page aligned requests */
-	offset &= PAGE_MASK;
-
-	FUSE_ARGS(args);
+	struct fuse_dlm_lock_args dargs = { .fi = fi, .rlock = rlock };
+	struct fuse_args *args = &dargs.args;
 	struct fuse_dlm_lock_in inarg;
 	struct fuse_dlm_lock_out outarg;
 	int err;
 
+	/* An empty range needs no lock. */
+	if (!length)
+		return 0;
+
 	/* note that this can be run from different processes
 	 * at the same time. It is intentionally not protected
 	 * since a DLM implementation in the FUSE server should take care
-	 * of any races in lock requests */
-	if (fuse_dlm_range_is_locked(fi, offset, end, mode))
-		return; /* we already have this area locked */
+	 * of any races in lock requests.
+	 * The early exit uses the same helper the callers re-validate
+	 * with, so this check and a later fuse_dlm_lock_is_held() can
+	 * never disagree about what counts as covered.
+     *
+     * rlock is still INIT here, invisible to invalidation. Move
+     * it to LOCKED -- which blocks until any invalidate that is
+     * concurrently draining an overlapping range (one that got
+     * past its own conflict check while we were INIT) has fully
+     * revoked the grant and released -- then re-check: only once
+     * LOCKED, which fences any further revoke, can is_held() be
+     * trusted. If the grant was revoked, undo back to INIT (never
+     * blocks) and fall through to request a fresh grant below. */
+    if (rlock) {
+        err = fuse_range_lock_mark_locked(fi, rlock);
+        if (err)
+            return err;
+    }
+	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
+		return 0; /* we already have this area locked */
+    if (rlock)
+        fuse_range_lock_mark_init(fi, rlock);
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
 
-	inarg.start = offset;
-	inarg.end = end;
+	/* note that the offset and length don't have to be page aligned
+	 * here but since we only get here on writeback caching we will
+	 * send out page aligned requests */
+	inarg.start = offset & PAGE_MASK;
+	inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
 	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
 		FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
 
-	args.opcode = FUSE_DLM_WB_LOCK;
-	args.nodeid = get_node_id(inode);
-	args.in_numargs = 1;
-	args.in_args[0].size = sizeof(inarg);
-	args.in_args[0].value = &inarg;
-	args.out_numargs = 1;
-	args.out_args[0].size = sizeof(outarg);
-	args.out_args[0].value = &outarg;
-	err = fuse_simple_request(fm, &args);
+	args->opcode = FUSE_DLM_WB_LOCK;
+	args->nodeid = get_node_id(inode);
+	args->in_numargs = 1;
+	args->in_args[0].size = sizeof(inarg);
+	args->in_args[0].value = &inarg;
+	args->out_numargs = 1;
+	args->out_args[0].size = sizeof(outarg);
+	args->out_args[0].value = &outarg;
+	args->complete = fuse_get_dlm_lock_complete;
+	err = fuse_simple_request(fm, args);
 	if (err == -ENOSYS) {
 		/* fuse server does not support dlm, save the info */
 		fc->dlm = 0;
-		return;
+		return err;
 	}
 
 	if (err)
-		return;
-	else
-		if (inarg.start < outarg.start ||
-		    inarg.end > outarg.end) {
-			/* fuse server is seriously broken */
-			pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",
-				inarg.start, inarg.end, outarg.start, outarg.end);
-			fuse_abort_conn(fc);
-			return;
-		} else {
-			/* ignore any errors here, there is no way we can react appropriately */
-			fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode);
-		}
+		return err;
+
+	if (inarg.start < outarg.start || inarg.end > outarg.end) {
+		/* fuse server is seriously broken */
+		pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",
+			inarg.start, inarg.end, outarg.start, outarg.end);
+		fuse_abort_conn(fc);
+		return -EIO;
+	}
+
+	/*
+	 * The server granted the lock; record it so
+	 * fuse_dlm_lock_is_held() sees it.
+	 */
+	err = fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode);
+
+	/*
+	 * A failure to record (small-allocation -ENOMEM) does not undo
+	 * the grant: coverage exists cluster-wide, only the local
+	 * bookkeeping is missing.  Report that as
+	 * FUSE_DLM_GRANT_UNRECORDED so callers neither fail an IO that
+	 * is actually covered nor keep re-requesting a grant that will
+	 * not become visible.  (rlock, if any, was already moved to READY
+	 * by fuse_get_dlm_lock_complete() while processing the reply.)
+	 */
+	if (err)
+		return FUSE_DLM_GRANT_UNRECORDED;
+
+	return 0;
+}
+
+/*
+ * FUSE local IO range locks.
+ *
+ * Not the grant record above: this interval tree holds the byte ranges local
+ * IO is working on, serialising overlapping cached reads and writes against
+ * each other and against invalidation.  See the range lock section of
+ * fuse_dlm_cache.h.
+ */
+static inline uint64_t fuse_range_lock_start(struct fuse_range_lock *lock)
+{
+	return lock->start;
+}
+
+static inline uint64_t fuse_range_lock_last(struct fuse_range_lock *lock)
+{
+	return lock->end;
+}
+
+INTERVAL_TREE_DEFINE(struct fuse_range_lock, rb, uint64_t, __subtree_end,
+		   fuse_range_lock_start, fuse_range_lock_last, static,
+		   fuse_range_it);
+
+/**
+ * fuse_range_lock_tree_init - Initialize the range lock manager
+ * @inode: The fuse inode whose range lock tree to initialize
+ */
+void fuse_range_lock_tree_init(struct fuse_inode *inode)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	spin_lock_init(&tree->lock);
+	tree->root = RB_ROOT_CACHED;
+	init_waitqueue_head(&tree->waitq);
+}
+
+/**
+ * fuse_range_conflicts - Test @lock's range against currently held ranges
+ * @tree: The range lock tree
+ * @lock: The range lock being tested (not yet inserted, or already held)
+ * @locked_only: If true, ignore existing ranges still in INIT state
+ *
+ * A conflict occurs whenever an overlapping range exists (other than
+ * @lock itself) and either @lock or that range is a WRITE lock (READ
+ * ranges may overlap each other freely). When @locked_only is set, a
+ * range still in INIT state (reserved, not yet touching the page cache)
+ * is not considered, but a range already in READY or LOCKED state is --
+ * see fuse_range_lock_acquire_locked().
+ *
+ * A range held by @lock's own task never conflicts: the only way that
+ * happens is the task faulting in its own user buffer mid-IO, where
+ * fuse_filemap_fault() takes a range lock on the faulting page while
+ * the read/write path already holds one covering it.  Waiting here
+ * would then deadlock on ourselves, and skipping is safe -- the outer
+ * hold already gives invalidation an overlapping range to conflict
+ * with for as long as both are held.
+ *
+ * Caller holds @tree->lock.
+ *
+ * Return: true if @lock's range conflicts with an existing held range.
+ */
+static bool fuse_range_conflicts(struct fuse_range_lock_tree *tree,
+				struct fuse_range_lock *lock,
+				bool locked_only)
+{
+	struct fuse_range_lock *cur;
+
+	cur = fuse_range_it_iter_first(&tree->root, lock->start, lock->end);
+	while (cur) {
+		if (cur != lock && cur->owner != lock->owner &&
+		    (!locked_only || cur->state != FUSE_RANGE_LOCK_INIT) &&
+		    (lock->mode == FUSE_RANGE_LOCK_WRITE ||
+		     cur->mode == FUSE_RANGE_LOCK_WRITE))
+			return true;
+		cur = fuse_range_it_iter_next(cur, lock->start, lock->end);
+	}
+
+	return false;
+}
+
+/**
+ * fuse_range_try_lock_init - Try to insert @lock into @tree in INIT state
+ * @tree: The range lock tree
+ * @lock: The range lock to try to acquire
+ *
+ * Conflict tested against every existing range regardless of state, same
+ * as a plain exclusive acquire -- this is what keeps two local IOs on an
+ * overlapping range serialized against each other even while both are
+ * still reserving (INIT), not yet touching the page cache.
+ *
+ * Return: true if @lock was inserted, false if the caller must wait.
+ */
+static bool fuse_range_try_lock_init(struct fuse_range_lock_tree *tree,
+				    struct fuse_range_lock *lock)
+{
+	bool conflict;
+
+	spin_lock(&tree->lock);
+
+	conflict = fuse_range_conflicts(tree, lock, false);
+	if (!conflict) {
+		lock->state = FUSE_RANGE_LOCK_INIT;
+		fuse_range_it_insert(lock, &tree->root);
+	}
+
+	spin_unlock(&tree->lock);
+
+	return !conflict;
+}
+
+/**
+ * fuse_range_try_lock_locked - Try to insert @lock into @tree in LOCKED state
+ * @tree: The range lock tree
+ * @lock: The range lock to try to acquire
+ *
+ * Conflict tested only against existing READY or LOCKED ranges: an
+ * overlapping range still in INIT state is ignored, so this never waits
+ * behind a read/write that has only reserved a range and not yet started
+ * touching the page cache.
+ *
+ * Return: true if @lock was inserted, false if the caller must wait.
+ */
+static bool fuse_range_try_lock_locked(struct fuse_range_lock_tree *tree,
+				      struct fuse_range_lock *lock)
+{
+	bool conflict;
+
+	spin_lock(&tree->lock);
+
+	conflict = fuse_range_conflicts(tree, lock, true);
+	if (!conflict) {
+		lock->state = FUSE_RANGE_LOCK_LOCKED;
+		fuse_range_it_insert(lock, &tree->root);
+	}
+
+	spin_unlock(&tree->lock);
+
+	return !conflict;
+}
+
+/**
+ * fuse_range_try_mark_locked - Try to move an already-held @lock to LOCKED
+ * @tree: The range lock tree
+ * @lock: The (already inserted) range lock to move to LOCKED state
+ *
+ * Return: true if @lock is now LOCKED, false if the caller must wait for
+ * a conflicting READY or LOCKED range to be released.
+ */
+static bool fuse_range_try_mark_locked(struct fuse_range_lock_tree *tree,
+				      struct fuse_range_lock *lock)
+{
+	bool conflict;
+
+	spin_lock(&tree->lock);
+
+	conflict = fuse_range_conflicts(tree, lock, true);
+	if (!conflict)
+		lock->state = FUSE_RANGE_LOCK_LOCKED;
+
+	spin_unlock(&tree->lock);
+
+	return !conflict;
+}
+
+/**
+ * fuse_range_lock_acquire_init - Reserve a byte range lock in INIT state
+ * @inode: The fuse inode
+ * @lock: Caller-allocated storage for the lock (e.g. on the stack)
+ * @start: Start byte offset (inclusive)
+ * @end: End byte offset (inclusive)
+ * @mode: FUSE_RANGE_LOCK_READ or FUSE_RANGE_LOCK_WRITE
+ *
+ * Blocks until [start, end] can be reserved in the requested mode
+ * without conflicting with any other currently held, overlapping range.
+ * The range is rounded out to whole pages; see fuse_dlm_cache.h.
+ *
+ * Killable, so a wait that has gone wrong (a lost conflicting holder)
+ * leaves a D-state task SIGKILL can still reach rather than one only a
+ * reboot clears.
+ *
+ * Return: 0 with the range reserved, or -ERESTARTSYS if a fatal signal
+ * arrived first -- the lock was never inserted then and must not be
+ * passed to fuse_range_lock_release().
+ */
+int fuse_range_lock_acquire_init(struct fuse_inode *inode,
+				 struct fuse_range_lock *lock,
+				 uint64_t start, uint64_t end,
+				 enum fuse_range_lock_mode mode)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	lock->start = round_down(start, PAGE_SIZE);
+	lock->end = end | (PAGE_SIZE - 1);
+	lock->mode = mode;
+	lock->owner = current;
+
+	return wait_event_killable(tree->waitq,
+				   fuse_range_try_lock_init(tree, lock));
+}
+
+/**
+ * fuse_range_lock_try_acquire_init - Try to reserve a byte range lock in
+ * INIT state without blocking
+ * @inode: The fuse inode
+ * @lock: Caller-allocated storage for the lock (e.g. on the stack)
+ * @start: Start byte offset (inclusive)
+ * @end: End byte offset (inclusive)
+ * @mode: FUSE_RANGE_LOCK_READ or FUSE_RANGE_LOCK_WRITE
+ *
+ * Same semantics as fuse_range_lock_acquire_init() but never waits, for
+ * callers that must not block, e.g. the fault path under mmap_lock.
+ *
+ * Return: true with the range reserved, false if a conflicting range is
+ * currently held -- the lock was not inserted then and must not be
+ * passed to fuse_range_lock_release().
+ */
+bool fuse_range_lock_try_acquire_init(struct fuse_inode *inode,
+				      struct fuse_range_lock *lock,
+				      uint64_t start, uint64_t end,
+				      enum fuse_range_lock_mode mode)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	lock->start = round_down(start, PAGE_SIZE);
+	lock->end = end | (PAGE_SIZE - 1);
+	lock->mode = mode;
+	lock->owner = current;
+
+	return fuse_range_try_lock_init(tree, lock);
+}
+
+/**
+ * fuse_range_lock_mark_ready - Move a reserved range lock to READY state
+ * @inode: The fuse inode
+ * @lock: The range lock previously passed to fuse_range_lock_acquire_init()
+ *
+ * Never blocks: moving @lock from INIT to READY only ever adds a new
+ * conflict for another caller (e.g. an invalidation that has not reached
+ * this range yet), it never resolves an existing one, so there is
+ * nothing for this call to wait for and no waiter to wake.
+ */
+void fuse_range_lock_mark_ready(struct fuse_inode *inode,
+			       struct fuse_range_lock *lock)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	spin_lock(&tree->lock);
+	lock->state = FUSE_RANGE_LOCK_READY;
+	spin_unlock(&tree->lock);
+}
+
+/**
+ * fuse_range_lock_mark_locked - Move a reserved range lock to LOCKED state
+ * @inode: The fuse inode
+ * @lock: The range lock previously passed to fuse_range_lock_acquire_init(),
+ *	whether still in INIT state or already moved to READY by
+ *	fuse_range_lock_mark_ready()
+ *
+ * Blocks until no other currently held, overlapping READY or LOCKED range
+ * conflicts with @lock.
+ *
+ * Killable, like fuse_range_lock_acquire_init().
+ *
+ * Return: 0 once LOCKED, or -ERESTARTSYS if a fatal signal arrived
+ * first -- @lock then keeps its previous state (INIT or READY) and is
+ * still held, so the caller must still release it.
+ */
+int fuse_range_lock_mark_locked(struct fuse_inode *inode,
+				struct fuse_range_lock *lock)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	return wait_event_killable(tree->waitq,
+				   fuse_range_try_mark_locked(tree, lock));
+}
+
+/**
+ * fuse_range_lock_try_mark_locked - Try to move an already-held range
+ * lock to LOCKED state without blocking
+ * @inode: The fuse inode
+ * @lock: The range lock previously reserved in INIT (or moved to READY)
+ *
+ * Same semantics as fuse_range_lock_mark_locked() but never waits.
+ *
+ * Return: true if @lock is now LOCKED, false if a conflicting READY or
+ * LOCKED range is held -- @lock then keeps its previous state and is
+ * still held, so the caller must still release it.
+ */
+bool fuse_range_lock_try_mark_locked(struct fuse_inode *inode,
+				     struct fuse_range_lock *lock)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	return fuse_range_try_mark_locked(tree, lock);
+}
+
+/**
+ * fuse_range_lock_mark_init - Move a READY or LOCKED range lock back to
+ * INIT state
+ * @inode: The fuse inode
+ * @lock: The range lock previously moved to READY or LOCKED state
+ *
+ * Never blocks. Wakes waiters, since an invalidation may be waiting on
+ * @lock's (until now READY or LOCKED) range and can now proceed around it.
+ */
+void fuse_range_lock_mark_init(struct fuse_inode *inode,
+			      struct fuse_range_lock *lock)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	spin_lock(&tree->lock);
+	lock->state = FUSE_RANGE_LOCK_INIT;
+	spin_unlock(&tree->lock);
+
+	wake_up_all(&tree->waitq);
+}
+
+/**
+ * fuse_range_lock_acquire_locked - Acquire a byte range lock in LOCKED state
+ * @inode: The fuse inode
+ * @lock: Caller-allocated storage for the lock (e.g. on the stack)
+ * @start: Start byte offset (inclusive)
+ * @end: End byte offset (inclusive)
+ * @mode: FUSE_RANGE_LOCK_READ or FUSE_RANGE_LOCK_WRITE
+ *
+ * Blocks until [start, end] can be locked in the requested mode without
+ * conflicting with any other currently held READY or LOCKED, overlapping
+ * range.  An overlapping range still in INIT state does not block this.
+ * The range is rounded out to whole pages; see fuse_dlm_cache.h.
+ */
+void fuse_range_lock_acquire_locked(struct fuse_inode *inode,
+				   struct fuse_range_lock *lock,
+				   uint64_t start, uint64_t end,
+				   enum fuse_range_lock_mode mode)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	lock->start = round_down(start, PAGE_SIZE);
+	lock->end = end | (PAGE_SIZE - 1);
+	lock->mode = mode;
+	lock->owner = current;
+
+	wait_event(tree->waitq, fuse_range_try_lock_locked(tree, lock));
+}
+
+/**
+ * fuse_range_lock_release - Release a previously acquired range lock
+ * @inode: The fuse inode
+ * @lock: The range lock previously passed to
+ *	fuse_range_lock_acquire_init() or fuse_range_lock_acquire_locked()
+ */
+void fuse_range_lock_release(struct fuse_inode *inode,
+			    struct fuse_range_lock *lock)
+{
+	struct fuse_range_lock_tree *tree = &inode->io_range_lock;
+
+	spin_lock(&tree->lock);
+	fuse_range_it_remove(lock, &tree->root);
+	spin_unlock(&tree->lock);
+
+	/* Wake everyone; conflicting waiters will simply re-check and sleep. */
+	wake_up_all(&tree->waitq);
 }

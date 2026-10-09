@@ -366,6 +366,17 @@ struct fuse_file_lock {
 #define FATTR_LOCKOWNER	(1 << 9)
 #define FATTR_CTIME	(1 << 10)
 #define FATTR_KILL_SUIDGID	(1 << 11)
+/*
+ * Not an attribute selector: marks the request as a kernel-initiated
+ * writeback of locally owned attributes rather than a userspace-initiated
+ * change.  Only sent if the server negotiated FUSE_SETATTR_WRITEBACK.
+ *
+ * The bit is deliberately far above the sequentially allocated FATTR_*
+ * range: libfuse mirrors these bits into its own FUSE_SET_ATTR_* space,
+ * which has its own allocations from bit 12 upwards, and only a value that
+ * is free on both sides can be passed through without translation.
+ */
+#define FATTR_WRITEBACK		(1 << 30)
 
 /**
  * Flags returned by the OPEN request
@@ -449,6 +460,8 @@ struct fuse_file_lock {
  *			optimal io-size alignment
  * FUSE_URING_REDUCED_Q: Client (kernel) supports less queues - Server is free
  *			 to register between 1 and nr-core io-uring queues
+ * FUSE_SETATTR_WRITEBACK: kernel marks writeback-initiated SETATTR requests
+ *			   with FATTR_WRITEBACK
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -498,6 +511,7 @@ struct fuse_file_lock {
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
 
 #define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
+#define FUSE_SETATTR_WRITEBACK	(1ULL << 58)
 #define FUSE_URING_REDUCED_Q	(1ULL << 59)
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
 #define FUSE_EXPIRE_INODE_ENTRY (1ULL << 61)

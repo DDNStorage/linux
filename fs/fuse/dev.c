@@ -433,9 +433,11 @@ static void flush_bg_queue(struct fuse_conn *fc)
  * This function is called when a request is finished.  Either a reply
  * has arrived or it was aborted (and not yet sent) or some error
  * occurred during communication with userspace, or the device file
- * was closed.  The requester thread is woken up (if still waiting),
- * the 'end' callback is called if given, else the reference to the
- * request is released
+ * was closed.  The 'complete' callback, if given, is called first, on
+ * this thread and before FR_FINISHED releases the requester; only then
+ * is the requester thread woken up (if still waiting), the 'end'
+ * callback called if given, else the reference to the request is
+ * released.
  */
 void fuse_request_end(struct fuse_req *req)
 {
@@ -443,22 +445,36 @@ void fuse_request_end(struct fuse_req *req)
 	struct fuse_conn *fc = fm->fc;
 	struct fuse_iqueue *fiq = &fc->iq;
 
-	if (test_and_set_bit(FR_FINISHED, &req->flags))
+	/* FR_ENDING, not FR_FINISHED, is what makes this the only ender */
+	if (test_and_set_bit(FR_ENDING, &req->flags))
 		goto put_request;
 
 	trace_fuse_request_end(req);
+	WARN_ON(test_bit(FR_PENDING, &req->flags));
+	WARN_ON(test_bit(FR_SENT, &req->flags));
+
 	/*
-	 * test_and_set_bit() implies smp_mb() between bit
-	 * changing and below FR_INTERRUPTED check. Pairs with
+	 * Before FR_FINISHED: req->args lives on the requester's stack
+	 * frame for a synchronous request, and the requester returns as
+	 * soon as it sees the bit, with no wakeup needed.
+	 */
+	if (req->args->complete)
+		req->args->complete(fm, req->args, req->out.h.error);
+
+	/* publish the reply and whatever 'complete' did before the bit */
+	smp_mb__before_atomic();
+	set_bit(FR_FINISHED, &req->flags);
+	/*
+	 * Order the bit against the below FR_INTERRUPTED check. Pairs with
 	 * smp_mb() from queue_interrupt().
 	 */
+	smp_mb__after_atomic();
 	if (test_bit(FR_INTERRUPTED, &req->flags)) {
 		spin_lock(&fiq->lock);
 		list_del_init(&req->intr_entry);
 		spin_unlock(&fiq->lock);
 	}
-	WARN_ON(test_bit(FR_PENDING, &req->flags));
-	WARN_ON(test_bit(FR_SENT, &req->flags));
+
 	if (test_bit(FR_BACKGROUND, &req->flags)) {
 		spin_lock(&fc->bg_lock);
 		clear_bit(FR_BACKGROUND, &req->flags);
