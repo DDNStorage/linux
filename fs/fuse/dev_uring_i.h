@@ -98,6 +98,19 @@ struct fuse_ring_queue {
 	/* background fuse requests */
 	struct list_head fuse_req_bg_queue;
 
+	/* foreground fuse requests waiting for the foreground limit */
+	struct list_head fuse_req_fg_queue;
+
+	/* number of registered ring entries */
+	unsigned int nr_ents;
+
+	/*
+	 * foreground requests on fuse_req_queue or in userspace, limited to
+	 * the entries not reserved for background requests with writeback cache;
+	 * see fuse_uring_max_foreground()
+	 */
+	unsigned int active_foreground;
+
 	/* number of requests queued or in userspace */
 	unsigned int nr_reqs;
 

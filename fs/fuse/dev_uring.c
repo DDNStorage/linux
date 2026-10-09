@@ -100,6 +100,67 @@ static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
 	}
 }
 
+/*
+ * With the writeback cache, foreground requests may hold at most half of the
+ * entries. They might wait in userspace on DLM revokes, which wait on page
+ * invalidation, which waits on writeback - if they held all entries,
+ * background writeback could not be sent and none of them would complete.
+ */
+#define FUSE_URING_MIN_FOREGROUND	8U
+#define FUSE_URING_MIN_BACKGROUND	2U
+
+static unsigned int fuse_uring_max_background(struct fuse_ring_queue *queue)
+{
+	return max(queue->nr_ents / 4, FUSE_URING_MIN_BACKGROUND);
+}
+
+static unsigned int fuse_uring_max_foreground(struct fuse_ring_queue *queue)
+{
+	unsigned int bg = fuse_uring_max_background(queue);
+
+	if (queue->nr_ents <= bg) {
+		pr_warn_once("fuse-io-uring configuration value is too small, could cause hung issue\n");
+		return queue->nr_ents;
+	}
+
+	return queue->nr_ents - bg;
+}
+
+static bool fuse_uring_req_fg_limited(struct fuse_req *req)
+{
+	return req->fm->fc->writeback_cache &&
+	       !test_bit(FR_BACKGROUND, &req->flags) &&
+	       !(req->args && req->args->no_fg_limit);
+}
+
+static void fuse_uring_flush_queue_fg(struct fuse_ring_queue *queue)
+{
+	lockdep_assert_held(&queue->lock);
+
+	while (queue->active_foreground < fuse_uring_max_foreground(queue) &&
+	       !list_empty(&queue->fuse_req_fg_queue)) {
+		struct fuse_req *req;
+
+		req = list_first_entry(&queue->fuse_req_fg_queue,
+				       struct fuse_req, list);
+		set_bit(FR_URING_FG, &req->flags);
+		queue->active_foreground++;
+
+		list_move_tail(&req->list, &queue->fuse_req_queue);
+	}
+}
+
+static void fuse_uring_end_foreground(struct fuse_ring_queue *queue,
+				       struct fuse_req *req)
+{
+	lockdep_assert_held(&queue->lock);
+
+	if (test_and_clear_bit(FR_URING_FG, &req->flags)) {
+		queue->active_foreground--;
+		fuse_uring_flush_queue_fg(queue);
+	}
+}
+
 static void __fuse_uring_req_end(struct fuse_ring_ent *ent,
 				 struct fuse_req *req, int error)
 {
@@ -112,6 +173,7 @@ static void __fuse_uring_req_end(struct fuse_ring_ent *ent,
 	ent->fuse_req = NULL;
 	queue->nr_reqs--;
 	list_del_init(&req->list);
+	fuse_uring_end_foreground(queue, req);
 	if (test_bit(FR_BACKGROUND, &req->flags)) {
 		queue->active_background--;
 		spin_lock(&fc->bg_lock);
@@ -171,9 +233,15 @@ static void fuse_uring_abort_end_queue_requests(struct fuse_ring_queue *queue)
 	LIST_HEAD(req_list);
 
 	spin_lock(&queue->lock);
-	list_for_each_entry(req, &queue->fuse_req_queue, list)
+	list_for_each_entry(req, &queue->fuse_req_queue, list) {
+		clear_bit(FR_PENDING, &req->flags);
+		if (test_and_clear_bit(FR_URING_FG, &req->flags))
+			queue->active_foreground--;
+	}
+	list_for_each_entry(req, &queue->fuse_req_fg_queue, list)
 		clear_bit(FR_PENDING, &req->flags);
 	list_splice_init(&queue->fuse_req_queue, &req_list);
+	list_splice_init(&queue->fuse_req_fg_queue, &req_list);
 	queue->nr_reqs = 0;
 	spin_unlock(&queue->lock);
 
@@ -237,6 +305,7 @@ bool fuse_uring_request_expired(struct fuse_conn *fc)
 		spin_lock(&queue->lock);
 		if (fuse_request_expired(fc, &queue->fuse_req_queue) ||
 		    fuse_request_expired(fc, &queue->fuse_req_bg_queue) ||
+		    fuse_request_expired(fc, &queue->fuse_req_fg_queue) ||
 		    ent_list_request_expired(fc, &queue->ent_w_req_queue) ||
 		    ent_list_request_expired(fc, &queue->ent_in_userspace)) {
 			spin_unlock(&queue->lock);
@@ -461,6 +530,7 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 	INIT_LIST_HEAD(&queue->ent_in_userspace);
 	INIT_LIST_HEAD(&queue->fuse_req_queue);
 	INIT_LIST_HEAD(&queue->fuse_req_bg_queue);
+	INIT_LIST_HEAD(&queue->fuse_req_fg_queue);
 	INIT_LIST_HEAD(&queue->ent_released);
 
 	queue->fpq.processing = pq;
@@ -524,7 +594,10 @@ static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent, int issue_flags
 	if (req) {
 		/* remove entry from queue->fpq->processing */
 		list_del_init(&req->list);
+		if (test_and_clear_bit(FR_URING_FG, &req->flags))
+			queue->active_foreground--;
 	}
+	queue->nr_ents--;
 
 	/*
 	 * The entry must not be freed immediately, due to access of direct
@@ -1138,6 +1211,8 @@ static int fuse_ring_ent_set_commit(struct fuse_ring_ent *ent)
 	return 0;
 }
 
+static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg);
+
 /* FUSE_URING_CMD_COMMIT_AND_FETCH handler */
 static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 				   struct fuse_conn *fc)
@@ -1151,6 +1226,8 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 	unsigned int qid = READ_ONCE(cmd_req->qid);
 	struct fuse_pqueue *fpq;
 	struct fuse_req *req;
+	struct fuse_ring_ent *avail;
+	struct fuse_req *next = NULL;
 
 	err = -ENOTCONN;
 	if (!ring)
@@ -1189,7 +1266,32 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 	if (err != 0) {
 		pr_info_ratelimited("qid=%d commit_id %llu state %d",
 				    queue->qid, commit_id, ent->state);
+		queue->nr_reqs--;
+		fuse_uring_end_foreground(queue, req);
+		if (test_bit(FR_BACKGROUND, &req->flags)) {
+			queue->active_background--;
+			spin_lock(&fc->bg_lock);
+			fuse_uring_flush_queue_bg(queue);
+			spin_unlock(&fc->bg_lock);
+		}
+
+		/*
+		 * The freed foreground or background slot might have moved a
+		 * queued request to fuse_req_queue. This entry is not usable,
+		 * so hand the request to another available entry.
+		 */
+		avail = list_first_entry_or_null(&queue->ent_avail_queue,
+						 struct fuse_ring_ent, list);
+		if (avail)
+			next = list_first_entry_or_null(&queue->fuse_req_queue,
+							struct fuse_req, list);
+		if (next)
+			fuse_uring_add_req_to_ring_ent(avail, next);
 		spin_unlock(&queue->lock);
+
+		if (next)
+			fuse_uring_dispatch_ent(avail, true);
+
 		req->out.h.error = err;
 		clear_bit(FR_SENT, &req->flags);
 		fuse_request_end(req);
@@ -1434,6 +1536,8 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
 
 	spin_lock(&queue->lock);
 	ent->cmd = cmd;
+	queue->nr_ents++;
+	fuse_uring_flush_queue_fg(queue);
 	spin_unlock(&queue->lock);
 
 	/* Marks the ring entry as ready */
@@ -1670,6 +1774,7 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	struct fuse_ring *ring = fc->ring;
 	struct fuse_ring_queue *queue;
 	struct fuse_ring_ent *ent = NULL;
+	struct fuse_req *next;
 	int err;
 
 	err = -EINVAL;
@@ -1684,18 +1789,25 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 
 	set_bit(FR_URING, &req->flags);
 	req->ring_queue = queue;
-	ent = list_first_entry_or_null(&queue->ent_avail_queue,
-				       struct fuse_ring_ent, list);
 	queue->nr_reqs++;
 
-	if (ent)
-		fuse_uring_add_req_to_ring_ent(ent, req);
-	else
+	if (fuse_uring_req_fg_limited(req)) {
+		list_add_tail(&req->list, &queue->fuse_req_fg_queue);
+		fuse_uring_flush_queue_fg(queue);
+	} else {
 		list_add_tail(&req->list, &queue->fuse_req_queue);
+	}
+
+	ent = list_first_entry_or_null(&queue->ent_avail_queue,
+				       struct fuse_ring_ent, list);
+	next = ent ? list_first_entry_or_null(&queue->fuse_req_queue,
+					      struct fuse_req, list) : NULL;
+	if (next)
+		fuse_uring_add_req_to_ring_ent(ent, next);
 
 	spin_unlock(&queue->lock);
 
-	if (ent)
+	if (next)
 		fuse_uring_dispatch_ent(ent, false);
 
 	return;
@@ -1762,12 +1874,27 @@ bool fuse_uring_remove_pending_req(struct fuse_req *req)
 {
 	struct fuse_ring_queue *queue = req->ring_queue;
 	bool removed = fuse_remove_pending_req(req, &queue->lock);
+	struct fuse_ring_ent *ent;
+	struct fuse_req *next = NULL;
 
 	if (removed) {
 		/* Update counters after successful removal */
 		spin_lock(&queue->lock);
 		queue->nr_reqs--;
+		fuse_uring_end_foreground(queue, req);
+
+		/* the freed foreground slot might let a queued request run */
+		ent = list_first_entry_or_null(&queue->ent_avail_queue,
+					       struct fuse_ring_ent, list);
+		if (ent)
+			next = list_first_entry_or_null(&queue->fuse_req_queue,
+							struct fuse_req, list);
+		if (next)
+			fuse_uring_add_req_to_ring_ent(ent, next);
 		spin_unlock(&queue->lock);
+
+		if (next)
+			fuse_uring_dispatch_ent(ent, true);
 	}
 
 	return removed;
