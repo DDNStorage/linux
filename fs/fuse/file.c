@@ -1012,7 +1012,7 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	struct fuse_io_args ia = {
 		.ap.args.page_zeroing = true,
 		.ap.args.out_pages = true,
-		.ap.args.no_fg_limit = true,
+		.ap.args.uring_critical = true,
 		.ap.num_folios = 1,
 		.ap.folios = &folio,
 		.ap.descs = &desc,
@@ -1165,7 +1165,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 	ap->args.out_pages = true;
 	ap->args.page_zeroing = true;
 	ap->args.page_replace = true;
-	ap->args.no_fg_limit = true;
+	ap->args.uring_critical = true;
 
 	/* Don't overflow end offset */
 	if (pos + (count - 1) == LLONG_MAX) {
@@ -1595,7 +1595,7 @@ static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,
 	if (fm->fc->handle_killpriv_v2 && !capable(CAP_FSETID))
 		ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
 
-	ap->args.no_fg_limit = true;
+	ap->args.uring_critical = true;
 	err = fuse_simple_request(fm, &ap->args);
 	if (!err && ia->write.out.size > count)
 		err = -EIO;
@@ -2923,6 +2923,7 @@ __acquires(fi->lock)
 	args->in_args[1].size = inarg->size;
 	args->force = true;
 	args->nocreds = true;
+	args->uring_critical = true;
 
 	err = fuse_simple_background(fm, args, GFP_ATOMIC);
 	if (err == -ENOMEM) {
