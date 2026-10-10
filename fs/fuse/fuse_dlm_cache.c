@@ -176,7 +176,10 @@ static void fuse_dlm_try_merge(struct fuse_dlm_cache *cache, uint64_t start,
  * For overlapping ranges, handle lock compatibility:
  * - READ locks are compatible with existing READ locks
  * - READ locks are compatible with existing WRITE locks (downgrade not needed)
- * - WRITE locks need to upgrade existing READ locks
+ * - WRITE locks need to upgrade existing READ locks, but only over the
+ *   intersection with [start, end]: the server granted nothing outside
+ *   it, so the parts of a READ range beyond the grant are split off and
+ *   keep their mode
  *
  * Return: 0 on success, negative error code on failure
  */
@@ -210,6 +213,49 @@ int fuse_dlm_lock_range(struct fuse_inode *inode, uint64_t start,
 		/* Check lock compatibility */
 		if (lock_mode == FUSE_PCACHE_LK_WRITE &&
 		    lock_mode != range->mode) {
+			/*
+			 * Upgrade only what the server granted: the grant
+			 * covers [start, end], not the whole of an
+			 * overlapping READ range.  Split off the pieces
+			 * outside the grant first -- mode-preserving, so
+			 * an allocation failure below still leaves the
+			 * tree describing exactly the grants held -- and
+			 * upgrade just the intersection.
+			 */
+			if (range->start < start) {
+				new_range = kmalloc(sizeof(*new_range),
+						    GFP_KERNEL);
+				if (!new_range) {
+					ret = -ENOMEM;
+					goto out_free;
+				}
+				new_range->start = range->start;
+				new_range->end = start - 1;
+				new_range->mode = range->mode;
+				INIT_LIST_HEAD(&new_range->list);
+				fuse_page_it_remove(range, &cache->ranges);
+				range->start = start;
+				fuse_page_it_insert(range, &cache->ranges);
+				fuse_page_it_insert(new_range,
+						    &cache->ranges);
+			}
+			if (range->end > end) {
+				new_range = kmalloc(sizeof(*new_range),
+						    GFP_KERNEL);
+				if (!new_range) {
+					ret = -ENOMEM;
+					goto out_free;
+				}
+				new_range->start = end + 1;
+				new_range->end = range->end;
+				new_range->mode = range->mode;
+				INIT_LIST_HEAD(&new_range->list);
+				fuse_page_it_remove(range, &cache->ranges);
+				range->end = end;
+				fuse_page_it_insert(range, &cache->ranges);
+				fuse_page_it_insert(new_range,
+						    &cache->ranges);
+			}
 			/* we own the lock but have to update it. */
 			list_add_tail(&range->list, &to_upgrade);
 		}
