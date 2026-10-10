@@ -2120,7 +2120,7 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
 		inarg.valid |= FATTR_WRITEBACK;
 	fuse_setattr_fill(fm->fc, &args, inode, &inarg, &outarg);
 	/* might be called from writeback, like a background request */
-	args.no_fg_limit = true;
+	args.uring_critical = true;
 
 	return fuse_simple_request(fm, &args);
 }

@@ -649,10 +649,21 @@ int fuse_simple_background(struct fuse_mount *fm, struct fuse_args *args,
 			return -ENOMEM;
 		__set_bit(FR_BACKGROUND, &req->flags);
 	} else {
+		/*
+		 * A critical request must not wait for the background budget:
+		 * async readahead holds its folios locked here, and the budget
+		 * might be held by requests blocked in userspace on a DLM revoke
+		 * that waits for those folios. It still counts in the budget,
+		 * and the limits on active background requests still apply.
+		 */
+		bool critical = args->uring_critical && fm->fc->writeback_cache;
+
 		WARN_ON(args->nocreds);
-		req = fuse_get_req(&invalid_mnt_idmap, fm, true);
+		req = fuse_get_req(&invalid_mnt_idmap, fm, !critical);
 		if (IS_ERR(req))
 			return PTR_ERR(req);
+		if (critical)
+			__set_bit(FR_BACKGROUND, &req->flags);
 	}
 
 	fuse_args_to_req(req, args);

@@ -422,7 +422,20 @@ struct fuse_args {
 	bool is_ext:1;
 	bool is_pinned:1;
 	bool invalidate_vmap:1;
-	bool no_fg_limit:1;
+	/*
+	 * Request is on the path invalidation waits for: the page reads in
+	 * fuse_do_readfolio() and fuse_send_readpages(), the page writes in
+	 * fuse_send_write_pages() and fuse_send_writepage(), and
+	 * fuse_flush_times(), which writeback calls. With the writeback cache,
+	 * it must never be held back behind requests that may be blocked in
+	 * userspace on a DLM revoke: foreground or background, it is exempt
+	 * from the io-uring entry limits and may use the critical entries, see
+	 * fuse_uring_req_critical(), and a background one does not wait for
+	 * the background budget, see fuse_simple_background(). Critical
+	 * requests are not limited, so the daemon must never block them on a
+	 * DLM revoke that waits on page invalidation on this node.
+	 */
+	bool uring_critical:1;
 	struct fuse_in_arg in_args[4];
 	struct fuse_arg out_args[2];
 	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
@@ -511,7 +524,10 @@ struct fuse_io_priv {
  * FR_PRIVATE:		request is on private list
  * FR_ASYNC:		request is asynchronous
  * FR_URING:		request is handled through fuse-io-uring
- * FR_URING_FG:		request is counted in the io-uring queue foreground limit
+ * FR_URING_NONCRIT:	request is counted in the io-uring queue non-critical limit,
+ *			shared by non-critical foreground and background requests
+ * FR_URING_CRITICAL:	critical background request counted in the io-uring
+ *			queue active critical background requests
  */
 enum fuse_req_flag {
 	FR_ISREPLY,
@@ -528,7 +544,8 @@ enum fuse_req_flag {
 	FR_PRIVATE,
 	FR_ASYNC,
 	FR_URING,
-	FR_URING_FG,
+	FR_URING_NONCRIT,
+	FR_URING_CRITICAL,
 };
 
 /**

@@ -95,21 +95,25 @@ struct fuse_ring_queue {
 	/* fuse requests waiting for an entry slot */
 	struct list_head fuse_req_queue;
 
-	/* background fuse requests */
+	/* non-critical background fuse requests */
 	struct list_head fuse_req_bg_queue;
 
-	/* foreground fuse requests waiting for the foreground limit */
+	/* uring_critical background fuse requests */
+	struct list_head fuse_req_bg_crit_queue;
+
+	/* non-critical foreground fuse requests waiting for the non-critical limit */
 	struct list_head fuse_req_fg_queue;
 
 	/* number of registered ring entries */
 	unsigned int nr_ents;
 
 	/*
-	 * foreground requests on fuse_req_queue or in userspace, limited to
-	 * the entries not reserved for background requests with writeback cache;
-	 * see fuse_uring_max_foreground()
+	 * non-critical requests, foreground and background, on fuse_req_queue
+	 * or in userspace. With the writeback cache they are limited to the
+	 * entries that are not critical entries, which are used only by
+	 * uring_critical requests, see fuse_uring_max_noncritical().
 	 */
-	unsigned int active_foreground;
+	unsigned int active_noncritical;
 
 	/* number of requests queued or in userspace */
 	unsigned int nr_reqs;
@@ -117,6 +121,12 @@ struct fuse_ring_queue {
 	struct fuse_pqueue fpq;
 
 	unsigned int active_background;
+
+	/*
+	 * uring_critical background requests on fuse_req_queue or in
+	 * userspace, one is always allowed regardless of the bg limits
+	 */
+	unsigned int active_bg_critical;
 
 	bool stopped;
 };
