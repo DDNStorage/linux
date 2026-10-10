@@ -1476,13 +1476,24 @@ static ssize_t fuse_send_write(struct fuse_io_args *ia, loff_t pos,
  * i_size still at the value read means nothing landed in the gap.  When it
  * moved, the mover zeroed its own gap before publishing, and only what lies
  * past the new size is left to do.
+ *
+ * Under DLM with the writeback cache, i_size is only this node's view and the
+ * server's side of the gap need not be a hole: the folio may have been read
+ * from the server with another node's bytes past it.  Zeroing would send
+ * zeros over them at writeback.  Only a shared writable mapping can put bytes
+ * past EOF that need zeroing, so skip unless the inode has had one.
  */
 void fuse_zero_eof_gap(struct inode *inode, loff_t to)
 {
+	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct folio *folio;
 	loff_t from, end;
 	bool done;
+
+	if (fc->dlm && fc->writeback_cache &&
+	    !test_bit(FUSE_I_SHARED_WRITE_MMAP, &fi->state))
+		return;
 
 	do {
 		from = i_size_read(inode);
@@ -3192,9 +3203,16 @@ retry:
 	/*
 	 * Check if the start of this folio comes after the end of file,
 	 * in which case the readpage can be optimized away.
+	 *
+	 * Not under DLM: there i_size is only this node's view.  Another
+	 * node extending the file does not update it, so a folio "past EOF"
+	 * here may hold that node's bytes on the server.  Zero-filling it
+	 * would send zeros over them once writeback covers the whole folio.
+	 * The page-aligned write grant this write holds makes the server's
+	 * copy current, so read it.
 	 */
 	fsize = i_size_read(mapping->host);
-	if (fsize <= folio_pos(folio)) {
+	if (!fc->dlm && fsize <= folio_pos(folio)) {
 		size_t off = offset_in_folio(folio, pos);
 		if (off)
 			folio_zero_segment(folio, 0, off);
@@ -3254,11 +3272,9 @@ static int fuse_write_end(struct file *file, struct address_space *mapping,
 	 * than by an unlocked read-modify-write two concurrent extenders could
 	 * lose an update to.
 	 *
-	 * Growing i_size just behind the write cursor, rather than claiming
-	 * the whole extension up front, also keeps fuse_write_begin()'s
-	 * beyond-EOF optimisation effective: folios wholly past EOF are zeroed
-	 * locally instead of sending the server a read-modify-write READ for
-	 * data that does not exist yet.
+	 * This i_size is not what fuse_write_begin() trusts to skip its
+	 * read-modify-write READ: under DLM it reads every partial folio,
+	 * because another node may have written past this node's i_size.
 	 */
 	if (pos > inode->i_size) {
 		struct fuse_inode *fi = get_fuse_inode(inode);
@@ -3961,8 +3977,10 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 			return rc;
 	}
 
-	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
+	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE)) {
+		set_bit(FUSE_I_SHARED_WRITE_MMAP, &get_fuse_inode(inode)->state);
 		fuse_link_write_file(file);
+	}
 
 	file_accessed(file);
 	vma->vm_ops = &fuse_file_vm_ops;
