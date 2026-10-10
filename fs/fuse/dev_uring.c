@@ -71,6 +71,46 @@ static struct fuse_ring_ent *uring_cmd_to_ring_ent(struct io_uring_cmd *cmd)
 	return pdu->ent;
 }
 
+/*
+ * With the writeback cache, some entries of a queue are critical entries, used
+ * only by uring_critical requests. Other requests, foreground and background,
+ * might wait in userspace on DLM revokes, which wait on page invalidation,
+ * which waits on writeback and page reads - if they held all entries, the
+ * critical requests could not be sent and none of them would complete.
+ *
+ * The critical entries are a quarter of the entries, but at least 2.
+ * Non-critical requests share the rest, but always keep at least one entry,
+ * and always leave at least one critical entry when there are 2 or more.
+ */
+#define FUSE_URING_MIN_CRITICAL	2U
+
+static unsigned int fuse_uring_nr_critical(struct fuse_ring_queue *queue)
+{
+	if (queue->nr_ents < 2)
+		return 0;
+
+	return min(max(queue->nr_ents / 4, FUSE_URING_MIN_CRITICAL),
+		   queue->nr_ents - 1);
+}
+
+static unsigned int fuse_uring_max_noncritical(struct fuse_ring_queue *queue)
+{
+	return max(queue->nr_ents - fuse_uring_nr_critical(queue), 1U);
+}
+
+static bool fuse_uring_req_critical(struct fuse_req *req)
+{
+	return req->fm->fc->writeback_cache &&
+	       req->args && req->args->uring_critical;
+}
+
+static bool fuse_uring_req_fg_noncritical(struct fuse_req *req)
+{
+	return req->fm->fc->writeback_cache &&
+	       !test_bit(FR_BACKGROUND, &req->flags) &&
+	       !fuse_uring_req_critical(req);
+}
+
 static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
 {
 	struct fuse_ring *ring = queue->ring;
@@ -84,9 +124,36 @@ static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
 	 * This prevents a single queue from consuming all resources and
 	 * eliminates the need for remote queue wake-ups when global
 	 * limits are met but this queue has no more waiting requests.
+	 *
+	 * Critical bg requests wait on their own list, so they never wait
+	 * behind non-critical bg requests, and are admitted first. They are
+	 * subject to the bg limits, but one critical bg request per queue is
+	 * always allowed. It is not counted in the non-critical limit and can
+	 * use the critical entries, so critical bg requests always progress.
+	 *
+	 * With the writeback cache, non-critical bg requests also share the
+	 * non-critical limit with foreground requests, see
+	 * fuse_uring_max_noncritical().
 	 */
 	while ((fc->active_background < fc->max_background ||
+		!queue->active_bg_critical) &&
+	       !list_empty(&queue->fuse_req_bg_crit_queue)) {
+		struct fuse_req *req;
+
+		req = list_first_entry(&queue->fuse_req_bg_crit_queue,
+				       struct fuse_req, list);
+		fc->active_background++;
+		queue->active_background++;
+		set_bit(FR_URING_CRITICAL, &req->flags);
+		queue->active_bg_critical++;
+
+		list_move_tail(&req->list, &queue->fuse_req_queue);
+	}
+
+	while ((fc->active_background < fc->max_background ||
 		!queue->active_background) &&
+	       (!fc->writeback_cache || queue->stopped ||
+		queue->active_noncritical < fuse_uring_max_noncritical(queue)) &&
 	       (!list_empty(&queue->fuse_req_bg_queue))) {
 		struct fuse_req *req;
 
@@ -94,91 +161,82 @@ static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
 				       struct fuse_req, list);
 		fc->active_background++;
 		queue->active_background++;
+		if (fc->writeback_cache) {
+			set_bit(FR_URING_NONCRIT, &req->flags);
+			queue->active_noncritical++;
+		}
 
 		list_move_tail(&req->list, &queue->fuse_req_queue);
 	}
-}
-
-/*
- * With the writeback cache, foreground requests may hold at most half of the
- * entries. They might wait in userspace on DLM revokes, which wait on page
- * invalidation, which waits on writeback - if they held all entries,
- * background writeback could not be sent and none of them would complete.
- */
-#define FUSE_URING_MIN_FOREGROUND	8U
-#define FUSE_URING_MIN_BACKGROUND	2U
-
-static unsigned int fuse_uring_max_background(struct fuse_ring_queue *queue)
-{
-	return max(queue->nr_ents / 4, FUSE_URING_MIN_BACKGROUND);
-}
-
-static unsigned int fuse_uring_max_foreground(struct fuse_ring_queue *queue)
-{
-	unsigned int bg = fuse_uring_max_background(queue);
-
-	if (queue->nr_ents <= bg) {
-		pr_warn_once("fuse-io-uring configuration value is too small, could cause hung issue\n");
-		return queue->nr_ents;
-	}
-
-	return queue->nr_ents - bg;
-}
-
-static bool fuse_uring_req_fg_limited(struct fuse_req *req)
-{
-	return req->fm->fc->writeback_cache &&
-	       !test_bit(FR_BACKGROUND, &req->flags) &&
-	       !(req->args && req->args->no_fg_limit);
 }
 
 static void fuse_uring_flush_queue_fg(struct fuse_ring_queue *queue)
 {
 	lockdep_assert_held(&queue->lock);
 
-	while (queue->active_foreground < fuse_uring_max_foreground(queue) &&
+	while (queue->active_noncritical < fuse_uring_max_noncritical(queue) &&
 	       !list_empty(&queue->fuse_req_fg_queue)) {
 		struct fuse_req *req;
 
 		req = list_first_entry(&queue->fuse_req_fg_queue,
 				       struct fuse_req, list);
-		set_bit(FR_URING_FG, &req->flags);
-		queue->active_foreground++;
+		set_bit(FR_URING_NONCRIT, &req->flags);
+		queue->active_noncritical++;
 
 		list_move_tail(&req->list, &queue->fuse_req_queue);
 	}
 }
 
-static void fuse_uring_end_foreground(struct fuse_ring_queue *queue,
-				       struct fuse_req *req)
+/*
+ * Undo the queue counting of an admitted request, and admit waiting requests
+ * into the freed slots. Requests that were never admitted are not counted.
+ */
+static void fuse_uring_end_active(struct fuse_ring_queue *queue,
+				   struct fuse_req *req)
 {
+	struct fuse_conn *fc = queue->ring->fc;
+	bool noncritical, background;
+
 	lockdep_assert_held(&queue->lock);
 
-	if (test_and_clear_bit(FR_URING_FG, &req->flags)) {
-		queue->active_foreground--;
-		fuse_uring_flush_queue_fg(queue);
+	noncritical = test_and_clear_bit(FR_URING_NONCRIT, &req->flags);
+	if (noncritical)
+		queue->active_noncritical--;
+
+	background = test_bit(FR_BACKGROUND, &req->flags);
+	if (background) {
+		queue->active_background--;
+		if (test_and_clear_bit(FR_URING_CRITICAL, &req->flags))
+			queue->active_bg_critical--;
 	}
+
+	/*
+	 * The non-critical limit is shared by foreground and bg requests. A
+	 * freed non-critical slot is offered first to the kind of request that
+	 * freed it, so under load neither kind can starve the other.
+	 */
+	if (noncritical && !background)
+		fuse_uring_flush_queue_fg(queue);
+	if (noncritical || background) {
+		spin_lock(&fc->bg_lock);
+		fuse_uring_flush_queue_bg(queue);
+		spin_unlock(&fc->bg_lock);
+	}
+	if (noncritical && background)
+		fuse_uring_flush_queue_fg(queue);
 }
 
 static void fuse_uring_req_end(struct fuse_ring_ent *ent, struct fuse_req *req,
 			       int error)
 {
 	struct fuse_ring_queue *queue = ent->queue;
-	struct fuse_ring *ring = queue->ring;
-	struct fuse_conn *fc = ring->fc;
 
 	lockdep_assert_not_held(&queue->lock);
 	spin_lock(&queue->lock);
 	ent->fuse_req = NULL;
 	queue->nr_reqs--;
 	list_del_init(&req->list);
-	fuse_uring_end_foreground(queue, req);
-	if (test_bit(FR_BACKGROUND, &req->flags)) {
-		queue->active_background--;
-		spin_lock(&fc->bg_lock);
-		fuse_uring_flush_queue_bg(queue);
-		spin_unlock(&fc->bg_lock);
-	}
+	fuse_uring_end_active(queue, req);
 	spin_unlock(&queue->lock);
 
 	if (error)
@@ -197,8 +255,8 @@ static void fuse_uring_abort_end_queue_requests(struct fuse_ring_queue *queue)
 	spin_lock(&queue->lock);
 	list_for_each_entry(req, &queue->fuse_req_queue, list) {
 		clear_bit(FR_PENDING, &req->flags);
-		if (test_and_clear_bit(FR_URING_FG, &req->flags))
-			queue->active_foreground--;
+		if (test_and_clear_bit(FR_URING_NONCRIT, &req->flags))
+			queue->active_noncritical--;
 	}
 	list_for_each_entry(req, &queue->fuse_req_fg_queue, list)
 		clear_bit(FR_PENDING, &req->flags);
@@ -452,6 +510,7 @@ static struct fuse_ring_queue *fuse_uring_create_queue(struct fuse_ring *ring,
 	INIT_LIST_HEAD(&queue->ent_in_userspace);
 	INIT_LIST_HEAD(&queue->fuse_req_queue);
 	INIT_LIST_HEAD(&queue->fuse_req_bg_queue);
+	INIT_LIST_HEAD(&queue->fuse_req_bg_crit_queue);
 	INIT_LIST_HEAD(&queue->fuse_req_fg_queue);
 	INIT_LIST_HEAD(&queue->ent_released);
 
@@ -516,8 +575,8 @@ static void fuse_uring_entry_teardown(struct fuse_ring_ent *ent, int issue_flags
 	if (req) {
 		/* remove entry from queue->fpq->processing */
 		list_del_init(&req->list);
-		if (test_and_clear_bit(FR_URING_FG, &req->flags))
-			queue->active_foreground--;
+		if (test_and_clear_bit(FR_URING_NONCRIT, &req->flags))
+			queue->active_noncritical--;
 	}
 	queue->nr_ents--;
 
@@ -1095,6 +1154,40 @@ out:
 	fuse_uring_req_end(ent, req, err);
 }
 
+static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg);
+
+/*
+ * Hand each request on fuse_req_queue to an available entry. Freeing a slot
+ * or background budget can admit more than one request at once, and every one
+ * of them needs an entry: a request left on fuse_req_queue next to an idle
+ * entry waits for the next event on this queue, which never comes when the
+ * requests in userspace are all blocked on a DLM revoke.
+ *
+ * Must be called without the queue lock. The entries are sent in task context,
+ * as the caller might hold the io_uring submission lock.
+ */
+static void fuse_uring_dispatch_pending(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_ent *ent;
+	struct fuse_req *req;
+
+	for (;;) {
+		spin_lock(&queue->lock);
+		ent = list_first_entry_or_null(&queue->ent_avail_queue,
+					       struct fuse_ring_ent, list);
+		req = ent ? list_first_entry_or_null(&queue->fuse_req_queue,
+						     struct fuse_req, list) : NULL;
+		if (req)
+			fuse_uring_add_req_to_ring_ent(ent, req);
+		spin_unlock(&queue->lock);
+
+		if (!req)
+			return;
+
+		fuse_uring_dispatch_ent(ent, true);
+	}
+}
+
 /*
  * Get the next fuse req and send it
  */
@@ -1104,11 +1197,15 @@ static void fuse_uring_next_fuse_req(struct fuse_ring_ent *ent,
 {
 	int err;
 	struct fuse_req *req;
+	bool more;
 
 retry:
 	spin_lock(&queue->lock);
 	fuse_uring_ent_avail(ent, queue);
 	req = fuse_uring_ent_assign_req(ent);
+	/* the request that ended might have admitted more than this one */
+	more = !list_empty(&queue->fuse_req_queue) &&
+	       !list_empty(&queue->ent_avail_queue);
 	spin_unlock(&queue->lock);
 
 	if (req) {
@@ -1116,6 +1213,9 @@ retry:
 		if (err)
 			goto retry;
 	}
+
+	if (more)
+		fuse_uring_dispatch_pending(queue);
 }
 
 static int fuse_ring_ent_set_commit(struct fuse_ring_ent *ent)
@@ -1133,8 +1233,6 @@ static int fuse_ring_ent_set_commit(struct fuse_ring_ent *ent)
 	return 0;
 }
 
-static void fuse_uring_dispatch_ent(struct fuse_ring_ent *ent, bool bg);
-
 /* FUSE_URING_CMD_COMMIT_AND_FETCH handler */
 static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 				   struct fuse_conn *fc)
@@ -1148,8 +1246,6 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 	unsigned int qid = READ_ONCE(cmd_req->qid);
 	struct fuse_pqueue *fpq;
 	struct fuse_req *req;
-	struct fuse_ring_ent *avail;
-	struct fuse_req *next = NULL;
 
 	err = -ENOTCONN;
 	if (!ring)
@@ -1165,6 +1261,17 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 
 	if (!READ_ONCE(fc->connected) || READ_ONCE(queue->stopped))
 		return err;
+
+	/*
+	 * With a single entry no entry is critical, so a non-critical request
+	 * blocked in userspace on a DLM revoke can hold the only entry, see
+	 * fuse_uring_nr_critical(). Checked on commit rather than on register,
+	 * as a queue has a single entry while its entries are being registered,
+	 * and libfuse registers all of them before it commits a reply.
+	 */
+	if (fc->writeback_cache && READ_ONCE(queue->nr_ents) < 2)
+		pr_warn_once("fuse-io-uring: qid=%u has a single entry, page I/O might hang behind a request blocked in userspace; use an io-uring queue depth of 2 or more\n",
+			     qid);
 
 	spin_lock(&queue->lock);
 	/* Find a request based on the unique ID of the fuse request
@@ -1189,30 +1296,16 @@ static int fuse_uring_commit_fetch(struct io_uring_cmd *cmd, int issue_flags,
 		pr_info_ratelimited("qid=%d commit_id %llu state %d",
 				    queue->qid, commit_id, ent->state);
 		queue->nr_reqs--;
-		fuse_uring_end_foreground(queue, req);
-		if (test_bit(FR_BACKGROUND, &req->flags)) {
-			queue->active_background--;
-			spin_lock(&fc->bg_lock);
-			fuse_uring_flush_queue_bg(queue);
-			spin_unlock(&fc->bg_lock);
-		}
+		fuse_uring_end_active(queue, req);
 
-		/*
-		 * The freed foreground or background slot might have moved a
-		 * queued request to fuse_req_queue. This entry is not usable,
-		 * so hand the request to another available entry.
-		 */
-		avail = list_first_entry_or_null(&queue->ent_avail_queue,
-						 struct fuse_ring_ent, list);
-		if (avail)
-			next = list_first_entry_or_null(&queue->fuse_req_queue,
-							struct fuse_req, list);
-		if (next)
-			fuse_uring_add_req_to_ring_ent(avail, next);
 		spin_unlock(&queue->lock);
 
-		if (next)
-			fuse_uring_dispatch_ent(avail, true);
+		/*
+		 * The freed non-critical or background slot might have moved
+		 * queued requests to fuse_req_queue. This entry is not usable,
+		 * so hand them to the available entries.
+		 */
+		fuse_uring_dispatch_pending(queue);
 
 		req->out.h.error = err;
 		clear_bit(FR_SENT, &req->flags);
@@ -1459,7 +1552,11 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
 	spin_lock(&queue->lock);
 	ent->cmd = cmd;
 	queue->nr_ents++;
+	/* the new entry might raise the non-critical limit */
 	fuse_uring_flush_queue_fg(queue);
+	spin_lock(&fc->bg_lock);
+	fuse_uring_flush_queue_bg(queue);
+	spin_unlock(&fc->bg_lock);
 	spin_unlock(&queue->lock);
 
 	/* Marks the ring entry as ready */
@@ -1713,7 +1810,7 @@ void fuse_uring_queue_fuse_req(struct fuse_iqueue *fiq, struct fuse_req *req)
 	req->ring_queue = queue;
 	queue->nr_reqs++;
 
-	if (fuse_uring_req_fg_limited(req)) {
+	if (fuse_uring_req_fg_noncritical(req)) {
 		list_add_tail(&req->list, &queue->fuse_req_fg_queue);
 		fuse_uring_flush_queue_fg(queue);
 	} else {
@@ -1747,7 +1844,6 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 	struct fuse_conn *fc = req->fm->fc;
 	struct fuse_ring *ring = fc->ring;
 	struct fuse_ring_queue *queue;
-	struct fuse_ring_ent *ent = NULL;
 
 	queue = fuse_uring_select_queue(ring, true);
 	if (!queue)
@@ -1761,33 +1857,26 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 
 	set_bit(FR_URING, &req->flags);
 	req->ring_queue = queue;
-	list_add_tail(&req->list, &queue->fuse_req_bg_queue);
+	if (fuse_uring_req_critical(req))
+		list_add_tail(&req->list, &queue->fuse_req_bg_crit_queue);
+	else
+		list_add_tail(&req->list, &queue->fuse_req_bg_queue);
 	queue->nr_reqs++;
 
-	ent = list_first_entry_or_null(&queue->ent_avail_queue,
-				       struct fuse_ring_ent, list);
 	spin_lock(&fc->bg_lock);
 	fc->num_background++;
 	if (fc->num_background == fc->max_background)
 		fc->blocked = 1;
 	fuse_uring_flush_queue_bg(queue);
 	spin_unlock(&fc->bg_lock);
+	spin_unlock(&queue->lock);
 
 	/*
 	 * Due to bg_queue flush limits there might be other bg requests
-	 * in the queue that need to be handled first. Or no further req
-	 * might be available.
+	 * in the queue that need to be handled first, or this one might have
+	 * to wait. Budget freed on other queues might also admit several.
 	 */
-	req = list_first_entry_or_null(&queue->fuse_req_queue, struct fuse_req,
-				       list);
-	if (ent && req) {
-		fuse_uring_add_req_to_ring_ent(ent, req);
-		spin_unlock(&queue->lock);
-
-		fuse_uring_dispatch_ent(ent, true);
-	} else {
-		spin_unlock(&queue->lock);
-	}
+	fuse_uring_dispatch_pending(queue);
 
 	return true;
 }
@@ -1796,27 +1885,16 @@ bool fuse_uring_remove_pending_req(struct fuse_req *req)
 {
 	struct fuse_ring_queue *queue = req->ring_queue;
 	bool removed = fuse_remove_pending_req(req, &queue->lock);
-	struct fuse_ring_ent *ent;
-	struct fuse_req *next = NULL;
 
 	if (removed) {
 		/* Update counters after successful removal */
 		spin_lock(&queue->lock);
 		queue->nr_reqs--;
-		fuse_uring_end_foreground(queue, req);
-
-		/* the freed foreground slot might let a queued request run */
-		ent = list_first_entry_or_null(&queue->ent_avail_queue,
-					       struct fuse_ring_ent, list);
-		if (ent)
-			next = list_first_entry_or_null(&queue->fuse_req_queue,
-							struct fuse_req, list);
-		if (next)
-			fuse_uring_add_req_to_ring_ent(ent, next);
+		fuse_uring_end_active(queue, req);
 		spin_unlock(&queue->lock);
 
-		if (next)
-			fuse_uring_dispatch_ent(ent, true);
+		/* the freed non-critical slot might let queued requests run */
+		fuse_uring_dispatch_pending(queue);
 	}
 
 	return removed;
