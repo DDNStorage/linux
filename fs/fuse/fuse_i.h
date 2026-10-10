@@ -313,6 +313,14 @@ enum {
 	 * See fuse_reverse_inval_inode()/fuse_file_io_open().
 	 */
 	FUSE_I_FORCE_DIO,
+	/*
+	 * Has had a shared writable mapping.  Only such a mapping can leave
+	 * bytes past EOF in the last folio, so under DLM fuse_zero_eof_gap()
+	 * zeroes them only when this is set.  Set in fuse_file_mmap() and
+	 * never cleared for the life of the inode: the bytes can outlive the
+	 * mapping in the page cache.
+	 */
+	FUSE_I_SHARED_WRITE_MMAP,
 };
 
 struct fuse_conn;
