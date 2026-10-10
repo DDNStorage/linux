@@ -3379,6 +3379,36 @@ static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t l
 	}
 	return err;
 }
+
+/*
+ * Batch size for fuse_fault_read_private_folios(): one fault-around
+ * window (64k with 4k pages), centred on the faulted page.  A
+ * spanning access (one instruction touching the tail of one page and
+ * the head of the next -- any unaligned copy does this constantly)
+ * needs BOTH pages mapped at once to retire, and every server round
+ * trip gets this client's grant revoked and its page cache dropped
+ * (the server does not exempt the requester, and the notification
+ * runs one op behind).  A one-page grant-and-populate therefore
+ * ping-pongs forever: mapping each page costs a round trip whose
+ * revoke drops the other.  A window covering both pages makes the
+ * neighbour's fault a pure fast-path hit -- recorded grant, resident
+ * folio, NO server op and no new revoke -- and the spanning access
+ * completes.  Centred, not aligned: an aligned window has edges
+ * (every 16th page boundary), and a spanning access sitting on an
+ * edge gets two one-page-covering windows and ping-pongs just the
+ * same (generic/263); a centred window always covers both of the
+ * faulted page's neighbours, so no boundary has the problem.
+ */
+#define FUSE_FAULT_BATCH_PAGES 16
+
+/* First page of the populate/grant window centred on @index. */
+static pgoff_t fuse_fault_batch_base(pgoff_t index)
+{
+	if (index < FUSE_FAULT_BATCH_PAGES / 2)
+		return 0;
+	return index - FUSE_FAULT_BATCH_PAGES / 2;
+}
+
 /*
  * Wait for writeback against this page to complete before allowing it
  * to be marked dirty again, and hence written back again, possibly
@@ -3400,9 +3430,60 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	struct file *file = vmf->vma->vm_file;
 	struct inode *inode = file_inode(file);
 	struct fuse_mount *fm = get_fuse_mount(inode);
+	loff_t pos = vmf->pgoff << PAGE_SHIFT;
 
-	if (!fm->fc->writeback_cache && fm->fc->dlm) {
-		loff_t pos = vmf->pgoff << PAGE_SHIFT;
+	if (fm->fc->writeback_cache && fm->fc->dlm) {
+		/*
+		 * Writenotify routes every clean-to-dirty transition of a
+		 * shared mapping through here, but the WRITE grant itself
+		 * is taken by fuse_filemap_fault(): shared-writable VMAs
+		 * get no ->map_pages under DLM (see fuse_file_mmap()), so
+		 * every PTE in such a VMA was installed by a fault that
+		 * recorded a WRITE grant for its batch window.  Only
+		 * verify here, and only without blocking -- nothing may
+		 * sleep on the range lock or the server while mmap_lock
+		 * (or the per-VMA lock) is held: the buffered write path
+		 * holds the range lock LOCKED while faulting in its
+		 * source buffer (which takes mmap_lock), so with a
+		 * pending mmap_lock writer queued between the two,
+		 * blocking here deadlocks three ways -- the cycle
+		 * 94effa2 ("fuse: do not block the fault path under
+		 * mmap_lock") removed from the fault path -- and
+		 * page_mkwrite has no VM_FAULT_RETRY protocol to drop
+		 * the lock and come back with.
+		 *
+		 * Same fence as fuse_filemap_fault()'s fast path: only
+		 * once LOCKED can the recorded grant be trusted.  On a
+		 * miss, NOPAGE.  A contended trylock re-faults with
+		 * mmap_lock released in between, so the holder can make
+		 * progress; a verified miss means a revoke is in flight
+		 * (only an invalidate removes a recorded grant), whose
+		 * unmap_mapping_range() clears the PTE, so the re-fault
+		 * goes through fuse_filemap_fault(), which re-takes the
+		 * grant with the proper drop-and-retry dance.
+		 */
+		struct fuse_inode *fi = get_fuse_inode(inode);
+		struct fuse_range_lock rlock;
+		bool held = false;
+
+		if (fuse_range_lock_try_acquire_init(fi, &rlock, pos,
+						     pos + PAGE_SIZE - 1,
+						     FUSE_RANGE_LOCK_WRITE)) {
+			bool locked =
+				fuse_range_lock_try_mark_locked(fi, &rlock);
+
+			held = locked &&
+			       fuse_dlm_lock_is_held(fi, pos, PAGE_SIZE,
+						     FUSE_PAGE_LOCK_WRITE);
+			if (locked && !held)
+				pr_warn_ratelimited("fuse: mkwrite with no WRITE grant, nodeid %llu idx %lu\n",
+						    fi->nodeid, vmf->pgoff);
+			fuse_range_lock_release(fi, &rlock);
+		}
+
+		if (!held)
+			return VM_FAULT_NOPAGE;
+	} else if (fm->fc->dlm) {
 		size_t length = PAGE_SIZE;
 		int err = fuse_get_page_mkwrite_lock(file, pos, length);
 		if (err < 0) {
@@ -3444,35 +3525,6 @@ static bool fuse_fault_needs_read(struct inode *inode, pgoff_t index)
 	uptodate = folio_test_uptodate(folio);
 	folio_put(folio);
 	return !uptodate;
-}
-
-/*
- * Batch size for fuse_fault_read_private_folios(): one fault-around
- * window (64k with 4k pages), centred on the faulted page.  A
- * spanning access (one instruction touching the tail of one page and
- * the head of the next -- any unaligned copy does this constantly)
- * needs BOTH pages mapped at once to retire, and every server round
- * trip gets this client's grant revoked and its page cache dropped
- * (the server does not exempt the requester, and the notification
- * runs one op behind).  A one-page grant-and-populate therefore
- * ping-pongs forever: mapping each page costs a round trip whose
- * revoke drops the other.  A window covering both pages makes the
- * neighbour's fault a pure fast-path hit -- recorded grant, resident
- * folio, NO server op and no new revoke -- and the spanning access
- * completes.  Centred, not aligned: an aligned window has edges
- * (every 16th page boundary), and a spanning access sitting on an
- * edge gets two one-page-covering windows and ping-pongs just the
- * same (generic/263); a centred window always covers both of the
- * faulted page's neighbours, so no boundary has the problem.
- */
-#define FUSE_FAULT_BATCH_PAGES 16
-
-/* First page of the populate/grant window centred on @index. */
-static pgoff_t fuse_fault_batch_base(pgoff_t index)
-{
-	if (index < FUSE_FAULT_BATCH_PAGES / 2)
-		return 0;
-	return index - FUSE_FAULT_BATCH_PAGES / 2;
 }
 
 /*
@@ -3707,9 +3759,19 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 		 * miss and come back here; each pass leaves a recorded
 		 * grant behind, which only a real invalidation takes away
 		 * again.
+		 *
+		 * FAULT_FLAG_TRIED does not demote a pass to the blocking
+		 * path below: retries may repeat (4064b98 "mm: allow
+		 * VM_FAULT_RETRY for multiple times"), and blocking on
+		 * the range lock with mmap_lock held closes a three-party
+		 * cycle whenever the lock holder is a buffered write
+		 * faulting in its source buffer (which waits on
+		 * mmap_lock) behind a queued mmap_lock writer.  A miss on
+		 * the retried fast path only means the range is contended
+		 * again; waiting for it must happen with mmap_lock
+		 * dropped, every time.
 		 */
-		if ((vmf->flags & FAULT_FLAG_ALLOW_RETRY) &&
-		    !(vmf->flags & FAULT_FLAG_TRIED)) {
+		if (vmf->flags & FAULT_FLAG_ALLOW_RETRY) {
 			if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 				return VM_FAULT_RETRY;
 
@@ -3763,11 +3825,12 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 		}
 
 		/*
-		 * Retries exhausted or not allowed: block in place.  The
-		 * waits are killable, and a same-task fault-in never
-		 * conflicts with its own IO's range lock, so this cannot
-		 * deadlock on itself; it can still stack behind a pending
-		 * mmap_lock writer the way any blocking fault can.
+		 * Retry not allowed (a caller without
+		 * FAULT_FLAG_ALLOW_RETRY): block in place.  The waits are
+		 * killable, and a same-task fault-in never conflicts with
+		 * its own IO's range lock, so this cannot deadlock on
+		 * itself; it can still stack behind a pending mmap_lock
+		 * writer the way any blocking fault can.
 		 *
 		 * Nothing held once the range lock is LOCKED may wait for
 		 * the server (see fuse_cache_read_iter), and
@@ -3906,6 +3969,23 @@ static const struct vm_operations_struct fuse_file_vm_ops = {
 	.page_mkwrite	= fuse_page_mkwrite,
 };
 
+/*
+ * Shared-writable VMAs under the writeback cache with DLM: no
+ * ->map_pages.  Fault-around installs PTEs for any resident folio in
+ * its window without calling ->fault, so a folio read in under a READ
+ * grant (read(2), readahead) could take its first write in
+ * ->page_mkwrite with no WRITE grant ever requested -- and
+ * page_mkwrite cannot take one there (no retry protocol; see
+ * fuse_page_mkwrite()).  Without fault-around, every first touch goes
+ * through fuse_filemap_fault(), which records a WRITE grant for the
+ * batch window before any PTE is installed.
+ */
+static const struct vm_operations_struct fuse_file_wb_dlm_vm_ops = {
+	.close		= fuse_vma_close,
+	.fault		= fuse_filemap_fault,
+	.page_mkwrite	= fuse_page_mkwrite,
+};
+
 static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct fuse_file *ff = file->private_data;
@@ -3987,7 +4067,11 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	file_accessed(file);
-	vma->vm_ops = &fuse_file_vm_ops;
+	if (fc->writeback_cache && fc->dlm &&
+	    (vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
+		vma->vm_ops = &fuse_file_wb_dlm_vm_ops;
+	else
+		vma->vm_ops = &fuse_file_vm_ops;
 	return 0;
 }
 
