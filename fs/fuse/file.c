@@ -242,11 +242,15 @@ struct fuse_file *fuse_file_open(struct fuse_mount *fm, u64 nodeid,
 							 &attr_outarg, outargp);
 			if (err == -ENOSYS)
 				fc->compound_open_getattr = 0;
-			if (!err)
+			if (!err) {
+				/* before the cached values are swapped in */
+				ff->args->attr_outarg = attr_outarg;
+				ff->args->attr_fetched = true;
 				fuse_change_attributes(inode, &attr_outarg.attr,
 						       NULL,
 						       ATTR_TIMEOUT(&attr_outarg),
 						       fuse_get_attr_version(fc));
+			}
 		}
 		if (err == -ENOSYS) {
 			err = fuse_send_open(fm, nodeid, open_flags, opcode, outargp);
@@ -330,7 +334,12 @@ int fuse_finish_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static void fuse_truncate_update_attr(struct inode *inode, struct file *file)
+/*
+ * The server truncated and stamped the file on FUSE_OPEN; its time stamps
+ * are taken once the page cache is emptied (fuse_truncate_server_times()),
+ * never set locally, where they would be flushed back over the server's.
+ */
+static void fuse_truncate_update_attr(struct inode *inode)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -339,7 +348,6 @@ static void fuse_truncate_update_attr(struct inode *inode, struct file *file)
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	i_size_write(inode, 0);
 	spin_unlock(&fi->lock);
-	file_update_time(file);
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
 }
 
@@ -416,7 +424,7 @@ static int fuse_open(struct inode *inode, struct file *file)
 		if (err)
 			fuse_sync_release(fi, ff, file->f_flags);
 		else if (is_truncate)
-			fuse_truncate_update_attr(inode, file);
+			fuse_truncate_update_attr(inode);
 	}
 
 	if (range_locked)
@@ -425,9 +433,10 @@ static int fuse_open(struct inode *inode, struct file *file)
 		fuse_release_nowrite(inode);
 
 	if (!err) {
-		if (is_truncate)
+		if (is_truncate) {
 			truncate_pagecache(inode, 0);
-		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+			fuse_truncate_server_times(inode, file);
+		} else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
 			invalidate_inode_pages2(inode->i_mapping);
 	}
 	if (dax_truncate)
