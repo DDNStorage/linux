@@ -475,7 +475,12 @@ struct fuse_release_args {
 
 union fuse_file_args {
 	/* Used during open() */
-	struct fuse_open_out open_outarg;
+	struct {
+		struct fuse_open_out open_outarg;
+		/* The attributes the open fetched with it, if any */
+		struct fuse_attr_out attr_outarg;
+		bool attr_fetched;
+	};
 	/* Used during release() */
 	struct fuse_release_args release_args;
 };
@@ -1550,6 +1555,7 @@ void fuse_flush_time_update(struct inode *inode);
 void fuse_update_ctime(struct inode *inode);
 
 int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask);
+void fuse_truncate_server_times(struct inode *inode, struct file *file);
 int fuse_update_attributes_sync(struct inode *inode, struct file *file,
 				u32 mask);
 

@@ -1479,6 +1479,143 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
 	return err;
 }
 
+/*
+ * Ask the server for mtime and ctime alone, with the file handle.  The
+ * server computes neither size nor blocks for the two stamps.  Sets
+ * fc->no_statx and returns -ENOSYS where the server has no statx.
+ */
+static int fuse_statx_times(struct fuse_mount *fm, struct inode *inode,
+			    struct fuse_file *ff, struct fuse_statx_out *outarg)
+{
+	const u32 mask = STATX_MTIME | STATX_CTIME;
+	struct fuse_statx *sx = &outarg->stat;
+	struct fuse_statx_in inarg;
+	FUSE_ARGS(args);
+	int err;
+
+	memset(&inarg, 0, sizeof(inarg));
+	memset(outarg, 0, sizeof(*outarg));
+	inarg.getattr_flags = FUSE_GETATTR_FH;
+	inarg.fh = ff->fh;
+	inarg.sx_mask = mask;
+	args.opcode = FUSE_STATX;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(*outarg);
+	args.out_args[0].value = outarg;
+	err = fuse_simple_request(fm, &args);
+	if (err == -ENOSYS)
+		fm->fc->no_statx = 1;
+	if (err)
+		return err;
+
+	if ((sx->mask & mask) != mask ||
+	    ((sx->mask & STATX_SIZE) && !fuse_valid_size(sx->size)) ||
+	    ((sx->mask & STATX_TYPE) && (!fuse_valid_type(sx->mode) ||
+					 inode_wrong_type(inode, sx->mode)))) {
+		fuse_make_bad(inode);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* The GETATTR with the file handle for a server without statx. */
+static int fuse_getattr_times(struct fuse_mount *fm, struct inode *inode,
+			      struct fuse_file *ff, struct fuse_attr_out *outarg)
+{
+	struct fuse_getattr_in inarg;
+	FUSE_ARGS(args);
+	int err;
+
+	memset(&inarg, 0, sizeof(inarg));
+	memset(outarg, 0, sizeof(*outarg));
+	inarg.getattr_flags = FUSE_GETATTR_FH;
+	inarg.fh = ff->fh;
+	fuse_getattr_args_fill(&args, get_node_id(inode), &inarg, outarg);
+	err = fuse_simple_request(fm, &args);
+	if (err)
+		return err;
+
+	if (fuse_invalid_attr(&outarg->attr) ||
+	    inode_wrong_type(inode, outarg->attr.mode)) {
+		fuse_make_bad(inode);
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * Take the server's mtime and ctime after an O_TRUNC open.
+ *
+ * The server truncated and stamped the file on FUSE_OPEN and the page cache
+ * has just been emptied, so nothing local is newer than its stamps.  The
+ * attributes come with the open where the server supports the compound and
+ * are fetched here otherwise: the two stamps alone by a statx where the
+ * server has it, all of them by a GETATTR else.  fuse_change_attributes()
+ * keeps the cached stamps for a writeback inode, which predate the truncate,
+ * and drops a reply an update since has overtaken, so the stamps are set
+ * from the reply directly.  A failed request leaves the attributes
+ * invalidated for the next stat to ask again.
+ */
+void fuse_truncate_server_times(struct inode *inode, struct file *file)
+{
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_file *ff = file->private_data;
+	struct fuse_attr_out outarg;
+	struct fuse_statx_out sxarg;
+	struct fuse_attr *attr = &outarg.attr;
+	struct fuse_statx *sx = NULL;
+	struct timespec64 mtime, ctime;
+	bool fetched = ff->args && ff->args->attr_fetched;
+	u64 attr_version = 0;
+	u64 attr_valid;
+
+	if (fetched) {
+		outarg = ff->args->attr_outarg;
+		attr_valid = ATTR_TIMEOUT(&outarg);
+	} else {
+		int err = -ENOSYS;
+
+		attr_version = fuse_get_attr_version(fc);
+		if (!fc->no_statx) {
+			err = fuse_statx_times(fm, inode, ff, &sxarg);
+			if (!err) {
+				sx = &sxarg.stat;
+				fuse_statx_to_attr(sx, attr);
+				attr_valid = ATTR_TIMEOUT(&sxarg);
+			}
+		}
+		if (err == -ENOSYS) {
+			err = fuse_getattr_times(fm, inode, ff, &outarg);
+			attr_valid = ATTR_TIMEOUT(&outarg);
+		}
+		if (err)
+			return;
+	}
+
+	/* before fuse_change_attributes() rewrites them */
+	mtime.tv_sec = attr->mtime;
+	mtime.tv_nsec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
+	ctime.tv_sec = attr->ctime;
+	ctime.tv_nsec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
+
+	/* the open's reply went through fuse_change_attributes() already */
+	if (!fetched)
+		fuse_change_attributes(inode, attr, sx, attr_valid,
+				       attr_version);
+
+	spin_lock(&fi->lock);
+	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+	inode_set_mtime_to_ts(inode, mtime);
+	inode_set_ctime_to_ts(inode, ctime);
+	spin_unlock(&fi->lock);
+}
+
 static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
 				struct file *file, struct kstat *stat,
 				u32 request_mask, unsigned int flags,
