@@ -411,6 +411,15 @@ struct fuse_args_pages {
 	unsigned int num_pages;
 };
 
+struct fuse_release_args {
+	struct fuse_args args;
+	struct fuse_release_in inarg;
+	struct inode *inode;
+	/* The attributes the open fetched with it, if any */
+	struct fuse_attr_out attr_outarg;
+	bool attr_fetched;
+};
+
 #define FUSE_ARGS(args) struct fuse_args args = {}
 
 /** The request IO state (for asynchronous processing) */
@@ -1432,6 +1441,7 @@ void fuse_flush_time_update(struct inode *inode);
 void fuse_update_ctime(struct inode *inode);
 
 int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask);
+void fuse_truncate_server_times(struct inode *inode, struct file *file);
 int fuse_update_attributes_sync(struct inode *inode, struct file *file,
 				u32 mask);
 
