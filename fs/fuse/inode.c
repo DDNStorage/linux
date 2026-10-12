@@ -596,6 +596,8 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_range_lock rlock;
+	bool range_locked = false;
 	u32 cache_mask;
 	loff_t oldsize;
 	struct timespec64 old_mtime;
@@ -604,7 +606,29 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	bool have_mtime = !sx || (sx->mask & STATX_MTIME);
 	bool have_ctime = !sx || (sx->mask & STATX_CTIME);
 
+	/*
+	 * Applying a size below i_size takes everything above it out of the
+	 * page cache, and under dlm a cached write moves i_size under
+	 * fi->lock alone, so a write landing past the reported size between
+	 * the decision and truncate_pagecache() would have its dirty folios
+	 * dropped.  Hold the IO range lock over that range across the
+	 * truncate, as fuse_do_setattr() does: a write claiming past the
+	 * size waits in fuse_range_lock_mark_locked() until the truncate is
+	 * done, and one already there holds this reply until its claim is in
+	 * i_size, which the size_seen test below notices.  A grant a waiting
+	 * writer records meanwhile covers nothing dirty yet.
+	 *
+	 * Only for a shrink that is going to be applied.  A larger size
+	 * truncates nothing under dlm (see below), and the lock would hold
+	 * every writer past the reported size for the reply.
+	 */
 	cache_mask = fuse_attr_cache_mask(inode, attr, have_size, &size_seen);
+	if (have_size && !(cache_mask & STATX_SIZE) && S_ISREG(inode->i_mode) &&
+	    fc->dlm && fc->writeback_cache && (loff_t)attr->size < size_seen) {
+		fuse_range_lock_acquire_locked(fi, &rlock, attr->size, ~0ULL,
+					       FUSE_RANGE_LOCK_WRITE);
+		range_locked = true;
+	}
 
 	spin_lock(&fi->lock);
 	/*
@@ -646,7 +670,7 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	if ((attr_version != 0 && fi->attr_version > attr_version) ||
 	    test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state)) {
 		spin_unlock(&fi->lock);
-		return;
+		goto out;
 	}
 
 	old_mtime = inode_get_mtime(inode);
@@ -678,7 +702,16 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 		bool inval = false;
 
 		if (have_size && oldsize != attr->size) {
-			truncate_pagecache(inode, attr->size);
+			/*
+			 * A larger size truncates nothing under dlm: every
+			 * uptodate folio above the old size is under a grant,
+			 * which a remote write into it revokes first, and a
+			 * local write may be landing past the reported size
+			 * right now.  A smaller one runs under the range lock.
+			 */
+			if ((loff_t)attr->size < oldsize ||
+			    !(fc->dlm && fc->writeback_cache))
+				truncate_pagecache(inode, attr->size);
 			if (!fc->explicit_inval_data)
 				inval = true;
 		} else if (have_mtime && fc->auto_inval_data) {
@@ -701,6 +734,9 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_dontcache(inode, attr->flags);
+out:
+	if (range_locked)
+		fuse_range_lock_release(fi, &rlock);
 }
 
 void fuse_change_attributes(struct inode *inode, struct fuse_attr *attr,
