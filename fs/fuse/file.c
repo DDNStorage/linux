@@ -1252,6 +1252,32 @@ static bool fuse_read_needs_size(struct inode *inode, loff_t pos, size_t len)
 	return fuse_size_needs_server(inode) && pos + len > i_size_read(inode);
 }
 
+/*
+ * How much of the user buffer to fault in before retrying a cached read.
+ *
+ * While the read is still making progress, fault a multi-page window,
+ * capped the way gfs2's should_fault_in_pages() does. After a retry
+ * copies nothing, drop to a single page so one large fault-in that does
+ * not stick gets a smaller try. The caller stops if that page also makes
+ * no progress: fault_in of an already resident page succeeds, so retrying
+ * it without a stop would spin.
+ */
+static size_t fuse_read_fault_window(struct kiocb *iocb, size_t count,
+				      bool single_page)
+{
+	size_t size = PAGE_SIZE;
+	size_t offs = offset_in_page(iocb->ki_pos);
+	size_t nr_dirtied;
+
+	if (!single_page) {
+		nr_dirtied = max(current->nr_dirtied_pause -
+				 current->nr_dirtied, 8);
+		size = min_t(size_t, SZ_1M, nr_dirtied << PAGE_SHIFT);
+	}
+
+	return min_t(size_t, size - offs, count);
+}
+
 static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct file *file = iocb->ki_filp;
@@ -1371,8 +1397,10 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	{
 		ssize_t total = 0;
 		size_t prev_count = 0;
+		bool single_page = false;
 
 		for (;;) {
+			size_t remain;
 			size_t window;
 			int err;
 
@@ -1386,22 +1414,39 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			    !(res >= 0 && iov_iter_count(to) &&
 			      iocb->ki_pos < i_size_read(inode)))
 				break;
-			if (!user_backed_iter(to) ||
-			    iov_iter_count(to) == prev_count)
+			if (!user_backed_iter(to))
 				break;
-			prev_count = iov_iter_count(to);
+
+			remain = iov_iter_count(to);
+			if (!remain)
+				break;
+			if (remain == prev_count) {
+				if (single_page) {
+					pr_warn_ratelimited("fuse: cached read made no progress after a one-page fault-in, nodeid %llu pos %lld size %lld remain %zu res %zd\n",
+							    fi->nodeid, iocb->ki_pos,
+							    i_size_read(inode), remain, res);
+					break;
+				}
+				single_page = true;
+			} else {
+				single_page = false;
+			}
+			prev_count = remain;
 
 			fuse_range_lock_mark_init(fi, &rlock);
-			window = min_t(size_t, iov_iter_count(to), SZ_1M);
+			window = fuse_read_fault_window(iocb, remain, single_page);
+			if (!window)
+				break;
 			window -= fault_in_iov_iter_writeable(to, window);
 			if (!window)
 				break;
-			fuse_get_dlm_lock(file, iocb->ki_pos,
-					  iov_iter_count(to),
+			fuse_get_dlm_lock(file, iocb->ki_pos, remain,
 					  FUSE_PAGE_LOCK_READ, &rlock);
 			err = fuse_range_lock_mark_locked(fi, &rlock);
-			if (err)
+			if (err) {
+				res = err;
 				break;
+			}
 		}
 
 		fuse_range_lock_release(fi, &rlock);
