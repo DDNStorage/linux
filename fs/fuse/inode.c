@@ -979,7 +979,9 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 		if (wb_sem) {
 			bool hot, has_writer, latched = false;
-			int ierr;
+			loff_t wb_start = 0;
+			loff_t wb_end = LLONG_MAX;
+			int ierr, werr;
 
 			spin_lock(&fi->lock);
 			hot = fuse_notify_inval_hot(fi);
@@ -1014,6 +1016,33 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				}
 				spin_unlock(&fi->lock);
 			}
+
+			/*
+			 * Write the range back in bulk before dropping it.
+			 * invalidate_inode_pages2_range() would otherwise
+			 * launder each dirty folio with its own synchronous
+			 * WRITE, and the server holds the conflicting grant
+			 * until that finishes.  The gate keeps cached writers
+			 * from dirtying the range again; anything left dirty
+			 * is still laundered below.  Wait with _keep_errors so
+			 * that a write-back error stays in AS_EIO/AS_ENOSPC
+			 * for fuse_flush() to report at close;
+			 * filemap_write_and_wait_range() would clear it.
+			 */
+			if (!fuse_inode_force_dio(inode)) {
+				wb_start = offset;
+				if (len > 0 && len - 1 <= LLONG_MAX - offset)
+					wb_end = offset + len - 1;
+			}
+			werr = filemap_fdatawrite_range(inode->i_mapping,
+							wb_start, wb_end);
+			ierr = filemap_fdatawait_range_keep_errors(inode->i_mapping,
+								   wb_start, wb_end);
+			if (werr)
+				ierr = werr;
+			if (ierr)
+				pr_warn_ratelimited("FUSE: inode %llu write-back before invalidate failed: %d\n",
+						    nodeid, ierr);
 
 			/*
 			 * Latched: drop the whole mapping (dirty folios
