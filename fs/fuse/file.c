@@ -3194,7 +3194,20 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 		 * a queued mmap_lock writer.  A miss on the retried fast
 		 * path only means the gate is contended again; waiting
 		 * for it must happen with mmap_lock dropped, every time.
+		 *
+		 * The flip side is that an error met with mmap_lock
+		 * dropped cannot be reported: only VM_FAULT_RETRY (or
+		 * COMPLETED) may be returned then, and a retried fault
+		 * that keeps failing comes straight back here.  An
+		 * aborted connection fails every request, so the task
+		 * would refault forever: it burns CPU in this path,
+		 * only SIGKILL ends it, and its mapping keeps the mount
+		 * busy.  Check it while the fault lock is still held,
+		 * where SIGBUS can be returned.
 		 */
+		if (!READ_ONCE(fc->connected))
+			return VM_FAULT_SIGBUS;
+
 		if (vmf->flags & FAULT_FLAG_ALLOW_RETRY) {
 			if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 				return VM_FAULT_RETRY;
@@ -3205,7 +3218,8 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 			/*
 			 * A hard error is not failed here, it cannot be
 			 * with the fault lock dropped: the retried fault
-			 * meets it again.
+			 * meets it again.  A lost connection ends at the
+			 * check above.
 			 */
 			fuse_get_dlm_lock(file, bpos, blen, mode);
 			/*
