@@ -23,6 +23,8 @@
 #include <linux/file.h>
 #include <linux/splice.h>
 #include <linux/delay.h>
+#include <linux/uaccess.h>
+#include <linux/sizes.h>
 
 int sb_init_dio_done_wq(struct super_block *sb);
 
@@ -1211,6 +1213,9 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
 	size_t count = iov_iter_count(to);
+	int tries = FUSE_DLM_READ_RETRIES;
+	size_t prev_count = 0;
+	ssize_t total = 0;
 	ssize_t res;
 	int lock_err = 0;
 
@@ -1238,6 +1243,10 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 					     iov_iter_count(to),
 					     FUSE_PAGE_LOCK_READ);
 
+	/* wb_sem is NULL on non-writeback+dlm mounts (gate inactive). */
+	if (!wb_sem)
+		return generic_file_read_iter(iocb, to);
+
 	/*
 	 * Fence the cache-serving read against a NOTIFY invalidate so we never
 	 * hand back a folio the server has just superseded.  The gate read side
@@ -1245,16 +1254,34 @@ static ssize_t fuse_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * Re-check the forced-DIO latch under it: if a storm latched us while we
 	 * waited on a pending writer, reroute to direct like the buffered write
 	 * path, so we do not repopulate the cache the latch just dropped.
-	 * wb_sem is NULL on non-writeback+dlm mounts (gate inactive).
+	 *
+	 * Nothing held under the gate may wait for the server, and faulting
+	 * on the user buffer can do exactly that: a buffer backed by a
+	 * shared-writable mapping of this (or any) fuse file sends
+	 * fuse_filemap_fault() after a WRITE grant, and granting it can
+	 * first require the server to revoke this read's own READ grant,
+	 * whose invalidation then waits on the gate this read holds.  ABBA
+	 * through the server, and request_wait_answer() does not die to
+	 * SIGKILL once the request is in userspace.
+	 *
+	 * So copy with page faults disabled (a non-resident user page makes
+	 * the copy come back short instead of faulting), and fault the
+	 * buffer in with the gate dropped: nothing is held then that the
+	 * revoke's invalidation needs.  The grant may be revoked while the
+	 * gate is dropped, so re-cover it before re-entering, which
+	 * re-validates it like the first pass.  Same shape as
+	 * gfs2_file_read_iter() around its glock.
 	 */
-	if (wb_sem) {
-		int tries = FUSE_DLM_READ_RETRIES;
+	for (;;) {
+		size_t remain;
+		size_t window;
 
 retry:
 		percpu_down_read(wb_sem);
 		if (fuse_inode_force_dio(inode)) {
 			percpu_up_read(wb_sem);
-			return fuse_direct_read_iter(iocb, to);
+			res = fuse_direct_read_iter(iocb, to);
+			break;
 		}
 		/*
 		 * The DLM lock was requested before entering the gate, and
@@ -1267,8 +1294,8 @@ retry:
 		 * hold.  A failed or unrecorded request falls through
 		 * unlocked, as before: the retry is taken even then (the
 		 * latch must be re-checked under the re-entered gate), so
-		 * lock_err has to stay sticky across it -- seeded by the
-		 * pre-gate request above -- or a grant that failed would
+		 * lock_err has to stay sticky across it, seeded by the
+		 * pre-gate request above, or a grant that failed would
 		 * be re-requested forever.  The retry is also bounded: a
 		 * remote writer can revoke each successful grant before
 		 * the gate is re-entered, and a reader-only inode has no
@@ -1286,14 +1313,34 @@ retry:
 						     FUSE_PAGE_LOCK_READ);
 			goto retry;
 		}
+
+		pagefault_disable();
+		res = generic_file_read_iter(iocb, to);
+		pagefault_enable();
+		percpu_up_read(wb_sem);
+		if (res > 0)
+			total += res;
+
+		if (res != -EFAULT &&
+		    !(res >= 0 && iov_iter_count(to) &&
+		      iocb->ki_pos < i_size_read(inode)))
+			break;
+		if (!user_backed_iter(to) ||
+		    iov_iter_count(to) == prev_count)
+			break;
+		prev_count = iov_iter_count(to);
+
+		window = min_t(size_t, iov_iter_count(to), SZ_1M);
+		window -= fault_in_iov_iter_writeable(to, window);
+		if (!window)
+			break;
+		remain = iov_iter_count(to);
+		if (!lock_err && fc->dlm)
+			lock_err = fuse_get_dlm_lock(file, iocb->ki_pos, remain,
+						     FUSE_PAGE_LOCK_READ);
 	}
 
-	res = generic_file_read_iter(iocb, to);
-
-	if (wb_sem)
-		percpu_up_read(wb_sem);
-
-	return res;
+	return total > 0 ? total : res;
 }
 
 static void fuse_write_args_fill(struct fuse_io_args *ia, struct fuse_file *ff,
