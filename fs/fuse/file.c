@@ -2854,9 +2854,54 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 	struct file *file = vmf->vma->vm_file;
 	struct inode *inode = file_inode(file);
 	struct fuse_mount *fm = get_fuse_mount(inode);
+	loff_t pos = vmf->pgoff << PAGE_SHIFT;
 
-	if (!fm->fc->writeback_cache && fm->fc->dlm) {
-		loff_t pos = vmf->pgoff << PAGE_SHIFT;
+	if (fm->fc->writeback_cache && fm->fc->dlm) {
+		/*
+		 * Writenotify routes every clean-to-dirty transition of a
+		 * shared mapping through here, but the WRITE grant itself
+		 * is taken by fuse_filemap_fault(): shared-writable VMAs
+		 * get no ->map_pages under DLM (see fuse_file_mmap()), so
+		 * every PTE in such a VMA was installed by a fault that
+		 * recorded a WRITE grant for its batch window.  Only
+		 * verify here, and only without blocking: nothing may
+		 * sleep on the gate or the server while mmap_lock (or the
+		 * per-VMA lock) is held.  The buffered read and write
+		 * paths hold the gate while faulting in their user
+		 * buffers (which takes mmap_lock), so with a pending
+		 * mmap_lock writer queued between the two, blocking here
+		 * deadlocks three ways, the cycle fuse_filemap_fault()
+		 * avoids with its drop-and-retry, and page_mkwrite has no
+		 * VM_FAULT_RETRY protocol to drop the lock and come back
+		 * with.
+		 *
+		 * Same fence as fuse_filemap_fault()'s fast path: only
+		 * under the gate can the recorded grant be trusted.  On a
+		 * miss, NOPAGE.  A contended trylock re-faults with
+		 * mmap_lock released in between, so the gate writer can
+		 * make progress; a verified miss means a revoke or a
+		 * truncate is in flight (only those remove a recorded
+		 * grant, and both drop the pages under the gate write
+		 * side), whose unmap clears the PTE, so the re-fault goes
+		 * through fuse_filemap_fault(), which re-takes the grant
+		 * with the proper drop-and-retry dance.
+		 */
+		struct fuse_inode *fi = get_fuse_inode(inode);
+		struct percpu_rw_semaphore *wb_sem = fi->wb_inval_rwsem;
+		bool held = false;
+
+		if (fuse_wb_gate_tryenter(wb_sem)) {
+			held = fuse_dlm_lock_is_held(fi, pos, PAGE_SIZE,
+						     FUSE_PAGE_LOCK_WRITE);
+			if (!held)
+				pr_warn_ratelimited("fuse: mkwrite with no WRITE grant, nodeid %llu idx %lu\n",
+						    fi->nodeid, vmf->pgoff);
+			fuse_wb_gate_exit(wb_sem);
+		}
+
+		if (!held)
+			return VM_FAULT_NOPAGE;
+	} else if (fm->fc->dlm) {
 		size_t length = PAGE_SIZE;
 		int err = fuse_get_page_mkwrite_lock(file, pos, length);
 		if (err < 0) {
@@ -3307,6 +3352,23 @@ static const struct vm_operations_struct fuse_file_vm_ops = {
 	.page_mkwrite	= fuse_page_mkwrite,
 };
 
+/*
+ * Shared-writable VMAs under the writeback cache with DLM: no
+ * ->map_pages.  Fault-around installs PTEs for any resident folio in
+ * its window without calling ->fault, so a folio read in under a READ
+ * grant (read(2), readahead) could take its first write in
+ * ->page_mkwrite with no WRITE grant ever requested, and page_mkwrite
+ * cannot take one there (no retry protocol; see fuse_page_mkwrite()).
+ * Without fault-around, every first touch goes through
+ * fuse_filemap_fault(), which records a WRITE grant for the batch
+ * window before any PTE is installed.
+ */
+static const struct vm_operations_struct fuse_file_wb_dlm_vm_ops = {
+	.close		= fuse_vma_close,
+	.fault		= fuse_filemap_fault,
+	.page_mkwrite	= fuse_page_mkwrite,
+};
+
 static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct fuse_file *ff = file->private_data;
@@ -3373,7 +3435,11 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 		fuse_link_write_file(file);
 
 	file_accessed(file);
-	vma->vm_ops = &fuse_file_vm_ops;
+	if (fc->writeback_cache && fc->dlm &&
+	    (vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
+		vma->vm_ops = &fuse_file_wb_dlm_vm_ops;
+	else
+		vma->vm_ops = &fuse_file_vm_ops;
 	return 0;
 }
 
