@@ -994,6 +994,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				   fc->writeback_cache && fc->dlm;
 		bool hot = false, has_writer = false, latched = false;
 		bool track_latch;
+		int ierr;
 
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)
@@ -1113,10 +1114,14 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * notified range.
 		 */
 		if (fuse_inode_force_dio(inode))
-			invalidate_inode_pages2_range(inode->i_mapping, 0, -1);
+			ierr = invalidate_inode_pages2_range(inode->i_mapping,
+							     0, -1);
 		else
-			invalidate_inode_pages2_range(inode->i_mapping,
-						      pg_start, pg_end);
+			ierr = invalidate_inode_pages2_range(inode->i_mapping,
+							     pg_start, pg_end);
+		if (ierr)
+			pr_warn_ratelimited("FUSE: inode %llu invalidate failed, folios left in page cache: %d\n",
+					    nodeid, ierr);
 
 		if (latched)
 			pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
