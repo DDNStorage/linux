@@ -2797,6 +2797,10 @@ static int fuse_launder_folio(struct folio *folio)
 		err = fuse_writepage_locked(&folio->page);
 		if (!err)
 			fuse_wait_on_page_writeback(inode, folio->index);
+		else
+			pr_warn_ratelimited("fuse: launder write failed, nodeid %llu pos %lld: %d\n",
+					    get_node_id(inode),
+					    folio_pos(folio), err);
 	}
 	return err;
 }

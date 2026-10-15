@@ -943,6 +943,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 		if (wb_sem) {
 			bool hot, has_writer, latched = false;
+			int ierr;
 
 			spin_lock(&fi->lock);
 			hot = fuse_notify_inval_hot(fi);
@@ -985,13 +986,16 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			 * notified range.
 			 */
 			if (fuse_inode_force_dio(inode))
-				invalidate_inode_pages2(inode->i_mapping);
+				ierr = invalidate_inode_pages2(inode->i_mapping);
 			else
-				invalidate_inode_pages2_range(inode->i_mapping,
-							      pg_start, pg_end);
+				ierr = invalidate_inode_pages2_range(inode->i_mapping,
+								     pg_start, pg_end);
 
 			percpu_up_write(wb_sem);
 
+			if (ierr)
+				pr_warn_ratelimited("FUSE: inode %llu invalidate failed, folios left in page cache: %d\n",
+						    nodeid, ierr);
 			if (latched)
 				pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
 						    nodeid);
@@ -999,10 +1003,15 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			/* No gate on this inode (DAX, non-regular, or the
 			 * gate allocation failed): drop the lock range
 			 * unserialized (best-effort), as before. */
+			int ierr;
+
 			if (fc->dlm && fc->writeback_cache)
 				fuse_dlm_revoke_inval_range(fi, offset, len);
-			invalidate_inode_pages2_range(inode->i_mapping,
-						      pg_start, pg_end);
+			ierr = invalidate_inode_pages2_range(inode->i_mapping,
+							     pg_start, pg_end);
+			if (ierr)
+				pr_warn_ratelimited("FUSE: inode %llu invalidate failed, folios left in page cache: %d\n",
+						    nodeid, ierr);
 		}
 	}
 	iput(inode);
