@@ -2601,6 +2601,20 @@ static int fuse_getattr(struct mnt_idmap *idmap,
 		return -EACCES;
 	}
 
+	/*
+	 * Under dlm a stat asks the server.  The attribute timeout says
+	 * nothing about the cluster: a write or truncate another node makes
+	 * outside every range held here revokes nothing, so nothing marks the
+	 * attributes stale, and the cache would answer with what this node
+	 * last heard.  The server revokes every writer of the file before it
+	 * answers, so the reply is the file as it is and nothing cached has to
+	 * be kept over it or written out first.  Only the user's own stat
+	 * asks: the kernel's reads and writes keep their timeout-gated
+	 * fetches.  AT_STATX_DONT_SYNC still takes the cache.
+	 */
+	if (fc->dlm && fc->writeback_cache && !(flags & AT_STATX_DONT_SYNC))
+		flags |= AT_STATX_FORCE_SYNC;
+
 	return fuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags,
 				    NULL);
 }
