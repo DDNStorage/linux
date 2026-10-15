@@ -498,6 +498,13 @@ static void fuse_args_to_req(struct fuse_req *req, struct fuse_args *args)
 	req->args = args;
 	if (args->is_ext)
 		req->in.h.total_extlen = args->in_args[args->ext_idx].size / 8;
+	if (args->has_new_ext) {
+		req->in.h.total_new_extlen = 0;
+		for (int i = 0; i < args->ext_numargs; i++) {
+			req->in.h.total_new_extlen += args->ext_in_args[i].size / 8;
+		}
+		BUG_ON(req->in.h.total_new_extlen * 8 > FUSE_URING_EXT_IN_SZ);
+	}
 	if (args->end)
 		__set_bit(FR_ASYNC, &req->flags);
 
@@ -1010,6 +1017,7 @@ static int fuse_copy_one(struct fuse_copy_state *cs, void *val, unsigned size)
 /* Copy request arguments to/from userspace buffer */
 int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
 		   unsigned argpages, struct fuse_arg *args,
+		   unsigned ext_numargs, struct fuse_arg *ext_args,
 		   int zeroing)
 {
 	int err = 0;
@@ -1017,10 +1025,20 @@ int fuse_copy_args(struct fuse_copy_state *cs, unsigned numargs,
 
 	for (i = 0; !err && i < numargs; i++)  {
 		struct fuse_arg *arg = &args[i];
-		if (i == numargs - 1 && argpages)
-			err = fuse_copy_pages(cs, arg->size, zeroing);
-		else
+		if (i < numargs - 1 || !argpages)
 			err = fuse_copy_one(cs, arg->value, arg->size);
+	}
+
+	/* io_uring requests carry extensions in the request header, so ext_numargs is zero for them. */
+	for (i = 0; !err && i < ext_numargs; i++)  {
+		struct fuse_arg *arg = &ext_args[i];
+		err = fuse_copy_one(cs, arg->value, arg->size);
+	}
+
+	/* Copy the page-backed payload last. */
+	if (numargs > 0 && !err && argpages) {
+	        struct fuse_arg *arg = &args[numargs - 1];
+	        err = fuse_copy_pages(cs, arg->size, zeroing);
 	}
 	return err;
 }
@@ -1296,7 +1314,9 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	err = fuse_copy_one(cs, &req->in.h, sizeof(req->in.h));
 	if (!err)
 		err = fuse_copy_args(cs, args->in_numargs, args->in_pages,
-				     (struct fuse_arg *) args->in_args, 0);
+				     (struct fuse_arg *) args->in_args,
+				     args->ext_numargs,
+				     (struct fuse_arg *) args->ext_in_args, 0);
 	fuse_copy_finish(cs);
 	spin_lock(&fpq->lock);
 	clear_bit(FR_LOCKED, &req->flags);
@@ -1867,7 +1887,7 @@ int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		lastarg->size -= diffsize;
 	}
 	return fuse_copy_args(cs, args->out_numargs, args->out_pages,
-			      args->out_args, args->page_zeroing);
+			      args->out_args, 0, NULL, args->page_zeroing);
 }
 
 /*
