@@ -1008,6 +1008,44 @@ static void fuse_short_read(struct inode *inode, u64 attr_ver, size_t num_read,
 	}
 }
 
+/*
+ * Under DLM with the writeback cache, i_size is this node's view: each cached
+ * write claims its own extension, and the server's size is not consulted.  A
+ * read reply is evidence of more.  The server answers short past its EOF, so
+ * num_read bytes at pos mean the file reaches pos + num_read, and the grant
+ * the read was made under keeps it there: a remote truncate revokes every
+ * grant above its new size before it proceeds (see fuse_attr_cache_mask()).
+ *
+ * Without this the bytes another node wrote past the local i_size, read into
+ * a folio by the read-modify-write read of a cached write, count as post-EOF:
+ * iomap_writeback_handle_eof() zeroes them in the folio when the folio is
+ * written back, and they stay zero in the cache until the next revoke.  Raise
+ * i_size to what the reply proves, so nothing in the folio is past EOF.
+ *
+ * Only a reply newer than the attributes may raise the size, as in
+ * fuse_read_update_size(): a reply issued before a truncate must not undo it.
+ */
+static void fuse_read_extend_size(struct inode *inode, u64 attr_ver,
+				  size_t num_read, struct fuse_args_pages *ap)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t end;
+
+	if (!fc->dlm || !fc->writeback_cache || !num_read)
+		return;
+
+	end = folio_pos(ap->folios[0]) + ap->descs[0].offset + num_read;
+
+	spin_lock(&fi->lock);
+	if (attr_ver >= fi->attr_version && end > inode->i_size &&
+	    !test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state)) {
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
+		i_size_write(inode, end);
+	}
+	spin_unlock(&fi->lock);
+}
+
 static int fuse_do_readfolio(struct file *file, struct folio *folio,
 			     size_t off, size_t len)
 {
@@ -1056,6 +1094,8 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	 */
 	if (res < desc.length)
 		fuse_short_read(inode, attr_ver, res, &ia.ap);
+
+	fuse_read_extend_size(inode, attr_ver, res, &ia.ap);
 
 	return 0;
 }
@@ -1147,6 +1187,10 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 		 */
 		if (!err && num_read < count)
 			fuse_short_read(inode, ia->read.attr_ver, num_read, ap);
+
+		if (!err)
+			fuse_read_extend_size(inode, ia->read.attr_ver, num_read,
+					      ap);
 
 		fuse_invalidate_atime(inode);
 	}
