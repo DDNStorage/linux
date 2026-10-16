@@ -992,6 +992,29 @@ static void fuse_read_update_size(struct inode *inode, loff_t size,
 	spin_unlock(&fi->lock);
 }
 
+/*
+ * Under DLM with the writeback cache, i_size is only this node's view, so
+ * bytes another node wrote can sit past it.  A READ reply proves the file
+ * reaches at least @end; without this, iomap treats those bytes as post-EOF
+ * and zeroes them on writeback.
+ */
+static void fuse_dlm_read_extend_size(struct inode *inode, loff_t end)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (end <= i_size_read(inode))
+		return;
+
+	spin_lock(&fi->lock);
+	if (end > inode->i_size &&
+	    !test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state)) {
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
+		i_size_write(inode, end);
+	}
+	spin_unlock(&fi->lock);
+}
+
 static void fuse_short_read(struct inode *inode, u64 attr_ver, size_t num_read,
 			    struct fuse_args_pages *ap)
 {
@@ -1056,6 +1079,9 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	 */
 	if (res < desc.length)
 		fuse_short_read(inode, attr_ver, res, &ia.ap);
+
+	if (fm->fc->dlm && fm->fc->writeback_cache && res > 0)
+		fuse_dlm_read_extend_size(inode, pos + res);
 
 	return 0;
 }
