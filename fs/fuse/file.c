@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
+#include "fuse_trace.h"
 
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -1069,6 +1070,7 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 
 	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
 	res = fuse_simple_request(fm, &ia.ap.args);
+	trace_fuse_readfolio_reply(inode, pos, desc.length, res);
 	if (res < 0) {
 		/*
 		 * Please refer to Documentation/filesystems/fuse/fuse-AOP_TRUNCATED_PAGE-reason.txt
@@ -2529,6 +2531,8 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			orig_size = i_size_read(inode);
 			if (end > orig_size) {
 				i_size_write(inode, end);
+				trace_fuse_isize_change(inode, orig_size, end,
+							FUSE_ISIZE_WRITE_CLAIM);
 				extended = true;
 			}
 			spin_unlock(&fi->lock);
@@ -2553,8 +2557,11 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 			if (reached < end) {
 				spin_lock(&fi->lock);
-				if (i_size_read(inode) == end)
+				if (i_size_read(inode) == end) {
 					i_size_write(inode, reached);
+					trace_fuse_isize_change(inode, end, reached,
+								FUSE_ISIZE_WRITE_RETRACT);
+				}
 				spin_unlock(&fi->lock);
 			}
 		}
@@ -3319,6 +3326,8 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	 */
 	if (pos + len > end_pos)
 		send_len = end_pos - pos;
+
+	trace_fuse_writeback_range(inode, pos, len, end_pos, send_len);
 
 	if (!data->ff) {
 		data->ff = fuse_write_file_get(fi);
