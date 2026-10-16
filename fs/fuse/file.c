@@ -3267,8 +3267,17 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	loff_t offset = offset_in_folio(folio, pos);
+	unsigned int send_len = len;
 
 	WARN_ON_ONCE(!data);
+
+	/*
+	 * iomap_writeback_handle_eof() zeroed this folio past end_pos (the local
+	 * i_size).  Under DLM that tail can hold another node's data, and i_size
+	 * may grow before the send crop runs, so never send past end_pos.
+	 */
+	if (pos + len > end_pos)
+		send_len = end_pos - pos;
 
 	if (!data->ff) {
 		data->ff = fuse_write_file_get(fi);
@@ -3276,7 +3285,7 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 			return -EIO;
 	}
 
-	if (wpa && fuse_writepage_need_send(fc, pos, len, ap, data, wpc->wbc)) {
+	if (wpa && fuse_writepage_need_send(fc, pos, send_len, ap, data, wpc->wbc)) {
 		fuse_writepages_send(inode, data);
 		data->wpa = NULL;
 		data->nr_bytes = 0;
@@ -3293,8 +3302,8 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 
 	iomap_start_folio_write(inode, folio, 1);
 	fuse_writepage_args_page_fill(wpa, folio, ap->num_folios,
-				      offset, len);
-	data->nr_bytes += len;
+				      offset, send_len);
+	data->nr_bytes += send_len;
 
 	ap->num_folios++;
 	if (!data->wpa)
