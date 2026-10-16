@@ -321,6 +321,12 @@ enum {
 	 * mapping in the page cache.
 	 */
 	FUSE_I_SHARED_WRITE_MMAP,
+	/*
+	 * A DLM lock was taken on this inode and no attribute reply has
+	 * arrived since: i_time is bounded to dlm_attr_timeout seconds from
+	 * the lock, see fuse_dlm_attr_timeout().
+	 */
+	FUSE_I_DLM_LOCKED,
 };
 
 struct fuse_conn;
@@ -1579,6 +1585,9 @@ struct inode *fuse_ilookup(struct fuse_conn *fc, u64 nodeid,
  */
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len);
+
+/* A DLM lock was taken on @fi: bound its attribute timeout until the next reply */
+void fuse_dlm_attr_timeout(struct fuse_inode *fi);
 
 /**
  * File-system tells the kernel to invalidate parent attributes and

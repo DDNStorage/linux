@@ -827,6 +827,8 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	if (err)
 		return err;
 
+	fuse_dlm_attr_timeout(fi);
+
 	if (inarg.start < outarg.start || inarg.end > outarg.end) {
 		/* fuse server is seriously broken */
 		pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",

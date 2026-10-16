@@ -49,6 +49,39 @@ module_param(enable_notify_dio, bool, 0644);
 MODULE_PARM_DESC(enable_notify_dio,
 		 "Latch a contended inode to direct IO on an invalidation notify storm");
 
+/*
+ * Attribute timeout of an inode once a DLM lock was taken on it, in
+ * seconds: i_time is bounded to it until the next attribute reply from
+ * the server, so a GETATTR goes out at most this long after the lock.
+ * 0 leaves the server's timeout alone.
+ */
+static unsigned int __read_mostly dlm_attr_timeout = 30;
+module_param(dlm_attr_timeout, uint, 0644);
+MODULE_PARM_DESC(dlm_attr_timeout,
+		 "Seconds until the attributes of an inode a DLM lock was taken on are fetched again (0 = server's timeout)");
+
+void fuse_dlm_attr_timeout(struct fuse_inode *fi)
+{
+	struct fuse_conn *fc = get_fuse_conn(&fi->inode);
+	unsigned int timeout = READ_ONCE(dlm_attr_timeout);
+	u64 valid;
+
+	if (!timeout)
+		return;
+	valid = get_jiffies_64() + (u64)timeout * HZ;
+
+	spin_lock(&fi->lock);
+	/*
+	 * Only a reply to a request sent after the lock may end the bound:
+	 * one to an earlier request is discarded by fuse_change_attributes_i().
+	 */
+	if (!test_and_set_bit(FUSE_I_DLM_LOCKED, &fi->state))
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
+	if (time_after64(fi->i_time, valid))
+		fi->i_time = valid;
+	spin_unlock(&fi->lock);
+}
+
 static struct kmem_cache *fuse_inode_cachep;
 struct list_head fuse_conn_list;
 DEFINE_MUTEX(fuse_mutex);
@@ -389,6 +422,9 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
 	lockdep_assert_held(&fi->lock);
+
+	/* The first attribute reply after a DLM lock ends the bounded timeout */
+	clear_bit(FUSE_I_DLM_LOCKED, &fi->state);
 
 	if (sx) {
 		return fuse_change_attributes_common_sx(inode, attr, sx,
