@@ -193,6 +193,13 @@ struct fuse_inode {
 	/** Version of last attribute change */
 	u64 attr_version;
 
+	/*
+	 * Bumped under fi->lock whenever the file may have shrunk behind a
+	 * read in flight: a local truncate, or a whole-file invalidate (the
+	 * shape a remote truncate takes).  See fuse_dlm_read_extend_size().
+	 */
+	u64 size_gen;
+
 	union {
 		/* read/write io cache (regular file only) */
 		struct {
@@ -1248,6 +1255,12 @@ static inline u64 fuse_get_attr_version(struct fuse_conn *fc)
 	return atomic64_read(&fc->attr_version);
 }
 
+static inline void fuse_bump_size_gen(struct fuse_inode *fi)
+{
+	lockdep_assert_held(&fi->lock);
+	WRITE_ONCE(fi->size_gen, fi->size_gen + 1);
+}
+
 static inline u64 fuse_get_evict_ctr(struct fuse_conn *fc)
 {
 	return atomic64_read(&fc->evict_ctr);
@@ -1333,6 +1346,7 @@ struct fuse_io_args {
 		struct {
 			struct fuse_read_in in;
 			u64 attr_ver;
+			u64 size_gen;
 		} read;
 		struct {
 			struct fuse_write_in in;

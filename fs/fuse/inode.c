@@ -979,6 +979,12 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	fi = get_fuse_inode(inode);
 	spin_lock(&fi->lock);
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+	/*
+	 * A remote truncate reaches us as a whole-file invalidate; read
+	 * replies in flight may predate it (see fuse_dlm_read_extend_size()).
+	 */
+	if (offset <= 0 && len <= 0)
+		fuse_bump_size_gen(fi);
 	spin_unlock(&fi->lock);
 
 	if (fc->inval_inode_entries)
