@@ -1020,6 +1020,36 @@ static void fuse_short_read(struct inode *inode, u64 attr_ver, size_t num_read,
 	}
 }
 
+/*
+ * Under DLM with the writeback cache, i_size covers only this node's own
+ * writes.  A read reply proves the file extends at least to the bytes it
+ * returned (the server clips reads at its size), and they may be another
+ * node's data in a page this node shares.  Raise i_size over them, so that
+ * iomap_writeback_handle_eof() never zeroes them as if they were past EOF.
+ *
+ * Every revoke bumps attr_version, including the revoke of the very range
+ * being read, so attr_version cannot gate this.  size_gen moves only for a
+ * local truncate or a whole-file invalidate, which is how a remote truncate
+ * reaches us; a reply that may predate either is dropped.
+ */
+static void fuse_dlm_read_extend_size(struct inode *inode, loff_t end,
+				      u64 size_gen)
+{
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (!fc->dlm || !fc->writeback_cache)
+		return;
+
+	spin_lock(&fi->lock);
+	if (fi->size_gen == size_gen && end > inode->i_size &&
+	    !test_bit(FUSE_I_SIZE_UNSTABLE, &fi->state)) {
+		fi->attr_version = atomic64_inc_return(&fc->attr_version);
+		i_size_write(inode, end);
+	}
+	spin_unlock(&fi->lock);
+}
+
 static int fuse_do_readfolio(struct file *file, struct folio *folio,
 			     size_t off, size_t len)
 {
@@ -1040,8 +1070,10 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	};
 	ssize_t res;
 	u64 attr_ver;
+	u64 size_gen;
 
 	attr_ver = fuse_get_attr_version(fm->fc);
+	size_gen = READ_ONCE(get_fuse_inode(inode)->size_gen);
 
 	/* Don't overflow end offset */
 	if (pos + (desc.length - 1) == LLONG_MAX)
@@ -1068,6 +1100,9 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 	 */
 	if (res < desc.length)
 		fuse_short_read(inode, attr_ver, res, &ia.ap);
+
+	if (res > 0)
+		fuse_dlm_read_extend_size(inode, pos + res, size_gen);
 
 	return 0;
 }
@@ -1300,6 +1335,11 @@ static void fuse_readpages_end(struct fuse_mount *fm, struct fuse_args *args,
 	if (!err && num_read < count)
 		fuse_short_read(inode, ia->read.attr_ver, num_read, ap);
 
+	if (!err && num_read)
+		fuse_dlm_read_extend_size(inode,
+					  ia->read.in.offset + num_read,
+					  ia->read.size_gen);
+
 	fuse_invalidate_atime(inode);
 
 	for (i = 0; i < ap->num_folios; i++) {
@@ -1337,6 +1377,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
 	ia->read.attr_ver = fuse_get_attr_version(fm->fc);
+	ia->read.size_gen = READ_ONCE(get_fuse_inode(file_inode(file))->size_gen);
 	if (async) {
 		ia->ff = fuse_file_get(ff);
 		ap->args.end = fuse_readpages_end;

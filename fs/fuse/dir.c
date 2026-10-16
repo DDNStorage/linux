@@ -2595,7 +2595,11 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	}
 
 	if (is_truncate) {
+		/* Drop read replies that may predate the truncate. */
+		spin_lock(&fi->lock);
+		fuse_bump_size_gen(fi);
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
+		spin_unlock(&fi->lock);
 		if (trust_local_cmtime && attr->ia_size != inode->i_size)
 			attr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
 	}
@@ -2692,6 +2696,11 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			fuse_range_lock_release(fi, &rlock);
 	}
 
+	if (is_truncate) {
+		spin_lock(&fi->lock);
+		fuse_bump_size_gen(fi);
+		spin_unlock(&fi->lock);
+	}
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 out:
 	if (fault_blocked)
@@ -2700,6 +2709,11 @@ out:
 	return 0;
 
 error:
+	if (is_truncate) {
+		spin_lock(&fi->lock);
+		fuse_bump_size_gen(fi);
+		spin_unlock(&fi->lock);
+	}
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
 	if (fault_blocked)
