@@ -10,6 +10,7 @@
 #include "fuse_dlm_cache.h"
 #include "fuse_dev_i.h"
 #include "dev_uring_i.h"
+#include "fuse_trace.h"
 
 #include <linux/dax.h>
 #include <linux/pagemap.h>
@@ -684,8 +685,12 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	 * attr->size coming from server can be stale. We cannot trust it.
 	 * Only update i_size if SIZE was actually returned by the server.
 	 */
-	if (have_size && !(cache_mask & STATX_SIZE))
+	if (have_size && !(cache_mask & STATX_SIZE)) {
 		i_size_write(inode, attr->size);
+		if (oldsize != attr->size)
+			trace_fuse_isize_change(inode, oldsize, attr->size,
+						FUSE_ISIZE_ATTR);
+	}
 	spin_unlock(&fi->lock);
 
 	/*

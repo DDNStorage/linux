@@ -1238,6 +1238,12 @@ static inline struct fuse_mount *get_fuse_mount(struct inode *inode)
 	return get_fuse_mount_super(inode->i_sb);
 }
 
+enum fuse_isize_reason {
+	FUSE_ISIZE_WRITE_CLAIM,
+	FUSE_ISIZE_WRITE_RETRACT,
+	FUSE_ISIZE_ATTR,
+};
+
 static inline struct fuse_conn *get_fuse_conn(struct inode *inode)
 {
 	return get_fuse_mount_super(inode->i_sb)->fc;
