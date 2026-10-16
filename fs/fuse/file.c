@@ -2869,6 +2869,8 @@ static int fuse_get_page_mkwrite_lock(struct file *file, loff_t offset, size_t l
 		fuse_abort_conn(fc);
 		err = -EINVAL;
 	}
+	if (!err && fc->dlm)
+		fuse_dlm_attr_timeout(get_fuse_inode(inode));
 	return err;
 }
 
