@@ -502,6 +502,18 @@ struct fuse_file_lock {
 #define FUSE_GETATTR_FH		(1 << 0)
 
 /**
+ * Statx flags (fuse_statx_in.sx_flags), beside the AT_STATX_* values
+ *
+ * FUSE_STATX_LIGHT: the caller does not need cluster-coherent size, blocks,
+ *		     mtime and ctime.  The server may return its current
+ *		     values without recalling locks other clients hold.
+ *		     Such a reply must have a zero attr_valid: the client
+ *		     does not cache it.  A non-zero attr_valid says the
+ *		     values are coherent, and they are cached as usual.
+ */
+#define FUSE_STATX_LIGHT	(1U << 31)
+
+/**
  * Lock flags
  */
 #define FUSE_LK_FLOCK		(1 << 0)
