@@ -715,13 +715,12 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
 		return;
 
 	/*
-	 * error is 0 (a grant) or -ENOSYS (the server has no DLM, so the
-	 * range is treated as covered) here: either way fuse_get_dlm_lock()
-	 * goes on to consider the range usable. Any other error fails the
-	 * IO instead, and the caller releases the still-INIT rlock directly
-	 * without ever touching the page cache under it, so leave it alone.
+	 * error is 0 (a grant) here and fuse_get_dlm_lock() goes on to
+	 * consider the range usable.  Any error fails the IO instead, and the
+	 * caller releases the still-INIT rlock directly without ever touching
+	 * the page cache under it, so leave it alone.
 	 */
-	if (error && error != -ENOSYS)
+	if (error)
 		return;
 
 	fuse_range_lock_mark_ready(dargs->fi, dargs->rlock);
@@ -822,9 +821,10 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	args->complete = fuse_get_dlm_lock_complete;
 	err = fuse_simple_request(fm, args);
 	if (err == -ENOSYS) {
-		/* fuse server does not support dlm, save the info */
-		fc->dlm = 0;
-		return err;
+		/* a server without DLM cannot serve a writeback cache */
+		pr_warn("fuse: server does not implement FUSE_DLM_WB_LOCK, aborting connection\n");
+		fuse_abort_conn(fc);
+		return -EIO;
 	}
 
 	if (err)
@@ -911,7 +911,7 @@ void fuse_range_lock_tree_init(struct fuse_inode *inode)
  *
  * A range held by @lock's own task never conflicts: the only way that
  * happens is the task faulting in its own user buffer mid-IO, where
- * fuse_filemap_fault() takes a range lock on the faulting page while
+ * fuse_wb_filemap_fault() takes a range lock on the faulting page while
  * the read/write path already holds one covering it.  Waiting here
  * would then deadlock on ourselves, and skipping is safe: the outer
  * hold already gives invalidation an overlapping range to conflict

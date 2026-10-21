@@ -519,26 +519,12 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	inode->i_flags &= ~S_NOSEC;
 }
 
-u32 fuse_get_cache_mask(struct inode *inode)
-{
-	struct fuse_conn *fc = get_fuse_conn(inode);
-
-	if (!fc->writeback_cache || !S_ISREG(inode->i_mode) || fc->dlm)
-		return 0;
-
-	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
-}
-
 /*
  * Which cached attributes survive a server reply.
  *
- * Without DLM this is fuse_get_cache_mask(): with the writeback cache on,
- * writes update mtime and ctime and may extend i_size locally, the server
- * knows about none of it, so the cached values win.
- *
- * With DLM the server is the authority (fuse_get_cache_mask() returns 0),
- * because another node may have changed the file behind us and only the
- * server can say so.  That holds for the parts of the file we do not own.  A
+ * The server is the authority, because another node may have changed the
+ * file behind us and only the server can say so.  That holds for the parts
+ * of the file we do not own.  A
  * write grant means no other node can touch the range until we are revoked,
  * so anything the server reports about it is at best as new as what we have,
  * and older if we still have unwritten data there.  Keep the cached values
@@ -578,13 +564,12 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	u32 cache_mask = fuse_get_cache_mask(inode);
+	u32 cache_mask = 0;
 	loff_t size = i_size_read(inode);
 
 	*size_seen = size;
 
-	if (cache_mask || !fc->dlm || !fc->writeback_cache ||
-	    !S_ISREG(inode->i_mode))
+	if (!fc->writeback_cache || !S_ISREG(inode->i_mode))
 		return cache_mask;
 
 	if (!fuse_dlm_write_grant_exists(fi))
@@ -604,16 +589,14 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 /*
  * Whether a cached time stamp stays over the one the server reported.
  *
- * Without dlm the kernel owns the stamps of a writeback inode and the
- * server's are ignored.  With dlm the cached stamp is kept only while the
- * page cache is dirty, because the local writes set it and the server has
- * not seen them.  That makes it a placeholder, not an authority: a later
+ * The cached stamp is kept only while the page cache is dirty, because the
+ * local writes set it and the server has not seen them.  That makes it a
+ * placeholder, not an authority: a later
  * stamp from the server records a modification the server did see, our own
  * earlier writeback or another node's write, and stat() has to report it.
  * The dirty data stamps again when it is written back.
  */
-static bool fuse_cached_time_wins(struct fuse_conn *fc,
-				  const struct timespec64 *cached,
+static bool fuse_cached_time_wins(const struct timespec64 *cached,
 				  u64 sec, u32 nsec, bool have)
 {
 	struct timespec64 reported = {
@@ -621,7 +604,7 @@ static bool fuse_cached_time_wins(struct fuse_conn *fc,
 		.tv_nsec = min_t(u32, nsec, NSEC_PER_SEC - 1),
 	};
 
-	if (!fc->dlm || !have)
+	if (!have)
 		return true;
 
 	return timespec64_compare(cached, &reported) >= 0;
@@ -649,11 +632,11 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	 * fi->lock alone, so a write landing past the reported size between
 	 * the decision and truncate_pagecache() would have its dirty folios
 	 * dropped.  Hold the IO range lock over that range across the
-	 * truncate, as fuse_do_setattr() does: a write claiming past the
-	 * size waits in fuse_range_lock_mark_locked() until the truncate is
-	 * done, and one already there holds this reply until its claim is in
-	 * i_size, which the size_seen test below notices.  A grant a waiting
-	 * writer records meanwhile covers nothing dirty yet.
+	 * truncate, as fuse_wb_truncate_pagecache() does: a write claiming
+	 * past the size waits in fuse_range_lock_mark_locked() until the
+	 * truncate is done, and one already there holds this reply until its
+	 * claim is in i_size, which the size_seen test below notices.  A
+	 * grant a waiting writer records meanwhile covers nothing dirty yet.
 	 *
 	 * Only for a shrink that is going to be applied.  A larger size
 	 * truncates nothing under dlm (see below), and the lock would hold
@@ -661,7 +644,7 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	 */
 	cache_mask = fuse_attr_cache_mask(inode, attr, have_size, &size_seen);
 	if (have_size && !(cache_mask & STATX_SIZE) && S_ISREG(inode->i_mode) &&
-	    fc->dlm && fc->writeback_cache && (loff_t)attr->size < size_seen) {
+	    fc->writeback_cache && (loff_t)attr->size < size_seen) {
 		fuse_range_lock_acquire_locked(fi, &rlock, attr->size, ~0ULL,
 					       FUSE_RANGE_LOCK_WRITE);
 		range_locked = true;
@@ -684,7 +667,7 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	if (cache_mask & STATX_MTIME) {
 		struct timespec64 cached = inode_get_mtime(inode);
 
-		if (fuse_cached_time_wins(fc, &cached, attr->mtime,
+		if (fuse_cached_time_wins(&cached, attr->mtime,
 					  attr->mtimensec, have_mtime)) {
 			attr->mtime = cached.tv_sec;
 			attr->mtimensec = cached.tv_nsec;
@@ -695,7 +678,7 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	if (cache_mask & STATX_CTIME) {
 		struct timespec64 cached = inode_get_ctime(inode);
 
-		if (fuse_cached_time_wins(fc, &cached, attr->ctime,
+		if (fuse_cached_time_wins(&cached, attr->ctime,
 					  attr->ctimensec, have_ctime)) {
 			attr->ctime = cached.tv_sec;
 			attr->ctimensec = cached.tv_nsec;
@@ -751,7 +734,7 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 			 * right now.  A smaller one runs under the range lock.
 			 */
 			if ((loff_t)attr->size < oldsize ||
-			    !(fc->dlm && fc->writeback_cache))
+			    !fc->writeback_cache)
 				truncate_pagecache(inode, attr->size);
 			if (!fc->explicit_inval_data)
 				inval = true;
@@ -1058,7 +1041,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	fi->attr_version = atomic64_inc_return(&fc->attr_version);
 	/*
 	 * A remote truncate reaches us as a whole-file invalidate; read
-	 * replies in flight may predate it (see fuse_dlm_read_extend_size()).
+	 * replies in flight may predate it (see fuse_wb_read_size()).
 	 */
 	if (offset <= 0 && len <= 0)
 		fuse_bump_size_gen(fi);
@@ -1074,7 +1057,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	security_inode_invalidate_secctx(inode);
 	if (offset >= 0) {
 		bool range_locked = S_ISREG(inode->i_mode) &&
-				   fc->writeback_cache && fc->dlm;
+				   fc->writeback_cache;
 		bool hot = false, has_writer = false, latched = false;
 		bool track_latch;
 		int ierr;
@@ -1123,7 +1106,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * files; elsewhere the invalidate just drops the range
 		 * (best-effort), as before.  An mmapped inode is never
 		 * latched: a mapping needs the page cache, and
-		 * fuse_file_mmap() reverts any latch it races with.
+		 * fuse_wb_mmap() reverts any latch it races with.
 		 */
 		if (range_locked) {
 			lock_start = offset;
@@ -1134,12 +1117,11 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 						       FUSE_RANGE_LOCK_WRITE);
 		}
 
-		if (fc->dlm && fc->writeback_cache)
+		if (fc->writeback_cache)
 			fuse_dlm_revoke_inval_range(fi, offset, len);
 
 		track_latch = S_ISREG(inode->i_mode) && fc->writeback_cache &&
-			      fc->dlm && !FUSE_IS_DAX(inode) &&
-			      !fuse_inode_backing(fi);
+			      !FUSE_IS_DAX(inode) && !fuse_inode_backing(fi);
 		if (track_latch) {
 			spin_lock(&fi->lock);
 			hot = fuse_notify_inval_hot(fi);
@@ -1166,7 +1148,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * The LOCKED range lock keeps cached writers from dirtying
 		 * the range again; anything left dirty is still laundered
 		 * below.  Wait with _keep_errors so that a write-back error
-		 * stays in AS_EIO/AS_ENOSPC for fuse_flush() to report at
+		 * stays in AS_EIO/AS_ENOSPC for fuse_wb_flush() to report at
 		 * close; filemap_write_and_wait_range() would clear it.
 		 */
 		if (range_locked) {
@@ -1623,13 +1605,11 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->blocked = 0;
 	fc->initialized = 0;
 	fc->connected = 1;
-	fc->dlm = 1;
 	fc->lookupx = 1;
 
 	/* module option for now */
 	fc->compound_open_getattr = enable_compound;
 
-	xa_init(&fc->dlm_retry_tasks);
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
@@ -1682,7 +1662,6 @@ void fuse_conn_put(struct fuse_conn *fc)
 	}
 	if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 		fuse_backing_files_free(fc);
-	xa_destroy(&fc->dlm_retry_tasks);
 	call_rcu(&fc->rcu, delayed_release);
 }
 EXPORT_SYMBOL_GPL(fuse_conn_put);
