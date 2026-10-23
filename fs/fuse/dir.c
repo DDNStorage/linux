@@ -2365,14 +2365,22 @@ static void iattr_to_fattr(struct mnt_idmap *idmap, struct fuse_conn *fc,
 		if (!(ivalid & ATTR_ATIME_SET))
 			arg->valid |= FATTR_ATIME_NOW;
 	}
+	/*
+	 * Under the writeback cache the DLM server's times win in the reply,
+	 * and the server stamps every other change, create included, with its
+	 * own clock.  Let it stamp "now" too: a client clock behind the
+	 * server's would set mtime before the create time.  Leaving out
+	 * FATTR_CTIME has the server stamp ctime as well.
+	 */
 	if ((ivalid & ATTR_MTIME) && update_mtime(ivalid, trust_local_cmtime)) {
 		arg->valid |= FATTR_MTIME;
 		arg->mtime = iattr->ia_mtime.tv_sec;
 		arg->mtimensec = iattr->ia_mtime.tv_nsec;
-		if (!(ivalid & ATTR_MTIME_SET) && !trust_local_cmtime)
+		if (!(ivalid & ATTR_MTIME_SET))
 			arg->valid |= FATTR_MTIME_NOW;
 	}
-	if ((ivalid & ATTR_CTIME) && trust_local_cmtime) {
+	if ((ivalid & ATTR_CTIME) && trust_local_cmtime &&
+	    !(arg->valid & FATTR_MTIME_NOW)) {
 		arg->valid |= FATTR_CTIME;
 		arg->ctime = iattr->ia_ctime.tv_sec;
 		arg->ctimensec = iattr->ia_ctime.tv_nsec;
