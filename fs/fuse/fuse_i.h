@@ -200,6 +200,13 @@ struct fuse_inode {
 	/** Version of last attribute change */
 	u64 attr_version;
 
+	/*
+	 * Bumped under fi->lock whenever the file may have shrunk behind a
+	 * read in flight: a local truncate, or a whole-file invalidate (the
+	 * shape a remote truncate takes).  See fuse_wb_read_size().
+	 */
+	u64 size_gen;
+
 	union {
 		/* read/write io cache (regular file only) */
 		struct {
@@ -343,6 +350,12 @@ enum {
 	 * See fuse_reverse_inval_inode()/fuse_file_io_open().
 	 */
 	FUSE_I_FORCE_DIO,
+	/*
+	 * A DLM lock was taken on this inode and no attribute reply has
+	 * arrived since: i_time is bounded to dlm_attr_timeout seconds from
+	 * the lock, see fuse_dlm_attr_timeout().
+	 */
+	FUSE_I_DLM_LOCKED,
 };
 
 struct fuse_conn;
@@ -781,17 +794,6 @@ struct fuse_sync_bucket {
 };
 
 /**
- * DLM retry tracking for iomap write deadlock workaround.
- *
- * Temporary workaround until mainline iomap gains AOP_TRUNCATED_PAGE
- * retry support. Tracks tasks that need to retry write operations due
- * to DLM lock contention (-EAGAIN from FUSE server).
- */
-struct fuse_dlm_retry {
-	bool retry_needed;
-};
-
-/**
  * A Fuse connection.
  *
  * This structure is created, when the root filesystem is mounted, and
@@ -1075,9 +1077,6 @@ struct fuse_conn {
 	/* Is statx not implemented by fs? */
 	unsigned int no_statx:1;
 
-	/* do we have support for dlm in the fs? */
-	unsigned int dlm:1;
-
 	/* Is extended lookup implemented by fs? */
 	unsigned int lookupx:1;
 
@@ -1172,13 +1171,6 @@ struct fuse_conn {
 
 	/* The foffset alignment in PAGE */
 	unsigned int alignment_pages;
-
-	/**
-	 * XArray tracking tasks that need DLM retry.
-	 * Maps task pointer -> struct fuse_dlm_retry.
-	 * Temporary workaround for iomap write deadlock.
-	 */
-	struct xarray dlm_retry_tasks;
 };
 
 /*
@@ -1231,6 +1223,12 @@ static inline struct fuse_mount *get_fuse_mount(struct inode *inode)
 	return get_fuse_mount_super(inode->i_sb);
 }
 
+enum fuse_isize_reason {
+	FUSE_ISIZE_WRITE_CLAIM,
+	FUSE_ISIZE_WRITE_RETRACT,
+	FUSE_ISIZE_ATTR,
+};
+
 static inline struct fuse_conn *get_fuse_conn(struct inode *inode)
 {
 	return get_fuse_mount_super(inode->i_sb)->fc;
@@ -1254,6 +1252,12 @@ static inline int invalid_nodeid(u64 nodeid)
 static inline u64 fuse_get_attr_version(struct fuse_conn *fc)
 {
 	return atomic64_read(&fc->attr_version);
+}
+
+static inline void fuse_bump_size_gen(struct fuse_inode *fi)
+{
+	lockdep_assert_held(&fi->lock);
+	WRITE_ONCE(fi->size_gen, fi->size_gen + 1);
 }
 
 static inline u64 fuse_get_evict_ctr(struct fuse_conn *fc)
@@ -1348,6 +1352,7 @@ struct fuse_io_args {
 		struct {
 			struct fuse_read_in in;
 			u64 attr_ver;
+			u64 size_gen;
 		} read;
 		struct {
 			struct fuse_write_in in;
@@ -1427,8 +1432,6 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 				   struct fuse_statx *sx,
 				   u64 attr_valid, u32 cache_mask,
 				   u64 evict_ctr);
-
-u32 fuse_get_cache_mask(struct inode *inode);
 
 /**
  * Initialize the client device
@@ -1636,6 +1639,9 @@ struct inode *fuse_ilookup(struct fuse_conn *fc, u64 nodeid,
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len);
 
+/* A DLM lock was taken on @fi: bound its attribute timeout until the next reply */
+void fuse_dlm_attr_timeout(struct fuse_inode *fi);
+
 /**
  * File-system tells the kernel to invalidate parent attributes and
  * the dentry matching parent/name.
@@ -1740,6 +1746,10 @@ void fuse_dax_dontcache(struct inode *inode, unsigned int flags);
 bool fuse_dax_check_alignment(struct fuse_conn *fc, unsigned int map_alignment);
 void fuse_dax_cancel_work(struct fuse_conn *fc);
 
+/* file.c: the regular-file operations of a DAX inode, per cache mode */
+extern const struct file_operations fuse_wt_dax_file_operations;
+extern const struct file_operations fuse_wb_dax_file_operations;
+
 /* ioctl.c */
 long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 long fuse_file_compat_ioctl(struct file *file, unsigned int cmd,
@@ -1838,7 +1848,7 @@ ssize_t fuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 ssize_t fuse_passthrough_splice_write(struct pipe_inode_info *pipe,
 				      struct file *out, loff_t *ppos,
 				      size_t len, unsigned int flags);
-ssize_t fuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma);
+int fuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma);
 
 #ifdef CONFIG_SYSCTL
 extern int fuse_sysctl_register(void);

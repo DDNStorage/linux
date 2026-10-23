@@ -678,6 +678,9 @@ ssize_t fuse_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct inode *inode = file_inode(iocb->ki_filp);
 	ssize_t ret;
 
+	if (fuse_is_bad(inode))
+		return -EIO;
+
 	if (iocb->ki_flags & IOCB_NOWAIT) {
 		if (!inode_trylock_shared(inode))
 			return -EAGAIN;
@@ -717,6 +720,9 @@ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	ssize_t ret;
+
+	if (fuse_is_bad(inode))
+		return -EIO;
 
 	if (iocb->ki_flags & IOCB_NOWAIT) {
 		if (!inode_trylock(inode))
@@ -1317,10 +1323,14 @@ static bool fuse_should_enable_dax(struct inode *inode, unsigned int flags)
 
 void fuse_dax_inode_init(struct inode *inode, unsigned int flags)
 {
+	struct fuse_conn *fc = get_fuse_conn(inode);
+
 	if (!fuse_should_enable_dax(inode, flags))
 		return;
 
 	inode->i_flags |= S_DAX;
+	inode->i_fop = fc->writeback_cache ? &fuse_wb_dax_file_operations :
+					     &fuse_wt_dax_file_operations;
 	inode->i_data.a_ops = &fuse_dax_file_aops;
 }
 

@@ -150,6 +150,114 @@ TRACE_EVENT(fuse_request_end,
 		  __entry->unique, __entry->len, __entry->error)
 );
 
+#define FUSE_ISIZE_REASONS				\
+	EM( FUSE_ISIZE_WRITE_CLAIM,	"write_claim")	\
+	EM( FUSE_ISIZE_WRITE_RETRACT,	"write_retract")\
+	EMe(FUSE_ISIZE_ATTR,		"attr")
+
+#undef EM
+#undef EMe
+#define EM(a, b)	TRACE_DEFINE_ENUM(a);
+#define EMe(a, b)	TRACE_DEFINE_ENUM(a);
+FUSE_ISIZE_REASONS
+#undef EM
+#undef EMe
+#define EM(a, b)	{ a, b },
+#define EMe(a, b)	{ a, b }
+
+/*
+ * Under DLM i_size is this node's view only; recording every change with its
+ * reason is what lets a lost update be tied to the local EOF at writeback.
+ */
+TRACE_EVENT(fuse_isize_change,
+	TP_PROTO(struct inode *inode, loff_t old_size, loff_t new_size,
+		 int reason),
+
+	TP_ARGS(inode, old_size, new_size, reason),
+
+	TP_STRUCT__entry(
+		__field(dev_t,		connection)
+		__field(uint64_t,	nodeid)
+		__field(loff_t,		old_size)
+		__field(loff_t,		new_size)
+		__field(int,		reason)
+	),
+
+	TP_fast_assign(
+		__entry->connection	=	get_fuse_conn(inode)->dev;
+		__entry->nodeid		=	get_fuse_inode(inode)->nodeid;
+		__entry->old_size	=	old_size;
+		__entry->new_size	=	new_size;
+		__entry->reason		=	reason;
+	),
+
+	TP_printk("connection %u nodeid %llu i_size %lld -> %lld (%s)",
+		  __entry->connection, __entry->nodeid, __entry->old_size,
+		  __entry->new_size,
+		  __print_symbolic(__entry->reason, FUSE_ISIZE_REASONS))
+);
+
+TRACE_EVENT(fuse_writeback_range,
+	TP_PROTO(struct inode *inode, u64 pos, unsigned int len,
+		 u64 end_pos, unsigned int send_len),
+
+	TP_ARGS(inode, pos, len, end_pos, send_len),
+
+	TP_STRUCT__entry(
+		__field(dev_t,		connection)
+		__field(uint64_t,	nodeid)
+		__field(uint64_t,	pos)
+		__field(uint32_t,	len)
+		__field(uint32_t,	send_len)
+		__field(uint64_t,	end_pos)
+		__field(loff_t,		i_size)
+	),
+
+	TP_fast_assign(
+		__entry->connection	=	get_fuse_conn(inode)->dev;
+		__entry->nodeid		=	get_fuse_inode(inode)->nodeid;
+		__entry->pos		=	pos;
+		__entry->len		=	len;
+		__entry->send_len	=	send_len;
+		__entry->end_pos	=	end_pos;
+		__entry->i_size		=	i_size_read(inode);
+	),
+
+	TP_printk("connection %u nodeid %llu pos %llu len %u send %u end_pos %llu i_size %lld",
+		  __entry->connection, __entry->nodeid, __entry->pos,
+		  __entry->len, __entry->send_len, __entry->end_pos,
+		  __entry->i_size)
+);
+
+TRACE_EVENT(fuse_readfolio_reply,
+	TP_PROTO(struct inode *inode, loff_t pos, size_t len,
+		 ssize_t res),
+
+	TP_ARGS(inode, pos, len, res),
+
+	TP_STRUCT__entry(
+		__field(dev_t,		connection)
+		__field(uint64_t,	nodeid)
+		__field(loff_t,		pos)
+		__field(size_t,		len)
+		__field(ssize_t,	res)
+		__field(loff_t,		i_size)
+	),
+
+	TP_fast_assign(
+		__entry->connection	=	get_fuse_conn(inode)->dev;
+		__entry->nodeid		=	get_fuse_inode(inode)->nodeid;
+		__entry->pos		=	pos;
+		__entry->len		=	len;
+		__entry->res		=	res;
+		__entry->i_size		=	i_size_read(inode);
+	),
+
+	TP_printk("connection %u nodeid %llu pos %lld len %zu res %zd i_size %lld",
+		  __entry->connection, __entry->nodeid, __entry->pos,
+		  __entry->len, __entry->res, __entry->i_size)
+);
+
 #endif /* _TRACE_FUSE_H */
 
 #undef TRACE_INCLUDE_PATH

@@ -29,7 +29,7 @@ struct fuse_inode;
  *    share: byte-exact ranges would let both of them work on it at once.
  *
  *  - Let attribute/BRL invalidation (fuse_reverse_inval_inode(),
- *    truncate in fuse_do_setattr()) block only on in-progress IO that
+ *    fuse_wb_truncate_pagecache()) block only on in-progress IO that
  *    overlaps with the range being invalidated, instead of serializing
  *    with all IO on the inode.
  *
@@ -132,7 +132,7 @@ struct fuse_range_lock {
 	 * conflict with each other: the only way a task acquires a range
 	 * overlapping its own is re-entering through the page fault path
 	 * while faulting in its own user buffer mid-IO (see
-	 * fuse_filemap_fault()), and the outer hold already fences
+	 * fuse_wb_filemap_fault()), and the outer hold already fences
 	 * invalidation over the overlap for as long as both are held.
 	 */
 	struct task_struct *owner;
