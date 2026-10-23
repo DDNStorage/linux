@@ -3346,6 +3346,18 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	int err;
 
 	ff = __fuse_write_file_get(fi);
+	/*
+	 * With no names left and no writable open here, the server may already
+	 * have deleted the inode, and this node has written nothing whose times
+	 * need sending: the only dirty time is the ctime of the unlink. A
+	 * WRITEBACK_SETATTR would re-create the deleted inode on the server.
+	 * A writable open here keeps the server's inode alive until the last
+	 * close, so its times are still sent. O_TMPFILE (I_LINKABLE) is flushed
+	 * as before.
+	 */
+	if (!ff && inode->i_nlink == 0 && !(inode_state_read_once(inode) & I_LINKABLE))
+		return 0;
+
 	err = fuse_flush_times(inode, ff);
 	if (ff)
 		fuse_file_put(ff, false);
