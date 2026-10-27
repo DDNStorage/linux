@@ -266,6 +266,13 @@ struct fuse_inode {
 			 */
 			unsigned int write_size_ewma;
 			unsigned int write_stream_run;
+
+			/*
+			 * A read the server did not see, through any open
+			 * file of the inode, see FUSE_RELEASE_CACHED_READ.
+			 * No lock: WRITE_ONCE() and xchg() only.
+			 */
+			bool cached_read;
 		};
 
 		/* readdir cache (directory only) */
@@ -1237,6 +1244,20 @@ static inline struct fuse_conn *get_fuse_conn(struct inode *inode)
 static inline struct fuse_inode *get_fuse_inode(const struct inode *inode)
 {
 	return container_of(inode, struct fuse_inode, inode);
+}
+
+/* Record a read served from the page cache, see FUSE_RELEASE_CACHED_READ */
+static inline void fuse_cached_read_set(struct file *file)
+{
+	if (!(file->f_flags & O_NOATIME))
+		WRITE_ONCE(get_fuse_inode(file_inode(file))->cached_read, true);
+}
+
+/* A read or write the server saw supersedes the recorded read */
+static inline void fuse_cached_read_clear(struct inode *inode)
+{
+	if (S_ISREG(inode->i_mode))
+		WRITE_ONCE(get_fuse_inode(inode)->cached_read, false);
 }
 
 static inline u64 get_node_id(struct inode *inode)

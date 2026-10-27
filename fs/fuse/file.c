@@ -444,6 +444,7 @@ static void fuse_open_finish_cache(struct inode *inode, struct file *file,
 	if (is_truncate) {
 		truncate_pagecache(inode, 0);
 		fuse_truncate_server_times(inode, file);
+		fuse_cached_read_clear(inode);
 	} else if (!(ff->open_flags & FOPEN_KEEP_CACHE)) {
 		invalidate_inode_pages2(inode->i_mapping);
 	}
@@ -617,6 +618,9 @@ static void fuse_prepare_release(struct fuse_inode *fi, struct fuse_file *ff,
 	memset(ff->args, 0, sizeof(*ff->args));
 	ra->inarg.fh = ff->fh;
 	ra->inarg.flags = flags;
+	/* The first release after the read reports it */
+	if (fi && S_ISREG(fi->inode.i_mode) && xchg(&fi->cached_read, false))
+		ra->inarg.release_flags |= FUSE_RELEASE_CACHED_READ;
 	ra->args.in_numargs = 1;
 	ra->args.in_args[0].size = sizeof(struct fuse_release_in);
 	ra->args.in_args[0].value = &ra->inarg;
@@ -1222,6 +1226,7 @@ static int fuse_do_readfolio(struct file *file, struct folio *folio,
 		desc.length--;
 
 	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
+	fuse_cached_read_clear(inode);
 	res = fuse_simple_request(fm, &ia.ap.args);
 	trace_fuse_readfolio_reply(inode, pos, desc.length, res);
 	if (res < 0)
@@ -1514,6 +1519,7 @@ static void fuse_send_readpages(struct fuse_io_args *ia, struct file *file,
 	WARN_ON((loff_t) (pos + count) < 0);
 
 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
+	fuse_cached_read_clear(file_inode(file));
 	ia->read.attr_ver = fuse_get_attr_version(fm->fc);
 	ia->read.size_gen = READ_ONCE(get_fuse_inode(file_inode(file))->size_gen);
 	if (async) {
@@ -1634,6 +1640,9 @@ static ssize_t fuse_wt_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	size_t count = iov_iter_count(to);
 
+	/* A FUSE_READ below clears it again */
+	fuse_cached_read_set(file);
+
 	/*
 	 * In auto invalidate mode, always update attributes on read.
 	 * Otherwise, only update if we attempt to read past EOF (to ensure
@@ -1659,6 +1668,9 @@ static ssize_t fuse_wb_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	size_t count = iov_iter_count(to);
 	ssize_t res;
 	int err;
+
+	/* A FUSE_READ or DLM read lock request below clears it again */
+	fuse_cached_read_set(file);
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -2869,6 +2881,9 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 	if (!ia)
 		return -ENOMEM;
 
+	if (!write && !cuse)
+		fuse_cached_read_clear(inode);
+
 	if (fopen_direct_io) {
 		res = filemap_write_and_wait_range(mapping, pos, pos + count - 1);
 		if (res) {
@@ -3100,14 +3115,20 @@ static ssize_t fuse_file_write_iter_common(struct kiocb *iocb,
 	struct file *file = iocb->ki_filp;
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
+	ssize_t res;
 
 	if (fuse_is_bad(inode))
 		return -EIO;
 
 	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
-		return fuse_direct_write_iter(iocb, from);
+		res = fuse_direct_write_iter(iocb, from);
+	else
+		res = cache_write_iter(iocb, from);
 
-	return cache_write_iter(iocb, from);
+	/* The release reports only a read after the last write */
+	if (res > 0 || res == -EIOCBQUEUED)
+		fuse_cached_read_clear(inode);
+	return res;
 }
 
 static ssize_t fuse_wt_write_iter(struct kiocb *iocb, struct iov_iter *from)
@@ -3151,14 +3172,20 @@ static ssize_t fuse_passthrough_file_write_iter(struct kiocb *iocb,
 	struct file *file = iocb->ki_filp;
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
+	ssize_t res;
 
 	if (fuse_is_bad(inode))
 		return -EIO;
 
 	if ((ff->open_flags & FOPEN_DIRECT_IO) || fuse_inode_force_dio(inode))
-		return fuse_direct_write_iter(iocb, from);
+		res = fuse_direct_write_iter(iocb, from);
+	else
+		res = fuse_passthrough_write_iter(iocb, from);
 
-	return fuse_passthrough_write_iter(iocb, from);
+	/* The release reports only a read after the last write */
+	if (res > 0 || res == -EIOCBQUEUED)
+		fuse_cached_read_clear(inode);
+	return res;
 }
 
 static ssize_t fuse_passthrough_file_splice_read(struct file *in, loff_t *ppos,
@@ -3820,6 +3847,8 @@ static vm_fault_t fuse_wt_page_mkwrite(struct vm_fault *vmf)
 	loff_t pos = vmf->pgoff << PAGE_SHIFT;
 	int err;
 
+	fuse_cached_read_clear(file_inode(file));
+
 	err = fuse_get_page_mkwrite_lock(file, pos, PAGE_SIZE);
 	if (err < 0)
 		return vmf_error(err);
@@ -3857,6 +3886,8 @@ static vm_fault_t fuse_wb_page_mkwrite(struct vm_fault *vmf)
 	struct fuse_range_lock rlock;
 	loff_t pos = vmf->pgoff << PAGE_SHIFT;
 	bool held = false;
+
+	fuse_cached_read_clear(inode);
 
 	if (fuse_range_lock_try_acquire_init(fi, &rlock, pos,
 					     pos + PAGE_SIZE - 1,
@@ -3973,6 +4004,7 @@ static int fuse_fault_read_private_folios(struct file *file,
 	}
 
 	fuse_read_args_fill(&ia, file, pos, count, FUSE_READ);
+	fuse_cached_read_clear(file_inode(file));
 	res = fuse_simple_request(fm, &ia.ap.args);
 	if (res < 0) {
 		for (i = 0; i < nr; i++)
@@ -4087,6 +4119,10 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 		mode = FUSE_PAGE_LOCK_WRITE;
 		range_mode = FUSE_RANGE_LOCK_WRITE;
 	}
+
+	/* Cleared again by a fill or a read lock request */
+	if (mode == FUSE_PAGE_LOCK_READ)
+		fuse_cached_read_set(file);
 
 	/*
 	 * Fast path: range lock uncontended, the grant already
@@ -5085,6 +5121,7 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 		truncate_pagecache_range(inode, offset, offset + length - 1);
 
 	fuse_invalidate_attr_mask(inode, FUSE_STATX_MODSIZE);
+	fuse_cached_read_clear(inode);
 
 out:
 	if (!(mode & FALLOC_FL_KEEP_SIZE))
@@ -5216,6 +5253,7 @@ fallback:
 
 	file_update_time(file_out);
 	fuse_write_update_attr(inode_out, pos_out + bytes_copied, bytes_copied);
+	fuse_cached_read_clear(inode_out);
 
 	err = bytes_copied;
 out:
