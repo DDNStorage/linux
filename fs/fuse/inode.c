@@ -1039,6 +1039,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	if (offset >= 0) {
 		bool range_locked = S_ISREG(inode->i_mode) &&
 				   fc->writeback_cache && fc->dlm;
+		bool whole_file = offset == 0 && len <= 0;
 		bool hot = false, has_writer = false, latched = false;
 		bool track_latch;
 		int ierr;
@@ -1169,6 +1170,25 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		if (ierr)
 			pr_warn_ratelimited("FUSE: inode %llu invalidate failed, folios left in page cache: %d\n",
 					    nodeid, ierr);
+
+		/*
+		 * A whole-file invalidation is how a sattr revoke arrives.
+		 * Times are dirtied only under a write grant, which holds sattr
+		 * CW, so dirty times here mean the CW being revoked is this
+		 * node's.  Send them now, while the server still sees that CW
+		 * as granted and lets the WRITEBACK SETATTR's CW past the
+		 * pending conflicting lock. If left dirty, close or the flusher
+		 * would send them after this node has re-cached PR, and the
+		 * server would have to revoke this node's own PR for it.
+		 */
+		if (range_locked && whole_file &&
+		    (inode->i_state & (I_DIRTY_SYNC | I_DIRTY_TIME))) {
+			int serr = sync_inode_metadata(inode, 1);
+
+			if (serr)
+				pr_warn_ratelimited("FUSE: inode %llu times flush before invalidate failed: %d\n",
+						    nodeid, serr);
+		}
 
 		if (latched)
 			pr_info_ratelimited("FUSE: inode %llu latched to direct IO on invalidation notify storm\n",
