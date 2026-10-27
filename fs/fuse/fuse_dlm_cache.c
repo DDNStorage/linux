@@ -704,6 +704,10 @@ restart:
 	 */
 	gen = fuse_dlm_revoke_gen(fi);
 
+	/* The server counts a read lock request as a read itself */
+	if (mode == FUSE_PAGE_LOCK_READ)
+		fuse_cached_read_clear(inode);
+
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
 
