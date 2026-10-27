@@ -492,9 +492,18 @@ struct fuse_file_lock {
 
 /**
  * Release flags
+ *
+ * FUSE_RELEASE_CACHED_READ: a read(2), splice, sendfile or read fault
+ *			     without O_NOATIME was served from the page cache
+ *			     of the inode, through any open file, and no
+ *			     FUSE_READ, DLM read lock request, write, truncate,
+ *			     fallocate or explicit atime followed, e.g. to
+ *			     stamp atime.  Also sent without DLM.  Reported
+ *			     once, by the first release after it.
  */
 #define FUSE_RELEASE_FLUSH	(1 << 0)
 #define FUSE_RELEASE_FLOCK_UNLOCK	(1 << 1)
+#define FUSE_RELEASE_CACHED_READ	(1U << 31)
 
 /**
  * Getattr flags

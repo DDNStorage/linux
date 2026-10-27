@@ -2492,6 +2492,10 @@ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
 		/* Directory mode changed, may need to revalidate access */
 		if (d_is_dir(entry) && (attr->ia_valid & ATTR_MODE))
 			fuse_invalidate_entry_cache(entry);
+
+		/* An explicit atime or a truncate supersedes the read */
+		if (attr->ia_valid & (ATTR_ATIME | ATTR_SIZE))
+			fuse_cached_read_clear(inode);
 	}
 	return ret;
 }
