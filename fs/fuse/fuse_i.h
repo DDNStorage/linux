@@ -406,6 +406,9 @@ struct fuse_file {
 
 	/** Has flock been performed on this file? */
 	bool flock:1;
+
+	/** Read the server did not count, see FUSE_RELEASE_CACHED_READ */
+	bool cached_read;
 };
 
 /** One input argument of a request */

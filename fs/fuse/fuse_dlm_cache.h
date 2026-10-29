@@ -309,9 +309,13 @@ bool fuse_dlm_write_grant_exists(struct fuse_inode *inode);
  * to LOCKED before touching the page cache.  Left at INIT on a hard
  * error, since the caller will not touch the page cache and releases it
  * directly.
+ *
+ * @user_read: true for the first request of a read(2): a range already
+ * covered is served from the page cache, a read the server never sees,
+ * so it sets the handle's cached_read.
  */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		      size_t length, enum fuse_page_lock_mode mode,
-		      struct fuse_range_lock *rlock);
+		      struct fuse_range_lock *rlock, bool user_read);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */

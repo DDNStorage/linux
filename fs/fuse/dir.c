@@ -1362,14 +1362,50 @@ static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, ui
 }
 
 /*
+ * A FUSE_STATX_LIGHT reply may lag behind writes the server has not seen,
+ * so it does not update the inode: a stale size would shrink i_size and
+ * the page cache.  This node's own unflushed writes are still reported,
+ * by taking the larger size and the later stamps of the two.
+ */
+static void fuse_statx_light_merge(struct inode *inode, struct fuse_attr *attr,
+				   struct fuse_statx *sx)
+{
+	loff_t size = i_size_read(inode);
+	struct timespec64 cached, reported;
+
+	if ((sx->mask & STATX_SIZE) && size > (loff_t) attr->size)
+		attr->size = size;
+
+	if (sx->mask & STATX_MTIME) {
+		cached = inode_get_mtime(inode);
+		reported.tv_sec = attr->mtime;
+		reported.tv_nsec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
+		if (timespec64_compare(&cached, &reported) > 0) {
+			attr->mtime = cached.tv_sec;
+			attr->mtimensec = cached.tv_nsec;
+		}
+	}
+	if (sx->mask & STATX_CTIME) {
+		cached = inode_get_ctime(inode);
+		reported.tv_sec = attr->ctime;
+		reported.tv_nsec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
+		if (timespec64_compare(&cached, &reported) > 0) {
+			attr->ctime = cached.tv_sec;
+			attr->ctimensec = cached.tv_nsec;
+		}
+	}
+}
+
+/*
  * @param sx_mask request mask send to to fuse-server
  * @param mandatory_sx_mask subset of (or complete) sx_mask that the server
  * has to fulfill
  * @param srv_size where to report the size the server sent, or NULL
+ * @param light send FUSE_STATX_LIGHT; the reply then only fills @stat
 */
 static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 			 struct file *file, struct kstat *stat, u32 sx_mask,
-			 u32 mandatory_sx_mask, loff_t *srv_size)
+			 u32 mandatory_sx_mask, loff_t *srv_size, bool light)
 {
 	int err;
 	struct fuse_attr attr;
@@ -1399,7 +1435,7 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 	 * For permission checks, we only need mode, uid, gid.
 	 * This is an optimization to avoid fetching all stats when not needed.
 	 */
-	inarg.sx_flags = 0;
+	inarg.sx_flags = light ? FUSE_STATX_LIGHT : 0;
 	inarg.sx_mask = sx_mask;
 	args.opcode = FUSE_STATX;
 	args.nodeid = get_node_id(inode);
@@ -1441,7 +1477,9 @@ static int fuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
 		*srv_size = sx->size;
 
 	fuse_statx_to_attr(&outarg.stat, &attr);
-	if (sx->mask & STATX_BASIC_STATS) {
+	if (light) {
+		fuse_statx_light_merge(inode, &attr, sx);
+	} else if (sx->mask & STATX_BASIC_STATS) {
 		fuse_change_attributes(inode, &attr, &outarg.stat,
 				       ATTR_TIMEOUT(&outarg), attr_version);
 	}
@@ -1650,6 +1688,8 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
 	u32 cache_mask = fuse_get_cache_mask(inode);
 	u32 mandatory_sx_mask = request_mask & STATX_BASIC_STATS;
 	u32 sx_mask = request_mask;
+	bool light = stat && S_ISREG(inode->i_mode) &&
+		     !(flags & AT_STATX_FORCE_SYNC);
 
 	/* FUSE only supports basic stats and possibly btime */
 	sx_mask &= STATX_BASIC_STATS | STATX_BTIME;
@@ -1672,7 +1712,7 @@ retry:
 		forget_all_cached_acls(inode);
 		if (!fc->no_statx) {
 			err = fuse_do_statx(idmap, inode, file, stat, sx_mask,
-					    mandatory_sx_mask, srv_size);
+					    mandatory_sx_mask, srv_size, light);
 			if (err == -ENOSYS) {
 				fc->no_statx = 1;
 				err = 0;

@@ -739,6 +739,7 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
  *  one LOCKED (fencing further revokes) before being trusted; if a
  *  concurrent invalidate is found to have revoked it, @rlock is put
  *  back in INIT and a fresh grant is requested below instead.
+ * @user_read: true for the first request of a read(2), see cached_read
  *
  * Return: 0 when the range is covered by a recorded grant on return,
  * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
@@ -749,7 +750,7 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
  */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		      size_t length, enum fuse_page_lock_mode mode,
-		      struct fuse_range_lock *rlock)
+		      struct fuse_range_lock *rlock, bool user_read)
 {
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
@@ -790,10 +791,18 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		if (err)
 			return err;
 	}
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
+	if (fuse_dlm_lock_is_held(fi, offset, length, mode)) {
+		/* A read the server never sees, served from the cache */
+		if (user_read)
+			WRITE_ONCE(ff->cached_read, true);
 		return 0; /* we already have this area locked */
+	}
 	if (rlock)
 		fuse_range_lock_mark_init(fi, rlock);
+
+	/* The server counts a read lock request as a read itself */
+	if (mode == FUSE_PAGE_LOCK_READ)
+		WRITE_ONCE(ff->cached_read, false);
 
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.fh = ff->fh;
