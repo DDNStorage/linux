@@ -519,6 +519,12 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	inode->i_flags &= ~S_NOSEC;
 }
 
+static bool fuse_mapping_dirty(struct inode *inode)
+{
+	return mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+	       mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK);
+}
+
 u32 fuse_get_cache_mask(struct inode *inode)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -526,15 +532,19 @@ u32 fuse_get_cache_mask(struct inode *inode)
 	if (!fc->writeback_cache || !S_ISREG(inode->i_mode) || fc->dlm)
 		return 0;
 
-	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
+	if (fuse_mapping_dirty(inode))
+		return STATX_MTIME | STATX_CTIME | STATX_SIZE;
+
+	return STATX_SIZE;
 }
 
 /*
  * Which cached attributes survive a server reply.
  *
  * Without DLM this is fuse_get_cache_mask(): with the writeback cache on,
- * writes update mtime and ctime and may extend i_size locally, the server
- * knows about none of it, so the cached values win.
+ * writes may extend i_size locally, and stamp mtime and ctime locally while
+ * their data is in the page cache.  The server knows about none of it, so the
+ * cached values win.
  *
  * With DLM the server is the authority (fuse_get_cache_mask() returns 0),
  * because another node may have changed the file behind us and only the
@@ -590,8 +600,7 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 	if (!fuse_dlm_write_grant_exists(fi))
 		return cache_mask;
 
-	if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
-	    mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
+	if (fuse_mapping_dirty(inode))
 		cache_mask |= STATX_MTIME | STATX_CTIME;
 
 	if (have_size && size > (loff_t) attr->size &&
@@ -604,10 +613,9 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 /*
  * Whether a cached time stamp stays over the one the server reported.
  *
- * Without dlm the kernel owns the stamps of a writeback inode and the
- * server's are ignored.  With dlm the cached stamp is kept only while the
- * page cache is dirty, because the local writes set it and the server has
- * not seen them.  That makes it a placeholder, not an authority: a later
+ * The cached stamp is considered only while the page cache is dirty, because
+ * the local writes set it and the server has not seen them.  Without dlm it
+ * then wins.  With dlm it is a placeholder, not an authority: a later
  * stamp from the server records a modification the server did see, our own
  * earlier writeback or another node's write, and stat() has to report it.
  * The dirty data stamps again when it is written back.
@@ -849,9 +857,8 @@ retry:
 
 	is_new_inode = inode->i_state & I_NEW;
 	if (is_new_inode) {
-		inode->i_flags |= S_NOATIME;
-		if (!fc->writeback_cache || !S_ISREG(attr->mode))
-			inode->i_flags |= S_NOCMTIME;
+		/* see fuse_cached_write_update_time() */
+		inode->i_flags |= S_NOATIME | S_NOCMTIME;
 		inode->i_generation = generation;
 		fuse_init_inode(inode, attr, fc);
 	} else if (fuse_stale_inode(inode, generation, attr)) {
