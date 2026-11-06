@@ -2950,7 +2950,7 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
 	else
-		return filemap_splice_read(in, ppos, pipe, len, flags);
+		return copy_splice_read(in, ppos, pipe, len, flags);
 }
 
 static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
