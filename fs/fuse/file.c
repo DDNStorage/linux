@@ -2044,8 +2044,19 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		 * as well.  The size is the one the caller asked for, before
 		 * generic_write_checks() has had a chance to clamp it, which is
 		 * the record the writer is working with.
+		 *
+		 * Not so a write that drains a pipe: splice, sendfile and the
+		 * copy_file_range fallback hand over one pipe's worth at a
+		 * time, 64 KiB through the internal pipe of the last two.  That
+		 * size is the pipe's, not a record of the writer's.  Written
+		 * through, every pipe would cost a synchronous round trip,
+		 * where writeback batches them into max_write requests.
+		 * iter_file_splice_write() passes it as a bvec in a sync kiocb;
+		 * io_uring's registered buffers are bvecs in an async one and
+		 * remain records.
 		 */
-		if (!(iocb->ki_flags & IOCB_DIRECT))
+		if (!(iocb->ki_flags & IOCB_DIRECT) &&
+		    !(iov_iter_is_bvec(from) && is_sync_kiocb(iocb)))
 			stream = fuse_write_stream_update(fi,
 							  iov_iter_count(from));
 
