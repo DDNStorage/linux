@@ -3195,7 +3195,7 @@ static ssize_t fuse_passthrough_file_splice_read(struct file *in, loff_t *ppos,
 	struct fuse_file *ff = in->private_data;
 
 	if (ff->open_flags & FOPEN_DIRECT_IO)
-		return filemap_splice_read(in, ppos, pipe, len, flags);
+		return copy_splice_read(in, ppos, pipe, len, flags);
 
 	return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
 }
@@ -5299,7 +5299,7 @@ static const struct file_operations fuse_wt_file_operations = {
 	.lock		= fuse_file_lock,
 	.get_unmapped_area = thp_get_unmapped_area,
 	.flock		= fuse_file_flock,
-	.splice_read	= filemap_splice_read,
+	.splice_read	= copy_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.unlocked_ioctl	= fuse_file_ioctl,
 	.compat_ioctl	= fuse_file_compat_ioctl,
@@ -5325,7 +5325,7 @@ static const struct file_operations fuse_wb_file_operations = {
 	.lock		= fuse_file_lock,
 	.get_unmapped_area = thp_get_unmapped_area,
 	.flock		= fuse_file_flock,
-	.splice_read	= filemap_splice_read,
+	.splice_read	= copy_splice_read,
 	.splice_write	= iter_file_splice_write,
 	.unlocked_ioctl	= fuse_file_ioctl,
 	.compat_ioctl	= fuse_file_compat_ioctl,
