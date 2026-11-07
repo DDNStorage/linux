@@ -2963,6 +2963,67 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 		return copy_splice_read(in, ppos, pipe, len, flags);
 }
 
+/*
+ * sendfile(2) and the copy_file_range() fallback copy through a 64 KiB
+ * internal pipe, and each pipe's worth is one write_iter.  Under DLM the
+ * server grants a cached write exactly the range it asks for, so every 64 KiB
+ * would wait for a write grant round trip of its own, the largest cost of
+ * such a copy.  When the caller says more follows (SPLICE_F_MORE), ask for a
+ * grant past this write, so that the next writes find their range granted.
+ *
+ * The grant reaches as far ahead as the run has already come, and never past
+ * the next FUSE_SPLICE_GRANT_AHEAD_MAX boundary after this write: a copy into
+ * one region of a file that other nodes write as well reaches into theirs
+ * only where the regions are not aligned to that size.
+ *
+ * Only a hint: the write path still requests its own range under its own
+ * range lock, which is what covers the data.  The range lock taken here
+ * covers the whole request, so an invalidate cannot pass the reply before
+ * the grant is recorded.
+ */
+static void fuse_splice_write_grant_ahead(struct file *out, loff_t pos,
+					  size_t len, unsigned int flags)
+{
+	struct fuse_file *ff = out->private_data;
+	struct inode *inode = file_inode(out);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	loff_t start = READ_ONCE(ff->splice_run_start);
+	loff_t maxbytes = inode->i_sb->s_maxbytes;
+	loff_t cap = FUSE_SPLICE_GRANT_AHEAD_MAX;
+	struct fuse_range_lock rlock;
+	loff_t end;
+
+	if (pos != READ_ONCE(ff->splice_run_next)) {
+		start = pos;
+		WRITE_ONCE(ff->splice_run_start, start);
+	}
+	WRITE_ONCE(ff->splice_run_next, pos + len);
+
+	/*
+	 * A write that will not be cached under our own grant: O_DIRECT and
+	 * FOPEN_DIRECT_IO writes have the server take the lock, and a write
+	 * that has to drop suid/sgid stays off the writeback path.
+	 */
+	if (!(flags & SPLICE_F_MORE) || !fc->writeback_cache || !fc->dlm ||
+	    (out->f_flags & O_DIRECT) || (ff->open_flags & FOPEN_DIRECT_IO) ||
+	    fuse_inode_force_dio(inode) ||
+	    (inode->i_mode & (S_ISUID | S_ISGID)) || pos >= maxbytes)
+		return;
+
+	end = pos + min(pos - start, cap);
+	end = min3(end, round_up(pos + (loff_t)len, cap), maxbytes);
+	if (end - pos <= (loff_t)len ||
+	    fuse_dlm_lock_is_held(fi, pos, len, FUSE_PAGE_LOCK_WRITE))
+		return;
+
+	if (fuse_range_lock_acquire_init(fi, &rlock, pos, end - 1,
+					 FUSE_RANGE_LOCK_WRITE))
+		return;
+	fuse_get_dlm_lock(out, pos, end - pos, FUSE_PAGE_LOCK_WRITE, &rlock);
+	fuse_range_lock_release(fi, &rlock);
+}
+
 static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
 				 loff_t *ppos, size_t len, unsigned int flags)
 {
@@ -2971,8 +3032,9 @@ static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
 	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
 	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
 		return fuse_passthrough_splice_write(pipe, out, ppos, len, flags);
-	else
-		return iter_file_splice_write(pipe, out, ppos, len, flags);
+
+	fuse_splice_write_grant_ahead(out, *ppos, len, flags);
+	return iter_file_splice_write(pipe, out, ppos, len, flags);
 }
 
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
