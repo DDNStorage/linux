@@ -3370,7 +3370,8 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc,
 
 	/* Reached alignment */
 	if (fc->alignment_pages) {
-		unsigned int total_pages = (bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		/* This folio starts the next chunk: count the pages before it */
+		unsigned int queued_pages = DIV_ROUND_UP(data->nr_bytes, PAGE_SIZE);
 		pgoff_t page_index = pos >> PAGE_SHIFT;
 
 		if (!(page_index % fc->alignment_pages)) {
@@ -3381,7 +3382,7 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc,
 			if (page_index + fc->alignment_pages > end_page_index)
 				return true;
 
-			if (total_pages + fc->alignment_pages > fc->max_pages)
+			if (queued_pages + fc->alignment_pages > fc->max_pages)
 				return true;
 		}
 	}
