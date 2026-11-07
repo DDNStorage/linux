@@ -157,6 +157,9 @@ struct dlm_locked_area
 /* Under this size a record is not worth a write of its own */
 #define FUSE_WRITE_STREAM_MIN		(64 * 1024)
 
+/* Largest DLM write grant requested ahead of a splice with more to come */
+#define FUSE_SPLICE_GRANT_AHEAD_MAX	(4 * 1024 * 1024)
+
 /** FUSE inode */
 struct fuse_inode {
 	/** Inode data */
@@ -422,6 +425,14 @@ struct fuse_file {
 	struct file *passthrough;
 	const struct cred *cred;
 #endif
+
+	/*
+	 * The run of sequential splice writes through this file: where it
+	 * started and where the next write continues it.  A hint, read and
+	 * written without a lock.
+	 */
+	loff_t splice_run_start;
+	loff_t splice_run_next;
 
 	/** Has flock been performed on this file? */
 	bool flock:1;
