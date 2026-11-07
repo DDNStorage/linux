@@ -3624,10 +3624,11 @@ static bool fuse_folios_need_send(struct fuse_conn *fc, loff_t pos,
  * either because writeback ends before it or because it would not fit.
  */
 static bool fuse_writeback_reached_alignment(struct fuse_conn *fc, loff_t pos,
-					     unsigned int bytes,
+					     unsigned int queued,
 					     struct writeback_control *wbc)
 {
-	unsigned int total_pages = (bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	/* This folio starts the next chunk: count the pages before it */
+	unsigned int queued_pages = DIV_ROUND_UP(queued, PAGE_SIZE);
 	pgoff_t page_index = pos >> PAGE_SHIFT;
 	pgoff_t end_page_index;
 
@@ -3641,7 +3642,7 @@ static bool fuse_writeback_reached_alignment(struct fuse_conn *fc, loff_t pos,
 	if (page_index + fc->alignment_pages > end_page_index)
 		return true;
 
-	return total_pages + fc->alignment_pages > fc->max_pages;
+	return queued_pages + fc->alignment_pages > fc->max_pages;
 }
 
 static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
@@ -3690,7 +3691,7 @@ static ssize_t fuse_iomap_writeback_range(struct iomap_writepage_ctx *wpc,
 
 		if (!send)
 			send = fuse_writeback_reached_alignment(fc, pos,
-					data->nr_bytes + send_len, wpc->wbc);
+					data->nr_bytes, wpc->wbc);
 
 		if (send) {
 			fuse_writepages_send(inode, data);
