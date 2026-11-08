@@ -1077,6 +1077,8 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	if (offset >= 0) {
 		bool range_locked = S_ISREG(inode->i_mode) &&
 				   fc->writeback_cache;
+		bool write_back = range_locked ||
+				  fuse_splice_staged_dirty(inode);
 		bool hot = false, has_writer = false, latched = false;
 		bool track_latch;
 		int ierr;
@@ -1164,13 +1166,15 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		 * invalidate_inode_pages2_range() would otherwise launder
 		 * each dirty folio with its own synchronous WRITE, and the
 		 * server holds the conflicting grant until that finishes.
+		 * A staged splice copy without the writeback cache has the
+		 * same dirty folios and would lose its chunked requests.
 		 * The LOCKED range lock keeps cached writers from dirtying
 		 * the range again; anything left dirty is still laundered
 		 * below.  Wait with _keep_errors so that a write-back error
 		 * stays in AS_EIO/AS_ENOSPC for fuse_wb_flush() to report at
 		 * close; filemap_write_and_wait_range() would clear it.
 		 */
-		if (range_locked) {
+		if (write_back) {
 			loff_t wb_start = 0;
 			loff_t wb_end = LLONG_MAX;
 			int werr, err;
