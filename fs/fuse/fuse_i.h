@@ -556,6 +556,8 @@ struct fuse_io_priv {
  *			shared by non-critical foreground and background requests
  * FR_URING_CRITICAL:	critical background request counted in the io-uring
  *			queue active critical background requests
+ * FR_URING_BG_RETURNED: fuse-io-uring gave back the request's share of
+ *			fc->active_background before fuse_request_end()
  */
 enum fuse_req_flag {
 	FR_ISREPLY,
@@ -574,6 +576,7 @@ enum fuse_req_flag {
 	FR_URING,
 	FR_URING_NONCRIT,
 	FR_URING_CRITICAL,
+	FR_URING_BG_RETURNED,
 };
 
 /**

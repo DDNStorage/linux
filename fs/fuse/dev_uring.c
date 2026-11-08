@@ -112,31 +112,34 @@ static bool fuse_uring_req_fg_noncritical(struct fuse_req *req)
 	       !fuse_uring_req_critical(req);
 }
 
-static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
+/* Whether the bg budget has room for one more request. */
+static bool fuse_uring_bg_budget(struct fuse_conn *fc)
 {
-	struct fuse_ring *ring = queue->ring;
-	struct fuse_conn *fc = ring->fc;
+	lockdep_assert_held(&fc->bg_lock);
+
+	return fc->active_background < fc->max_background;
+}
+
+/*
+ * Allow one bg request per queue, ignoring global fc limits.
+ * This prevents a single queue from consuming all resources and
+ * eliminates the need for remote queue wake-ups when global
+ * limits are met but this queue has no more waiting requests.
+ *
+ * Critical bg requests wait on their own list, so they never wait
+ * behind non-critical bg requests, and are admitted first. They are
+ * subject to the bg limits, but one critical bg request per queue is
+ * always allowed. It is not counted in the non-critical limit and can
+ * use the critical entries, so critical bg requests always progress.
+ */
+static void fuse_uring_flush_queue_bg_crit(struct fuse_ring_queue *queue)
+{
+	struct fuse_conn *fc = queue->ring->fc;
 
 	lockdep_assert_held(&queue->lock);
 	lockdep_assert_held(&fc->bg_lock);
 
-	/*
-	 * Allow one bg request per queue, ignoring global fc limits.
-	 * This prevents a single queue from consuming all resources and
-	 * eliminates the need for remote queue wake-ups when global
-	 * limits are met but this queue has no more waiting requests.
-	 *
-	 * Critical bg requests wait on their own list, so they never wait
-	 * behind non-critical bg requests, and are admitted first. They are
-	 * subject to the bg limits, but one critical bg request per queue is
-	 * always allowed. It is not counted in the non-critical limit and can
-	 * use the critical entries, so critical bg requests always progress.
-	 *
-	 * With the writeback cache, non-critical bg requests also share the
-	 * non-critical limit with foreground requests, see
-	 * fuse_uring_max_noncritical().
-	 */
-	while ((fc->active_background < fc->max_background ||
+	while ((fuse_uring_bg_budget(fc) ||
 		!queue->active_bg_critical) &&
 	       !list_empty(&queue->fuse_req_bg_crit_queue)) {
 		struct fuse_req *req;
@@ -150,47 +153,124 @@ static void fuse_uring_flush_queue_bg(struct fuse_ring_queue *queue)
 
 		list_move_tail(&req->list, &queue->fuse_req_queue);
 	}
+}
 
-	while ((fc->active_background < fc->max_background ||
+/*
+ * Whether the first non-critical bg request can be admitted now. With the
+ * writeback cache it also needs a free non-critical slot, which it shares
+ * with foreground requests, see fuse_uring_max_noncritical().
+ */
+static bool fuse_uring_bg_admissible(struct fuse_ring_queue *queue)
+{
+	struct fuse_conn *fc = queue->ring->fc;
+
+	lockdep_assert_held(&queue->lock);
+	lockdep_assert_held(&fc->bg_lock);
+
+	return (fuse_uring_bg_budget(fc) ||
 		!queue->active_background) &&
 	       (!fc->writeback_cache || queue->stopped ||
 		queue->active_noncritical < fuse_uring_max_noncritical(queue)) &&
-	       (!list_empty(&queue->fuse_req_bg_queue))) {
-		struct fuse_req *req;
-
-		req = list_first_entry(&queue->fuse_req_bg_queue,
-				       struct fuse_req, list);
-		fc->active_background++;
-		queue->active_background++;
-		if (fc->writeback_cache) {
-			set_bit(FR_URING_NONCRIT, &req->flags);
-			queue->active_noncritical++;
-		}
-
-		list_move_tail(&req->list, &queue->fuse_req_queue);
-	}
+	       !list_empty(&queue->fuse_req_bg_queue);
 }
 
-static void fuse_uring_flush_queue_fg(struct fuse_ring_queue *queue)
+static void fuse_uring_admit_bg(struct fuse_ring_queue *queue)
+{
+	struct fuse_conn *fc = queue->ring->fc;
+	struct fuse_req *req;
+
+	req = list_first_entry(&queue->fuse_req_bg_queue, struct fuse_req,
+			       list);
+	fc->active_background++;
+	queue->active_background++;
+	if (fc->writeback_cache) {
+		set_bit(FR_URING_NONCRIT, &req->flags);
+		queue->active_noncritical++;
+	}
+
+	list_move_tail(&req->list, &queue->fuse_req_queue);
+}
+
+/*
+ * Whether the first waiting foreground request can be admitted now. A stopped
+ * queue keeps the non-critical limit: it dispatches nothing, so admitting more
+ * would not drain them, and abort ends the waiting requests.
+ */
+static bool fuse_uring_fg_admissible(struct fuse_ring_queue *queue)
 {
 	lockdep_assert_held(&queue->lock);
 
-	while (queue->active_noncritical < fuse_uring_max_noncritical(queue) &&
-	       !list_empty(&queue->fuse_req_fg_queue)) {
-		struct fuse_req *req;
+	return queue->active_noncritical < fuse_uring_max_noncritical(queue) &&
+	       !list_empty(&queue->fuse_req_fg_queue);
+}
 
-		req = list_first_entry(&queue->fuse_req_fg_queue,
-				       struct fuse_req, list);
-		set_bit(FR_URING_NONCRIT, &req->flags);
-		queue->active_noncritical++;
+static void fuse_uring_admit_fg(struct fuse_ring_queue *queue)
+{
+	struct fuse_req *req;
 
-		list_move_tail(&req->list, &queue->fuse_req_queue);
+	req = list_first_entry(&queue->fuse_req_fg_queue, struct fuse_req,
+			       list);
+	set_bit(FR_URING_NONCRIT, &req->flags);
+	queue->active_noncritical++;
+
+	list_move_tail(&req->list, &queue->fuse_req_queue);
+}
+
+/*
+ * Admits foreground requests only, without bg_lock. Used when a foreground
+ * request arrives, and when a slot is freed while no bg request waits on the
+ * queue, so there is nothing to contend with.
+ */
+static void fuse_uring_flush_queue_fg(struct fuse_ring_queue *queue)
+{
+	while (fuse_uring_fg_admissible(queue))
+		fuse_uring_admit_fg(queue);
+}
+
+/*
+ * Admits waiting requests of both kinds into the free slots. Used whenever a
+ * bg request arrives, a slot is freed while bg requests wait, slots are added,
+ * or the queue stops.
+ *
+ * Foreground and non-critical bg requests share the non-critical slots. When
+ * both kinds can take a free slot, the slot goes to the kind that did not get
+ * the previous contested slot. While a request of either kind can be admitted,
+ * it is therefore admitted within two non-critical completions on its queue,
+ * however long the other kind keeps its list full. A bg request that the bg
+ * budget holds back cannot take a slot, and does not count as contending.
+ */
+static void fuse_uring_flush_queue(struct fuse_ring_queue *queue)
+{
+	fuse_uring_flush_queue_bg_crit(queue);
+
+	for (;;) {
+		bool fg = fuse_uring_fg_admissible(queue);
+		bool bg = fuse_uring_bg_admissible(queue);
+
+		if (fg && bg) {
+			bg = queue->noncrit_bg_turn;
+			fg = !bg;
+			queue->noncrit_bg_turn = !queue->noncrit_bg_turn;
+		}
+
+		if (fg)
+			fuse_uring_admit_fg(queue);
+		else if (bg)
+			fuse_uring_admit_bg(queue);
+		else
+			break;
 	}
 }
 
 /*
  * Undo the queue counting of an admitted request, and admit waiting requests
  * into the freed slots. Requests that were never admitted are not counted.
+ *
+ * Every caller ends the request with fuse_request_end() afterwards, which
+ * gives back the bg budget of a bg request. When bg requests wait on this
+ * queue, the budget is given back here instead, before the freed slot is
+ * handed on: fuse_request_end() may run only after a whole batch of
+ * completions, from task work.
  */
 static void fuse_uring_end_active(struct fuse_ring_queue *queue,
 				   struct fuse_req *req)
@@ -211,20 +291,23 @@ static void fuse_uring_end_active(struct fuse_ring_queue *queue,
 			queue->active_bg_critical--;
 	}
 
-	/*
-	 * The non-critical limit is shared by foreground and bg requests. A
-	 * freed non-critical slot is offered first to the kind of request that
-	 * freed it, so under load neither kind can starve the other.
-	 */
-	if (noncritical && !background)
+	if (!noncritical && !background)
+		return;
+
+	/* Without waiting bg requests there is no contention, and no bg_lock. */
+	if (list_empty(&queue->fuse_req_bg_queue) &&
+	    list_empty(&queue->fuse_req_bg_crit_queue)) {
 		fuse_uring_flush_queue_fg(queue);
-	if (noncritical || background) {
-		spin_lock(&fc->bg_lock);
-		fuse_uring_flush_queue_bg(queue);
-		spin_unlock(&fc->bg_lock);
+		return;
 	}
-	if (noncritical && background)
-		fuse_uring_flush_queue_fg(queue);
+
+	spin_lock(&fc->bg_lock);
+	if (background) {
+		fc->active_background--;
+		set_bit(FR_URING_BG_RETURNED, &req->flags);
+	}
+	fuse_uring_flush_queue(queue);
+	spin_unlock(&fc->bg_lock);
 }
 
 static void __fuse_uring_req_end(struct fuse_ring_ent *ent,
@@ -325,7 +408,7 @@ void fuse_uring_flush_bg(struct fuse_conn *fc)
 		spin_lock(&queue->lock);
 		spin_lock(&fc->bg_lock);
 		queue->stopped = true;
-		fuse_uring_flush_queue_bg(queue);
+		fuse_uring_flush_queue(queue);
 		spin_unlock(&fc->bg_lock);
 		spin_unlock(&queue->lock);
 	}
@@ -1632,9 +1715,8 @@ static int fuse_uring_register(struct io_uring_cmd *cmd,
 	ent->cmd = cmd;
 	queue->nr_ents++;
 	/* the new entry might raise the non-critical limit */
-	fuse_uring_flush_queue_fg(queue);
 	spin_lock(&fc->bg_lock);
-	fuse_uring_flush_queue_bg(queue);
+	fuse_uring_flush_queue(queue);
 	spin_unlock(&fc->bg_lock);
 	spin_unlock(&queue->lock);
 
@@ -1946,7 +2028,7 @@ bool fuse_uring_queue_bq_req(struct fuse_req *req)
 	fc->num_background++;
 	if (fc->num_background == fc->max_background)
 		fc->blocked = 1;
-	fuse_uring_flush_queue_bg(queue);
+	fuse_uring_flush_queue(queue);
 	spin_unlock(&fc->bg_lock);
 	spin_unlock(&queue->lock);
 
