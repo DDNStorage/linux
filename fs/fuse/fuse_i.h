@@ -150,8 +150,12 @@ struct dlm_locked_area
 /* Under this size a record is not worth a write of its own */
 #define FUSE_WRITE_STREAM_MIN		(64 * 1024)
 
-/* Largest DLM write grant requested ahead of writes still to come */
-#define FUSE_WRITE_GRANT_AHEAD_MAX	(4 * 1024 * 1024)
+/*
+ * Bounds of the dlm_grant_ahead window.  The byte cap bounds the range one
+ * client takes from other nodes at once, whatever the unit is.
+ */
+#define FUSE_GRANT_AHEAD_MAX_UNITS	64
+#define FUSE_GRANT_AHEAD_MAX_BYTES	(256 * 1024 * 1024)
 
 /** FUSE inode */
 struct fuse_inode {

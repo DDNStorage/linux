@@ -2972,6 +2972,28 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 }
 
 /*
+ * How far ahead of a sequential write the DLM write grant is requested, in
+ * units of the server's write alignment, or of max_write when the server
+ * announces none.  Off by default: a wider write grant favours the client
+ * that asks for it, and every other node that writes or caches in that range
+ * has to give it back and drop its cached pages there.
+ */
+static unsigned int __read_mostly dlm_grant_ahead;
+
+static int dlm_grant_ahead_set(const char *val, const struct kernel_param *kp)
+{
+	return param_set_uint_minmax(val, kp, 0, FUSE_GRANT_AHEAD_MAX_UNITS);
+}
+
+static const struct kernel_param_ops dlm_grant_ahead_ops = {
+	.set = dlm_grant_ahead_set,
+	.get = param_get_uint,
+};
+module_param_cb(dlm_grant_ahead, &dlm_grant_ahead_ops, &dlm_grant_ahead, 0644);
+MODULE_PARM_DESC(dlm_grant_ahead,
+		 "DLM write grant requested ahead of sequential writes, in units of the server alignment or max_write (0 = off, at most 64 units and 256 MiB)");
+
+/*
  * Under DLM the server grants a cached write exactly the range it asks for, so
  * a writer going through a file in small writes waits for a write grant round
  * trip per write.  When more writes are known to follow, ask for a grant past
@@ -2980,10 +3002,11 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
  * copy_file_range() fallback, which copy 64 KiB a round), and a streamed
  * write(2).
  *
- * The grant reaches as far ahead as the run has already come, and never past
- * the next FUSE_WRITE_GRANT_AHEAD_MAX boundary after this write: a writer into
- * one region of a file that other nodes write as well reaches into theirs
- * only where the regions are not aligned to that size.
+ * The grant reaches as far ahead as the run has already come, at most the
+ * window of dlm_grant_ahead units, and never past the next multiple of the
+ * window after this write: a writer into one region of a file that other
+ * nodes write as well reaches into theirs only where the regions are not
+ * aligned to the window.
  *
  * Only a hint: the write path still requests its own range under its own
  * range lock, which is what covers the data.  The range lock taken here
@@ -2993,16 +3016,20 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
 				   bool more)
 {
+	unsigned int units = READ_ONCE(dlm_grant_ahead);
 	struct fuse_file *ff = out->private_data;
 	struct inode *inode = file_inode(out);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	loff_t start = READ_ONCE(ff->write_run_start);
 	loff_t maxbytes = inode->i_sb->s_maxbytes;
-	loff_t cap = FUSE_WRITE_GRANT_AHEAD_MAX;
 	struct fuse_range_lock rlock;
-	loff_t end;
+	loff_t start, unit, window, end;
 
+	/* Before the run tracking, so that off leaves the file untouched. */
+	if (!units)
+		return;
+
+	start = READ_ONCE(ff->write_run_start);
 	if (pos != READ_ONCE(ff->write_run_next)) {
 		start = pos;
 		WRITE_ONCE(ff->write_run_start, start);
@@ -3020,8 +3047,16 @@ static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
 	    (inode->i_mode & (S_ISUID | S_ISGID)) || pos >= maxbytes)
 		return;
 
-	end = pos + min(pos - start, cap);
-	end = min3(end, round_up(pos + (loff_t)len, cap), maxbytes);
+	unit = fc->alignment_pages ?
+	       (loff_t)fc->alignment_pages << PAGE_SHIFT : fc->max_write;
+	window = min_t(loff_t, units, FUSE_GRANT_AHEAD_MAX_BYTES / unit) * unit;
+	if (!window)
+		return;
+
+	end = pos + min(pos - start, window);
+	end = min3(end,
+		   (loff_t)div64_u64(pos + len + window - 1, window) * window,
+		   maxbytes);
 	if (end - pos <= (loff_t)len ||
 	    fuse_dlm_lock_is_held(fi, pos, len, FUSE_PAGE_LOCK_WRITE))
 		return;
