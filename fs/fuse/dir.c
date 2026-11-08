@@ -2389,6 +2389,17 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			goto error;
 	}
 
+	/*
+	 * Without the writeback cache the reply's size is applied as it is
+	 * and the page cache truncated to it, which would drop a staged
+	 * splice copy the server has not seen yet.  The wait keeps AS_EIO
+	 * for fuse_flush().
+	 */
+	if (!is_wb && S_ISREG(inode->i_mode) && fuse_splice_staged_dirty(inode)) {
+		filemap_fdatawrite(mapping);
+		filemap_fdatawait_keep_errors(mapping);
+	}
+
 	if (is_truncate) {
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 		if (trust_local_cmtime && attr->ia_size != inode->i_size)
