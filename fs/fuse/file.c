@@ -3361,14 +3361,21 @@ static ssize_t fuse_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		fuse_write_grant_ahead(out, pos,
 				       fuse_splice_write_len(pipe, len));
 
+	/*
+	 * Fail a round on an earlier chunk's error before it is copied: once
+	 * copied, its data reaches the file with the flush below, and the count
+	 * do_splice_direct() reports would not cover it.  An error that comes in
+	 * during the round is left to the next round or the final flush.
+	 */
 	chunks = fuse_splice_stage_begin(pipe, out);
-	ret = iter_file_splice_write(pipe, out, ppos, len, flags);
+	if (chunks)
+		err = fuse_write_check_wb_err(out);
+	ret = err ?: iter_file_splice_write(pipe, out, ppos, len, flags);
 	fuse_write_run_advance(out, pos, *ppos);
 	if (chunks) {
 		WRITE_ONCE(fi->splice_stager, NULL);
 		if (ret > 0)
 			fuse_write_behind(out, pos, ret, chunks);
-		err = fuse_write_check_wb_err(out);
 	}
 
 	/*
