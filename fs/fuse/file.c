@@ -2324,6 +2324,9 @@ out:
 	return written ? written : err;
 }
 
+static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
+				   bool more);
+
 static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
 					struct iov_iter *from)
 {
@@ -2423,6 +2426,11 @@ static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
 	 */
 	through = stream && fc->big_writes &&
 		  iov_iter_count(from) >= FUSE_WRITE_STREAM_MIN;
+
+	/* An append lands at EOF, not at ki_pos. */
+	if (through && !(iocb->ki_flags & IOCB_APPEND))
+		fuse_write_grant_ahead(file, iocb->ki_pos, iov_iter_count(from),
+				       true);
 
 	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 
@@ -3223,15 +3231,16 @@ static ssize_t fuse_passthrough_file_splice_write(struct pipe_inode_info *pipe,
 #endif
 
 /*
- * sendfile(2) and the copy_file_range() fallback copy through a 64 KiB
- * internal pipe, and each pipe's worth is one write_iter.  Under DLM the
- * server grants a cached write exactly the range it asks for, so every 64 KiB
- * would wait for a write grant round trip of its own, the largest cost of
- * such a copy.  When the caller says more follows (SPLICE_F_MORE), ask for a
- * grant past this write, so that the next writes find their range granted.
+ * Under DLM the server grants a cached write exactly the range it asks for, so
+ * a writer going through a file in small writes waits for a write grant round
+ * trip per write.  When more writes are known to follow, ask for a grant past
+ * this one, so that the next writes find their range granted.  Two callers
+ * know: a splice whose caller set SPLICE_F_MORE (sendfile(2) and the
+ * copy_file_range() fallback, which copy 64 KiB a round), and a streamed
+ * write(2).
  *
  * The grant reaches as far ahead as the run has already come, and never past
- * the next FUSE_SPLICE_GRANT_AHEAD_MAX boundary after this write: a copy into
+ * the next FUSE_WRITE_GRANT_AHEAD_MAX boundary after this write: a writer into
  * one region of a file that other nodes write as well reaches into theirs
  * only where the regions are not aligned to that size.
  *
@@ -3240,30 +3249,30 @@ static ssize_t fuse_passthrough_file_splice_write(struct pipe_inode_info *pipe,
  * covers the whole request, so an invalidate cannot pass the reply before
  * the grant is recorded.
  */
-static void fuse_splice_write_grant_ahead(struct file *out, loff_t pos,
-					  size_t len, unsigned int flags)
+static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
+				   bool more)
 {
 	struct fuse_file *ff = out->private_data;
 	struct inode *inode = file_inode(out);
 	struct fuse_inode *fi = get_fuse_inode(inode);
-	loff_t start = READ_ONCE(ff->splice_run_start);
+	loff_t start = READ_ONCE(ff->write_run_start);
 	loff_t maxbytes = inode->i_sb->s_maxbytes;
-	loff_t cap = FUSE_SPLICE_GRANT_AHEAD_MAX;
+	loff_t cap = FUSE_WRITE_GRANT_AHEAD_MAX;
 	struct fuse_range_lock rlock;
 	loff_t end;
 
-	if (pos != READ_ONCE(ff->splice_run_next)) {
+	if (pos != READ_ONCE(ff->write_run_next)) {
 		start = pos;
-		WRITE_ONCE(ff->splice_run_start, start);
+		WRITE_ONCE(ff->write_run_start, start);
 	}
-	WRITE_ONCE(ff->splice_run_next, pos + len);
+	WRITE_ONCE(ff->write_run_next, pos + len);
 
 	/*
 	 * A write that will not be cached under our own grant: O_DIRECT and
 	 * FOPEN_DIRECT_IO writes have the server take the lock, and a write
 	 * that has to drop suid/sgid stays off the writeback path.
 	 */
-	if (!(flags & SPLICE_F_MORE) ||
+	if (!more ||
 	    (out->f_flags & O_DIRECT) || (ff->open_flags & FOPEN_DIRECT_IO) ||
 	    fuse_inode_force_dio(inode) ||
 	    (inode->i_mode & (S_ISUID | S_ISGID)) || pos >= maxbytes)
@@ -3287,7 +3296,7 @@ static ssize_t fuse_wb_splice_write(struct pipe_inode_info *pipe,
 				    struct file *out, loff_t *ppos,
 				    size_t len, unsigned int flags)
 {
-	fuse_splice_write_grant_ahead(out, *ppos, len, flags);
+	fuse_write_grant_ahead(out, *ppos, len, flags & SPLICE_F_MORE);
 	return iter_file_splice_write(pipe, out, ppos, len, flags);
 }
 
