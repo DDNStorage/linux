@@ -569,6 +569,22 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 
 	*size_seen = size;
 
+	/*
+	 * Without the writeback cache, a staged splice copy holds the same
+	 * kind of data until fuse_wt_splice_write() has written it back:
+	 * extending what the server has not seen yet, under stamps the
+	 * server has not set.  Shrinking i_size to the server's size would
+	 * have truncate_pagecache() drop it, and the server's newer mtime
+	 * would have the auto_inval_data check launder it a folio at a time.
+	 */
+	if (!fc->writeback_cache && S_ISREG(inode->i_mode) &&
+	    fuse_splice_staged_dirty(inode)) {
+		cache_mask |= STATX_MTIME | STATX_CTIME;
+		if (have_size && size > (loff_t)attr->size)
+			cache_mask |= STATX_SIZE;
+		return cache_mask;
+	}
+
 	if (!fc->writeback_cache || !S_ISREG(inode->i_mode))
 		return cache_mask;
 
@@ -667,7 +683,9 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	if (cache_mask & STATX_MTIME) {
 		struct timespec64 cached = inode_get_mtime(inode);
 
-		if (fuse_cached_time_wins(&cached, attr->mtime,
+		/* A staged splice copy keeps its stamps, see above */
+		if (!fc->writeback_cache ||
+		    fuse_cached_time_wins(&cached, attr->mtime,
 					  attr->mtimensec, have_mtime)) {
 			attr->mtime = cached.tv_sec;
 			attr->mtimensec = cached.tv_nsec;
@@ -678,7 +696,8 @@ static void fuse_change_attributes_i(struct inode *inode, struct fuse_attr *attr
 	if (cache_mask & STATX_CTIME) {
 		struct timespec64 cached = inode_get_ctime(inode);
 
-		if (fuse_cached_time_wins(&cached, attr->ctime,
+		if (!fc->writeback_cache ||
+		    fuse_cached_time_wins(&cached, attr->ctime,
 					  attr->ctimensec, have_ctime)) {
 			attr->ctime = cached.tv_sec;
 			attr->ctimensec = cached.tv_nsec;

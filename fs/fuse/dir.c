@@ -2719,6 +2719,16 @@ static int fuse_wt_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		file = NULL;
 	}
 
+	/*
+	 * The reply's size is applied as it is and the page cache truncated
+	 * to it, which would drop a staged splice copy the server has not
+	 * seen yet.  The wait keeps AS_EIO for fuse_flush_common().
+	 */
+	if (S_ISREG(inode->i_mode) && fuse_splice_staged_dirty(inode)) {
+		filemap_fdatawrite(mapping);
+		filemap_fdatawait_keep_errors(mapping);
+	}
+
 	if (is_truncate) {
 		/* Drop read replies that may predate the truncate. */
 		spin_lock(&fi->lock);

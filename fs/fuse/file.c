@@ -813,8 +813,24 @@ static int fuse_wt_flush(struct file *file, fl_owner_t id)
 	if (fuse_is_bad(file_inode(file)))
 		return -EIO;
 
-	if (ff->open_flags & FOPEN_NOFLUSH)
-		return 0;
+	if (ff->open_flags & FOPEN_NOFLUSH) {
+		struct inode *inode = file_inode(file);
+		int err;
+
+		/*
+		 * A staged splice copy that ended on a failed source read had
+		 * no flush point left; what it staged is written back at close
+		 * even so.
+		 */
+		if (!test_bit(FUSE_I_SPLICE_STAGED,
+			      &get_fuse_inode(inode)->state))
+			return 0;
+
+		err = write_inode_now(inode, 1);
+		if (err)
+			return err;
+		return filemap_check_errors(file->f_mapping);
+	}
 
 	return fuse_flush_common(file, id);
 }
@@ -1160,7 +1176,11 @@ typedef void (*fuse_read_size_fn)(struct inode *inode, loff_t pos,
 static void fuse_wt_read_size(struct inode *inode, loff_t pos, size_t asked,
 			      size_t got, u64 attr_ver, u64 size_gen)
 {
-	if (got < asked)
+	/*
+	 * While a staged splice copy is dirty, a short read is a hole, as
+	 * with the writeback cache: data after it has not reached the server.
+	 */
+	if (got < asked && !fuse_splice_staged_dirty(inode))
 		fuse_read_update_size(inode, pos + got, attr_ver);
 }
 
@@ -1438,10 +1458,10 @@ static int fuse_wb_read_folio(struct file *file, struct folio *folio)
 }
 
 /*
- * Only the writeback cache writes through iomap, and
- * fuse_wb_cache_write_iter() holds the grant over the written range across
- * this read, so the server never bounces it (see fuse_wt_read_folio() for a
- * read without a grant).
+ * With the writeback cache fuse_wb_cache_write_iter() holds the grant over
+ * the written range across this read, so the server never bounces it (see
+ * fuse_wt_read_folio() for a read without a grant).  A staged splice round
+ * without it uses fuse_wt_iomap_write_ops.
  */
 static int fuse_iomap_read_folio_range(const struct iomap_iter *iter,
 				       struct folio *folio, loff_t pos,
@@ -2184,6 +2204,21 @@ static const struct iomap_write_ops fuse_iomap_write_ops = {
 	.read_folio_range = fuse_iomap_read_folio_range,
 };
 
+/* A staged splice round: no DLM without the writeback cache */
+static int fuse_wt_iomap_read_folio_range(const struct iomap_iter *iter,
+					  struct folio *folio, loff_t pos,
+					  size_t len)
+{
+	struct file *file = iter->private;
+	size_t off = offset_in_folio(folio, pos);
+
+	return fuse_do_readfolio(file, folio, off, len, fuse_wt_read_size);
+}
+
+static const struct iomap_write_ops fuse_wt_iomap_write_ops = {
+	.read_folio_range = fuse_wt_iomap_read_folio_range,
+};
+
 static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from);
 
 /*
@@ -2387,6 +2422,7 @@ static ssize_t fuse_wt_cache_write_iter(struct kiocb *iocb,
 					struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	bool stage = READ_ONCE(get_fuse_inode(inode)->splice_stager) == current;
 	ssize_t written = 0;
 	ssize_t err, count;
 
@@ -2416,6 +2452,14 @@ static ssize_t fuse_wt_cache_write_iter(struct kiocb *iocb,
 			goto out;
 		written = direct_write_fallback(iocb, from, written,
 						fuse_perform_write(iocb, from, 0));
+	} else if (stage) {
+		/*
+		 * Left dirty for fuse_wt_splice_write() to write back.  The
+		 * inode lock is exclusive, and iomap moves i_size under it.
+		 */
+		written = iomap_file_buffered_write(iocb, from, &fuse_iomap_ops,
+						    &fuse_wt_iomap_write_ops,
+						    iocb->ki_filp);
 	} else {
 		written = fuse_perform_write(iocb, from, 0);
 	}
@@ -3495,6 +3539,136 @@ static size_t fuse_splice_write_len(struct pipe_inode_info *pipe, size_t len)
 	pipe_unlock(pipe);
 
 	return min(bytes, len);
+}
+
+/*
+ * Without the writeback cache, every pipe's worth that sendfile(2) or the
+ * copy_file_range() fallback hands over (64 KiB) is otherwise sent as one
+ * synchronous WRITE of that size.  With splice_write_batch set to N, such a
+ * round is copied into the page cache and left dirty instead, each chunk the
+ * copy completes is put under writeback as one aligned request with at most N
+ * of them in flight (fuse_write_behind()), and whatever is staged is written
+ * back and waited for before the system call returns.  The copy's own length
+ * or source tells where that is: the round without SPLICE_F_MORE ends a copy
+ * of a given length, ->splice_eof() one that reached the end of its source,
+ * and a round that fails or comes up short ends it as well.
+ *
+ * Off by default: a chunk that fails on the server ends the copy at a later
+ * round, which do_splice_direct() turns into a short count when earlier
+ * rounds succeeded, and when it is the last write back of a copy that ran to
+ * the end of its source, the next write, fsync() and close() report it
+ * instead of sendfile(2).
+ */
+static unsigned int splice_write_batch;
+module_param(splice_write_batch, uint, 0644);
+MODULE_PARM_DESC(splice_write_batch,
+		 "Chunks of a sendfile/copy_file_range copy left under writeback without the writeback cache (0: write each round through)");
+
+/*
+ * Only a round of do_splice_direct() is staged: it runs on the task's own
+ * splice pipe, and the copy it belongs to ends in one of the flush points
+ * above.  A write that has to reach the server by itself (O_SYNC, O_DSYNC,
+ * direct I/O) or that has to drop suid/sgid, which the WRITE of writeback
+ * does not do, is written through as before, and so is a round of a second
+ * copy into the same inode.
+ */
+static unsigned int fuse_splice_stage_begin(struct pipe_inode_info *pipe,
+					    struct file *out)
+{
+	struct fuse_file *ff = out->private_data;
+	struct inode *inode = file_inode(out);
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	unsigned int chunks = READ_ONCE(splice_write_batch);
+
+	if (!chunks || pipe != current->splice_pipe || !S_ISREG(inode->i_mode) ||
+	    FUSE_IS_DAX(inode) || (ff->open_flags & FOPEN_DIRECT_IO) ||
+	    fuse_inode_force_dio(inode) || IS_SYNC(inode) ||
+	    (out->f_flags & (O_DIRECT | O_DSYNC)) ||
+	    (inode->i_mode & (S_ISUID | S_ISGID)))
+		return 0;
+
+	if (cmpxchg(&fi->splice_stager, NULL, current))
+		return 0;
+
+	/* Writeback needs an open file to send with. */
+	fuse_link_write_file(out);
+	/* The server may need memory to complete the writeback reclaim waits on. */
+	mapping_set_writeback_may_deadlock_on_reclaim(out->f_mapping);
+	set_bit(FUSE_I_SPLICE_STAGED, &fi->state);
+
+	return chunks;
+}
+
+bool fuse_splice_staged_dirty(struct inode *inode)
+{
+	return test_bit(FUSE_I_SPLICE_STAGED, &get_fuse_inode(inode)->state) &&
+	       (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+		mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK));
+}
+
+/*
+ * The whole file, not just the copy's range: a staged copy keeps no record
+ * of where it started, and without the writeback cache the only other dirty
+ * folios are those of a shared mapping.  The wait keeps AS_EIO for
+ * fuse_flush_common(); the caller reports the error through its own cursor.
+ */
+static int fuse_splice_stage_flush(struct file *out)
+{
+	int err = filemap_fdatawrite(out->f_mapping);
+
+	filemap_fdatawait_keep_errors(out->f_mapping);
+
+	return err;
+}
+
+static ssize_t fuse_wt_splice_write(struct pipe_inode_info *pipe,
+				    struct file *out, loff_t *ppos,
+				    size_t len, unsigned int flags)
+{
+	struct fuse_inode *fi = get_fuse_inode(file_inode(out));
+	loff_t pos = *ppos;
+	unsigned int chunks;
+	int flush_err;
+	ssize_t ret;
+	int err = 0;
+
+	chunks = fuse_splice_stage_begin(pipe, out);
+	ret = iter_file_splice_write(pipe, out, ppos, len, flags);
+	if (chunks) {
+		WRITE_ONCE(fi->splice_stager, NULL);
+		if (ret > 0)
+			fuse_write_behind(out, pos, ret, chunks);
+		err = fuse_write_check_wb_err(out);
+	}
+
+	/*
+	 * A round of an earlier copy, or one another task's copy claimed the
+	 * inode for, may have left data staged, so the end of every copy
+	 * writes back whatever the inode holds.
+	 */
+	if (pipe != current->splice_pipe ||
+	    !test_bit(FUSE_I_SPLICE_STAGED, &fi->state))
+		return ret;
+	if (!err && ret == (ssize_t)len && (flags & SPLICE_F_MORE))
+		return ret;
+
+	flush_err = fuse_splice_stage_flush(out);
+	if (!err)
+		err = fuse_write_check_wb_err(out) ?: flush_err;
+
+	return err ?: ret;
+}
+
+/*
+ * A copy whose source ran out before its length ends after a round that
+ * still carried SPLICE_F_MORE.  There is no round left to fail, so an error
+ * of this last write back is reported by the next write, fsync() and close().
+ */
+static void fuse_splice_eof(struct file *out)
+{
+	if (test_bit(FUSE_I_SPLICE_STAGED,
+		     &get_fuse_inode(file_inode(out))->state))
+		fuse_splice_stage_flush(out);
 }
 
 /* The writeback cache is kept coherent by the DLM: ask for the grant ahead */
@@ -5602,7 +5776,8 @@ static const struct file_operations fuse_wt_file_operations = {
 	.get_unmapped_area = thp_get_unmapped_area,
 	.flock		= fuse_file_flock,
 	.splice_read	= copy_splice_read,
-	.splice_write	= iter_file_splice_write,
+	.splice_write	= fuse_wt_splice_write,
+	.splice_eof	= fuse_splice_eof,
 	.unlocked_ioctl	= fuse_file_ioctl,
 	.compat_ioctl	= fuse_file_compat_ioctl,
 	.poll		= fuse_file_poll,
@@ -5803,6 +5978,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	fi->notify_interval_ewma = FUSE_NOTIFY_EWMA_SEED << FUSE_NOTIFY_EWMA_SHIFT;
 	fi->write_size_ewma = 0;
 	fi->write_stream_run = 0;
+	fi->splice_stager = NULL;
 
 	if (IS_ENABLED(CONFIG_FUSE_DAX))
 		fuse_dax_inode_init(inode, flags);
