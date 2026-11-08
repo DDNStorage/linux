@@ -373,8 +373,9 @@ enum {
 	FUSE_I_DLM_LOCKED,
 	/*
 	 * Spliced data has been left dirty on this inode without the
-	 * writeback cache (fuse_wt_splice_write()).  Never cleared: it only
-	 * means something while the mapping is dirty or under writeback.
+	 * writeback cache (fuse_wt_splice_write()).  Cleared once that data is
+	 * on the server (fuse_splice_stage_done()); it only means something
+	 * while the mapping is dirty or under writeback.
 	 */
 	FUSE_I_SPLICE_STAGED,
 };

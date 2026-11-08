@@ -768,6 +768,27 @@ static void fuse_sync_writes(struct inode *inode)
  * Write the inode out and send FUSE_FLUSH.  Dirty folios exist in both
  * modes: writethrough gets them from shared mappings.
  */
+/*
+ * Once what a copy staged is on the server, a dirty folio left in the mapping
+ * is one a shared mapping dirtied, which takes the server's size and mtime as
+ * it did before any copy.  Holding the stager claim keeps a copy from staging
+ * while the mapping is checked.
+ */
+static void fuse_splice_stage_done(struct inode *inode)
+{
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
+	if (!test_bit(FUSE_I_SPLICE_STAGED, &fi->state) ||
+	    cmpxchg(&fi->splice_stager, NULL, current))
+		return;
+
+	if (!mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) &&
+	    !mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))
+		clear_bit(FUSE_I_SPLICE_STAGED, &fi->state);
+	/* Orders the clear_bit() before the set_bit() of the next claim. */
+	smp_store_release(&fi->splice_stager, NULL);
+}
+
 static int fuse_flush_common(struct file *file, fl_owner_t id)
 {
 	struct inode *inode = file_inode(file);
@@ -780,6 +801,7 @@ static int fuse_flush_common(struct file *file, fl_owner_t id)
 	err = write_inode_now(inode, 1);
 	if (err)
 		return err;
+	fuse_splice_stage_done(inode);
 
 	err = filemap_check_errors(file->f_mapping);
 	if (err)
@@ -829,6 +851,7 @@ static int fuse_wt_flush(struct file *file, fl_owner_t id)
 		err = write_inode_now(inode, 1);
 		if (err)
 			return err;
+		fuse_splice_stage_done(inode);
 		return filemap_check_errors(file->f_mapping);
 	}
 
@@ -3617,6 +3640,7 @@ static int fuse_splice_stage_flush(struct file *out)
 	int err = filemap_fdatawrite(out->f_mapping);
 
 	filemap_fdatawait_keep_errors(out->f_mapping);
+	fuse_splice_stage_done(file_inode(out));
 
 	return err;
 }
@@ -3643,7 +3667,8 @@ static ssize_t fuse_wt_splice_write(struct pipe_inode_info *pipe,
 		err = fuse_write_check_wb_err(out);
 	ret = err ?: iter_file_splice_write(pipe, out, ppos, len, flags);
 	if (chunks) {
-		WRITE_ONCE(fi->splice_stager, NULL);
+		/* Orders the round's dirty tags before fuse_splice_stage_done(). */
+		smp_store_release(&fi->splice_stager, NULL);
 		if (ret > 0)
 			fuse_write_behind(out, pos, ret, chunks);
 	}
