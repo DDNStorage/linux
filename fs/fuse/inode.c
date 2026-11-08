@@ -1003,6 +1003,38 @@ static void fuse_dlm_revoke_inval_range(struct fuse_inode *fi, loff_t offset,
 	fuse_dlm_unlock_range(fi, start, end);
 }
 
+/*
+ * Lower *end to the index of the last folio in [start, *end], or return false
+ * when the range holds none.  Shadow entries carry no data and do not count.
+ */
+static bool fuse_last_cached_folio(struct address_space *mapping,
+				   pgoff_t start, pgoff_t *end)
+{
+	XA_STATE(xas, &mapping->i_pages, start);
+	bool found = false;
+	pgoff_t last = 0;
+	void *entry;
+
+	rcu_read_lock();
+	xas_for_each(&xas, entry, *end) {
+		if (xas_retry(&xas, entry) || xa_is_value(entry))
+			continue;
+		last = xas.xa_index;
+		found = true;
+		if (need_resched()) {
+			xas_pause(&xas);
+			rcu_read_unlock();
+			cond_resched();
+			rcu_read_lock();
+		}
+	}
+	rcu_read_unlock();
+
+	if (found)
+		*end = last;
+	return found;
+}
+
 int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			     loff_t offset, loff_t len)
 {
@@ -1055,17 +1087,30 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 	if (offset >= 0) {
 		bool range_locked = S_ISREG(inode->i_mode) &&
 				   fc->writeback_cache && fc->dlm;
-		bool write_back = range_locked ||
-				  fuse_splice_staged_dirty(inode);
+		bool staged = fuse_splice_staged_dirty(inode);
+		bool write_back = range_locked || staged;
 		bool hot = false, has_writer = false, latched = false;
+		bool cached = true;
 		bool track_latch;
-		int ierr;
+		int ierr = 0;
 
 		pg_start = offset >> PAGE_SHIFT;
 		if (len <= 0)
 			pg_end = -1;
 		else
 			pg_end = (offset + len - 1) >> PAGE_SHIFT;
+
+		/*
+		 * A staged splice copy keeps adding folios while the
+		 * invalidate below runs, and laundering each one it dirties
+		 * would follow the copy to its end.  Only the folios present
+		 * now can hold data this notify supersedes: a folio added
+		 * later is filled by a READ sent, or a write made, after the
+		 * server sent the notify.
+		 */
+		if (staged)
+			cached = fuse_last_cached_folio(inode->i_mapping,
+							pg_start, &pg_end);
 
 		/*
 		 * A data invalidation means another (remote) entity is
@@ -1183,7 +1228,7 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 		if (fuse_inode_force_dio(inode))
 			ierr = invalidate_inode_pages2_range(inode->i_mapping,
 							     0, -1);
-		else
+		else if (cached)
 			ierr = invalidate_inode_pages2_range(inode->i_mapping,
 							     pg_start, pg_end);
 		if (ierr)
