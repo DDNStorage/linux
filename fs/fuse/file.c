@@ -329,6 +329,8 @@ int fuse_finish_open(struct inode *inode, struct file *file)
 	else if (ff->open_flags & FOPEN_NONSEEKABLE)
 		nonseekable_open(inode, file);
 
+	ff->write_wb_err = file->f_wb_err;
+
 	if ((file->f_mode & FMODE_WRITE) && fc->writeback_cache)
 		fuse_link_write_file(file);
 
@@ -2141,6 +2143,107 @@ static bool fuse_write_stream_update(struct fuse_inode *fi, size_t len)
 	return run >= FUSE_WRITE_STREAM_RUN;
 }
 
+/*
+ * Off by default: with it set, a record that failed on the server is reported
+ * by a later write, fsync() or close() instead of by the write(2) that wrote
+ * it.
+ */
+static unsigned int stream_write_behind;
+module_param(stream_write_behind, uint, 0644);
+MODULE_PARM_DESC(stream_write_behind,
+		 "Chunks of a streamed buffered write left under writeback behind the writer (0: write through)");
+
+/*
+ * The largest power of two a FUSE_WRITE carries.  Every power-of-two
+ * erasure-coding bucket up to that size divides it, so a request that starts
+ * and ends on its boundaries covers whole buckets, whether or not the server
+ * set align_page_order.
+ */
+static loff_t fuse_write_chunk(struct fuse_conn *fc)
+{
+	size_t cap = min_t(size_t, fc->max_write,
+			   (size_t)fc->max_pages << PAGE_SHIFT);
+
+	return rounddown_pow_of_two(cap);
+}
+
+/*
+ * Report a writeback error that no write through @file has reported yet, once.
+ * A cursor of its own leaves f_wb_err to fsync() and AS_EIO to close(), so
+ * that both still report the error in their turn.
+ */
+static int fuse_write_check_wb_err(struct file *file)
+{
+	struct fuse_file *ff = file->private_data;
+	errseq_t *wb_err = &file->f_mapping->wb_err;
+	int err;
+
+	if (!errseq_check(wb_err, READ_ONCE(ff->write_wb_err)))
+		return 0;
+
+	spin_lock(&file->f_lock);
+	err = errseq_check_and_advance(wb_err, &ff->write_wb_err);
+	spin_unlock(&file->f_lock);
+
+	return err;
+}
+
+static void fuse_write_behind_wait(struct address_space *mapping,
+				   loff_t start, loff_t end)
+{
+	pgoff_t index = start >> PAGE_SHIFT;
+	pgoff_t last = end >> PAGE_SHIFT;
+	struct folio_batch fbatch;
+	unsigned int i, nr;
+	int err = 0;
+
+	folio_batch_init(&fbatch);
+	while (!err && index <= last) {
+		nr = filemap_get_folios_tag(mapping, &index, last,
+					    PAGECACHE_TAG_WRITEBACK, &fbatch);
+		if (!nr)
+			break;
+		for (i = 0; i < nr && !err; i++)
+			err = folio_wait_writeback_killable(fbatch.folios[i]);
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+}
+
+/*
+ * Put each chunk that a write of [pos, pos + len) completed under writeback at
+ * once, then wait for the chunk @chunks behind it: a writer keeps at most that
+ * many chunks under writeback and less than one dirty, and the folios it
+ * leaves behind turn clean and reclaimable soon after.
+ *
+ * Called with no lock held: nothing here may hold off an invalidate or a
+ * truncate.
+ */
+static void fuse_write_behind(struct file *file, loff_t pos, size_t len,
+			      unsigned int chunks)
+{
+	struct address_space *mapping = file->f_mapping;
+	loff_t chunk = fuse_write_chunk(get_fuse_conn(mapping->host));
+	loff_t window = (loff_t)chunks * chunk;
+	loff_t start = round_down(pos, chunk);
+	loff_t end = round_down(pos + len, chunk);
+
+	if (end <= pos)
+		return;
+
+	/* A pass that starts on a chunk boundary sends aligned requests. */
+	filemap_fdatawrite_range_kick(mapping, start, end - 1);
+
+	/*
+	 * Not filemap_fdatawait_range(): it would clear the AS_EIO that
+	 * fuse_flush() reports, and could not be killed while the server
+	 * holds the requests.
+	 */
+	if (end - window > 0)
+		fuse_write_behind_wait(mapping, max_t(loff_t, start - window, 0),
+				       end - window - 1);
+}
+
 static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len);
 static void fuse_write_run_advance(struct file *out, loff_t pos, loff_t next);
 
@@ -2160,6 +2263,7 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	bool through = false;
 	bool run = false;
 	loff_t run_pos = iocb->ki_pos;
+	unsigned int behind = 0;
 	bool range_locked = false;
 	bool exclusive = true;
 	loff_t dlm_pos = 0;
@@ -2257,6 +2361,22 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	run = through && !(iocb->ki_flags & IOCB_APPEND);
 	if (run)
 		fuse_write_grant_ahead(file, run_pos, iov_iter_count(from));
+
+	/*
+	 * With stream_write_behind set, the record is cached and written back
+	 * right behind the writer instead (fuse_write_behind()).  An O_SYNC or
+	 * O_DSYNC record has to reach the server before write(2) returns
+	 * either way.
+	 */
+	if (through && !(iocb->ki_flags & IOCB_DSYNC)) {
+		behind = READ_ONCE(stream_write_behind);
+		if (behind) {
+			through = false;
+			err = fuse_write_check_wb_err(file);
+			if (err)
+				return err;
+		}
+	}
 
 	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 
@@ -2599,6 +2719,8 @@ out:
 	fuse_cache_wr_unlock(inode, exclusive);
 	if (run)
 		fuse_write_run_advance(file, run_pos, iocb->ki_pos);
+	if (behind && written > 0)
+		fuse_write_behind(file, iocb->ki_pos - written, written, behind);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
 
