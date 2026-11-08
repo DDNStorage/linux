@@ -2324,8 +2324,8 @@ out:
 	return written ? written : err;
 }
 
-static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
-				   bool more);
+static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len);
+static void fuse_write_run_advance(struct file *out, loff_t pos, loff_t next);
 
 static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
 					struct iov_iter *from)
@@ -2342,6 +2342,8 @@ static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
 	bool writeback = false;
 	bool stream = false;
 	bool through = false;
+	bool run = false;
+	loff_t run_pos = iocb->ki_pos;
 	bool range_locked = false;
 	bool exclusive = true;
 	loff_t dlm_pos = 0;
@@ -2428,9 +2430,9 @@ static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
 		  iov_iter_count(from) >= FUSE_WRITE_STREAM_MIN;
 
 	/* An append lands at EOF, not at ki_pos. */
-	if (through && !(iocb->ki_flags & IOCB_APPEND))
-		fuse_write_grant_ahead(file, iocb->ki_pos, iov_iter_count(from),
-				       true);
+	run = through && !(iocb->ki_flags & IOCB_APPEND);
+	if (run)
+		fuse_write_grant_ahead(file, run_pos, iov_iter_count(from));
 
 	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 
@@ -2757,6 +2759,8 @@ out:
 	if (range_locked)
 		fuse_range_lock_release(fi, &rlock);
 	fuse_cache_wr_unlock(inode, exclusive);
+	if (run)
+		fuse_write_run_advance(file, run_pos, iocb->ki_pos);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
 
@@ -3273,9 +3277,11 @@ MODULE_PARM_DESC(dlm_grant_ahead,
  * the grant is recorded.  It is only tried, never waited for: a hint is not
  * worth stalling the writer behind other IO or an invalidate draining
  * anywhere in the window.
+ *
+ * @len is only an estimate for a splice, so the run advances afterwards, by
+ * what was written: fuse_write_run_advance().
  */
-static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
-				   bool more)
+static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len)
 {
 	unsigned int units = READ_ONCE(dlm_grant_ahead);
 	struct fuse_file *ff = out->private_data;
@@ -3286,27 +3292,21 @@ static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
 	struct fuse_range_lock rlock;
 	loff_t start, unit, window, end;
 
-	/* Before the run tracking, so that off leaves the file untouched. */
-	if (!units)
+	if (!units || !len)
 		return;
-
-	start = READ_ONCE(ff->write_run_start);
-	if (pos != READ_ONCE(ff->write_run_next)) {
-		start = pos;
-		WRITE_ONCE(ff->write_run_start, start);
-	}
-	WRITE_ONCE(ff->write_run_next, pos + len);
 
 	/*
 	 * A write that will not be cached under our own grant: O_DIRECT and
 	 * FOPEN_DIRECT_IO writes have the server take the lock, and a write
 	 * that has to drop suid/sgid stays off the writeback path.
 	 */
-	if (!more ||
-	    (out->f_flags & O_DIRECT) || (ff->open_flags & FOPEN_DIRECT_IO) ||
+	if ((out->f_flags & O_DIRECT) || (ff->open_flags & FOPEN_DIRECT_IO) ||
 	    fuse_inode_force_dio(inode) ||
 	    (inode->i_mode & (S_ISUID | S_ISGID)) || pos >= maxbytes)
 		return;
+
+	start = pos == READ_ONCE(ff->write_run_next) ?
+		READ_ONCE(ff->write_run_start) : pos;
 
 	unit = fc->alignment_pages ?
 	       (loff_t)fc->alignment_pages << PAGE_SHIFT : fc->max_write;
@@ -3336,13 +3336,53 @@ static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
 	fuse_range_lock_release(fi, &rlock);
 }
 
+static void fuse_write_run_advance(struct file *out, loff_t pos, loff_t next)
+{
+	struct fuse_file *ff = out->private_data;
+
+	if (!READ_ONCE(dlm_grant_ahead) || next <= pos)
+		return;
+
+	if (pos != READ_ONCE(ff->write_run_next))
+		WRITE_ONCE(ff->write_run_start, pos);
+	WRITE_ONCE(ff->write_run_next, next);
+}
+
+/*
+ * A splice from a pipe writes no more than the pipe holds when it starts,
+ * unless it has to wait for more, and splice(2) callers commonly pass a
+ * length far beyond that.
+ */
+static size_t fuse_splice_write_len(struct pipe_inode_info *pipe, size_t len)
+{
+	unsigned int head, tail, slot;
+	size_t bytes = 0;
+
+	pipe_lock(pipe);
+	head = pipe->head;
+	tail = pipe->tail;
+	for (slot = 0; slot < pipe_occupancy(head, tail) && bytes < len; slot++)
+		bytes += pipe_buf(pipe, tail + slot)->len;
+	pipe_unlock(pipe);
+
+	return min(bytes, len);
+}
+
 /* The writeback cache is kept coherent by the DLM: ask for the grant ahead */
 static ssize_t fuse_wb_splice_write(struct pipe_inode_info *pipe,
 				    struct file *out, loff_t *ppos,
 				    size_t len, unsigned int flags)
 {
-	fuse_write_grant_ahead(out, *ppos, len, flags & SPLICE_F_MORE);
-	return iter_file_splice_write(pipe, out, ppos, len, flags);
+	loff_t pos = *ppos;
+	ssize_t ret;
+
+	if ((flags & SPLICE_F_MORE) && READ_ONCE(dlm_grant_ahead))
+		fuse_write_grant_ahead(out, pos,
+				       fuse_splice_write_len(pipe, len));
+	ret = iter_file_splice_write(pipe, out, ppos, len, flags);
+	fuse_write_run_advance(out, pos, *ppos);
+
+	return ret;
 }
 
 static void fuse_writepage_free(struct fuse_writepage_args *wpa)
