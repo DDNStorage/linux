@@ -517,7 +517,8 @@ void fuse_request_end(struct fuse_req *req)
 		}
 
 		fc->num_background--;
-		fc->active_background--;
+		if (!test_bit(FR_URING_BG_RETURNED, &req->flags))
+			fc->active_background--;
 		flush_bg_queue(fc);
 		spin_unlock(&fc->bg_lock);
 	} else {
