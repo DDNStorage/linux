@@ -2976,6 +2976,13 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
 }
 
 /*
+ * Bounds of the dlm_grant_ahead window.  The byte cap bounds the range one
+ * client takes from other nodes at once, whatever the unit is.
+ */
+#define FUSE_GRANT_AHEAD_MAX_UNITS	64
+#define FUSE_GRANT_AHEAD_MAX_BYTES	(256 * 1024 * 1024)
+
+/*
  * How far ahead of a sequential write the DLM write grant is requested, in
  * units of the server's write alignment, or of max_write when the server
  * announces none.  Off by default: a wider write grant favours the client
@@ -2995,7 +3002,7 @@ static const struct kernel_param_ops dlm_grant_ahead_ops = {
 };
 module_param_cb(dlm_grant_ahead, &dlm_grant_ahead_ops, &dlm_grant_ahead, 0644);
 MODULE_PARM_DESC(dlm_grant_ahead,
-		 "DLM write grant requested ahead of sequential writes, in units of the server alignment or max_write (0 = off, at most 64 units and 256 MiB)");
+		 "DLM write grant requested ahead of sequential writes, in units of the server alignment or max_write (0 = off, at most 64; the window is capped at 256 MiB)");
 
 /*
  * Under DLM the server grants a cached write exactly the range it asks for, so
