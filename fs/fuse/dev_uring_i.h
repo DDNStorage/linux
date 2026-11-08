@@ -128,6 +128,13 @@ struct fuse_ring_queue {
 	 */
 	unsigned int active_bg_critical;
 
+	/*
+	 * When foreground and bg requests both wait for a free non-critical
+	 * slot, whether the next one goes to bg. Flipped on each such slot,
+	 * see fuse_uring_flush_queue().
+	 */
+	bool noncrit_bg_turn;
+
 	bool stopped;
 };
 
