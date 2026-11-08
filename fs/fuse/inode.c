@@ -583,6 +583,22 @@ static u32 fuse_attr_cache_mask(struct inode *inode, struct fuse_attr *attr,
 
 	*size_seen = size;
 
+	/*
+	 * Without the writeback cache, a staged splice copy holds the same
+	 * kind of data until fuse_splice_write() has written it back:
+	 * extending what the server has not seen yet, under stamps the
+	 * server has not set.  Shrinking i_size to the server's size would
+	 * have truncate_pagecache() drop it, and the server's newer mtime
+	 * would have the auto_inval_data check launder it a folio at a time.
+	 */
+	if (!fc->writeback_cache && S_ISREG(inode->i_mode) &&
+	    fuse_splice_staged_dirty(inode)) {
+		cache_mask |= STATX_MTIME | STATX_CTIME;
+		if (have_size && size > (loff_t)attr->size)
+			cache_mask |= STATX_SIZE;
+		return cache_mask;
+	}
+
 	if (cache_mask || !fc->dlm || !fc->writeback_cache ||
 	    !S_ISREG(inode->i_mode))
 		return cache_mask;
