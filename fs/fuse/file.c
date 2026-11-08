@@ -3011,7 +3011,9 @@ MODULE_PARM_DESC(dlm_grant_ahead,
  * Only a hint: the write path still requests its own range under its own
  * range lock, which is what covers the data.  The range lock taken here
  * covers the whole request, so an invalidate cannot pass the reply before
- * the grant is recorded.
+ * the grant is recorded.  It is only tried, never waited for: a hint is not
+ * worth stalling the writer behind other IO or an invalidate draining
+ * anywhere in the window.
  */
 static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
 				   bool more)
@@ -3061,10 +3063,17 @@ static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len,
 	    fuse_dlm_lock_is_held(fi, pos, len, FUSE_PAGE_LOCK_WRITE))
 		return;
 
-	if (fuse_range_lock_acquire_init(fi, &rlock, pos, end - 1,
-					 FUSE_RANGE_LOCK_WRITE))
+	if (!fuse_range_lock_try_acquire_init(fi, &rlock, pos, end - 1,
+					      FUSE_RANGE_LOCK_WRITE))
 		return;
-	fuse_get_dlm_lock(out, pos, end - pos, FUSE_PAGE_LOCK_WRITE, &rlock);
+	/*
+	 * LOCKED first, so that fuse_get_dlm_lock() finds no invalidate
+	 * draining in the window to wait for: one could have slipped past
+	 * the INIT range since the try above.
+	 */
+	if (fuse_range_lock_try_mark_locked(fi, &rlock))
+		fuse_get_dlm_lock(out, pos, end - pos, FUSE_PAGE_LOCK_WRITE,
+				  &rlock);
 	fuse_range_lock_release(fi, &rlock);
 }
 
