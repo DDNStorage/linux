@@ -240,6 +240,14 @@ struct fuse_inode {
 			 */
 			unsigned int write_size_ewma;
 			unsigned int write_stream_run;
+
+			/*
+			 * The task whose fuse_splice_write() round is
+			 * staging into the page cache of this inode without
+			 * the writeback cache, claimed with cmpxchg(); see
+			 * fuse_splice_stage_begin().
+			 */
+			struct task_struct *splice_stager;
 		};
 
 		/* readdir cache (directory only) */
@@ -327,6 +335,12 @@ enum {
 	 * the lock, see fuse_dlm_attr_timeout().
 	 */
 	FUSE_I_DLM_LOCKED,
+	/*
+	 * Spliced data has been left dirty on this inode without the
+	 * writeback cache (fuse_splice_write()).  Never cleared: it only
+	 * means something while the mapping is dirty or under writeback.
+	 */
+	FUSE_I_SPLICE_STAGED,
 };
 
 struct fuse_conn;
@@ -1643,6 +1657,7 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait);
 int fuse_dev_release(struct inode *inode, struct file *file);
 
 bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written);
+bool fuse_splice_staged_dirty(struct inode *inode);
 void fuse_zero_eof_gap(struct inode *inode, loff_t to);
 
 int fuse_flush_times(struct inode *inode, struct fuse_file *ff);
