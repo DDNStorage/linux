@@ -395,6 +395,13 @@ struct fuse_file {
 	loff_t write_run_start;
 	loff_t write_run_next;
 
+	/*
+	 * The last writeback error a write through this file has reported,
+	 * kept apart from f_wb_err so that fsync() still reports it as well.
+	 * Protected by file->f_lock.
+	 */
+	errseq_t write_wb_err;
+
 	/** Has flock been performed on this file? */
 	bool flock:1;
 };
