@@ -2745,9 +2745,11 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct page *page,
 
 	/* Reached alignment */
 	if (fc->alignment_pages && !(page->index % fc->alignment_pages)) {
+		pgoff_t end_page_index = (wbc->range_end + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
 		/* we are at a point where we would write aligned
 		 * check if we potentially could reach the next alignment */
-		if (page->index + fc->alignment_pages > wbc->range_end)
+		if (page->index + fc->alignment_pages > end_page_index)
 			return true;
 
 		if (ap->num_pages + fc->alignment_pages > fc->max_pages)
