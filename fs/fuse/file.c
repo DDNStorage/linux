@@ -3665,9 +3665,11 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct folio *folio,
 
 	/* Reached alignment */
 	if (fc->alignment_pages && !(folio->index % fc->alignment_pages)) {
+		pgoff_t end_page_index = (wbc->range_end + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
 		/* we are at a point where we would write aligned
 		 * check if we potentially could reach the next alignment */
-		if (folio->index + fc->alignment_pages > wbc->range_end)
+		if (folio->index + fc->alignment_pages > end_page_index)
 			return true;
 
 		if (ap->num_folios + fc->alignment_pages > fc->max_pages)
