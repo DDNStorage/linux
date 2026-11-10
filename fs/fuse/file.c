@@ -5265,7 +5265,16 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 			goto out;
 	}
 
-	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) {
+	/*
+	 * With DLM the server takes the file's data lock in EX for FALLOCATE
+	 * and revokes our grant.  A WRITE sent from that revoke queues behind
+	 * the EX and never completes, so no folio may be dirty when we send it.
+	 */
+	if (fm->fc->writeback_cache && fm->fc->dlm) {
+		err = fuse_writeback_range(inode, 0, LLONG_MAX);
+		if (err)
+			goto out;
+	} else if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)) {
 		loff_t endbyte = offset + length - 1;
 
 		err = fuse_writeback_range(inode, offset, endbyte);
