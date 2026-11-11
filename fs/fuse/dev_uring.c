@@ -19,9 +19,17 @@ module_param(enable_uring, bool, 0644);
 MODULE_PARM_DESC(enable_uring,
 		 "Enable userspace communication through io-uring");
 
+static unsigned int __read_mostly uring_copy_split_kb = 1024;
+module_param(uring_copy_split_kb, uint, 0644);
+MODULE_PARM_DESC(uring_copy_split_kb,
+		 "Copy write payloads into the ring on several CPUs, in segments of this many KiB; 0 disables");
+
 #define FUSE_URING_IOV_SEGS 2 /* header and payload */
 #define FUSE_RING_HEADER_PG 0
 #define FUSE_RING_PAYLOAD_PG 1
+
+/* Upper bound of CPUs that copy one payload into the ring */
+#define FUSE_URING_COPY_MAX_SEGS 16
 
 /* Threshold that determines if a better queue should be searched for */
 #define FUSE_URING_Q_THRESHOLD 2
@@ -1011,6 +1019,121 @@ static int fuse_uring_copy_from_ring(struct fuse_ring *ring,
 	return err;
 }
 
+struct fuse_uring_copy_seg {
+	struct work_struct work;
+	struct fuse_args_pages *ap;
+	struct page **dst_pages;
+	size_t dst_off;
+	size_t src_pos;
+	size_t len;
+	atomic_t *pending;
+	struct completion *done;
+};
+
+/* Copy @len payload bytes from payload position @src_pos to ring offset @dst_off */
+static void fuse_uring_copy_seg(struct fuse_args_pages *ap,
+				struct page **dst_pages, size_t dst_off,
+				size_t src_pos, size_t len)
+{
+	unsigned int i = 0;
+	size_t skip = src_pos;
+
+	while (i < ap->num_folios && skip >= ap->descs[i].length) {
+		skip -= ap->descs[i].length;
+		i++;
+	}
+
+	for (; len && i < ap->num_folios; i++, skip = 0) {
+		size_t folio_off = ap->descs[i].offset + skip;
+		size_t avail = ap->descs[i].length - skip;
+
+		while (len && avail) {
+			struct page *src = folio_page(ap->folios[i],
+						      folio_off >> PAGE_SHIFT);
+			struct page *dst = dst_pages[dst_off >> PAGE_SHIFT];
+			size_t n = min3(len, avail,
+					PAGE_SIZE - offset_in_page(folio_off));
+
+			n = min(n, PAGE_SIZE - offset_in_page(dst_off));
+			memcpy_page(dst, offset_in_page(dst_off), src,
+				    offset_in_page(folio_off), n);
+			folio_off += n;
+			dst_off += n;
+			avail -= n;
+			len -= n;
+		}
+	}
+}
+
+static void fuse_uring_copy_seg_work(struct work_struct *work)
+{
+	struct fuse_uring_copy_seg *seg =
+		container_of(work, struct fuse_uring_copy_seg, work);
+
+	fuse_uring_copy_seg(seg->ap, seg->dst_pages, seg->dst_off,
+			    seg->src_pos, seg->len);
+	if (atomic_dec_and_test(seg->pending))
+		complete(seg->done);
+}
+
+/*
+ * One CPU copies 4 MiB into the ring in 0.5-1.6 ms, depending on where the
+ * source and the ring pages live, which caps a stream of synchronous writes.
+ * Split the payload across CPUs of the caller's node. Returns false when the
+ * payload was not copied; the caller then copies it itself.
+ */
+static bool fuse_uring_copy_payload_split(struct fuse_ring_ent *ent,
+					  struct fuse_req *req, size_t dst_off,
+					  size_t size)
+{
+	struct fuse_args_pages *ap =
+		container_of(req->args, struct fuse_args_pages, args);
+	size_t seg_sz = (size_t)READ_ONCE(uring_copy_split_kb) << 10;
+	DECLARE_COMPLETION_ONSTACK(done);
+	struct fuse_uring_copy_seg *segs;
+	unsigned int nseg, i;
+	atomic_t pending;
+	int node;
+
+	if (!seg_sz || size < 2 * seg_sz)
+		return false;
+	if (dst_off + size > (size_t)ent->nr_payload_pages << PAGE_SHIFT)
+		return false;
+
+	nseg = min_t(size_t, DIV_ROUND_UP(size, seg_sz),
+		     FUSE_URING_COPY_MAX_SEGS);
+	seg_sz = round_up(DIV_ROUND_UP(size, nseg), PAGE_SIZE);
+	nseg = DIV_ROUND_UP(size, seg_sz);
+
+	segs = kmalloc_array(nseg, sizeof(*segs), GFP_NOFS | __GFP_NOWARN);
+	if (!segs)
+		return false;
+
+	node = numa_node_id();
+	atomic_set(&pending, nseg - 1);
+	for (i = 1; i < nseg; i++) {
+		struct fuse_uring_copy_seg *seg = &segs[i];
+
+		seg->ap = ap;
+		seg->dst_pages = ent->payload_pages;
+		seg->src_pos = i * seg_sz;
+		seg->dst_off = dst_off + seg->src_pos;
+		seg->len = min(seg_sz, size - seg->src_pos);
+		seg->pending = &pending;
+		seg->done = &done;
+		INIT_WORK(&seg->work, fuse_uring_copy_seg_work);
+		queue_work_node(node, system_unbound_wq, &seg->work);
+	}
+
+	fuse_uring_copy_seg(ap, ent->payload_pages, dst_off, 0,
+			    min(seg_sz, size));
+	if (nseg > 1)
+		wait_for_completion(&done);
+
+	kfree(segs);
+	return true;
+}
+
 /*
  * Copy data from the req to the ring buffer
  * In order to be able to write into the ring buffer from the application,
@@ -1050,9 +1173,26 @@ static int fuse_uring_args_to_ring_pages(struct fuse_ring *ring,
 		num_args--;
 	}
 
-	/* copy the payload */
-	err = fuse_copy_args(&cs, num_args, args->in_pages,
-			     (struct fuse_arg *)in_args, 0);
+	/* copy the payload, the page argument is always the last one */
+	if (args->in_pages && num_args > 0) {
+		struct fuse_in_arg *pages_arg = &in_args[num_args - 1];
+
+		err = fuse_copy_args(&cs, num_args - 1, 0,
+				     (struct fuse_arg *)in_args, 0);
+		if (!err) {
+			if (fuse_uring_copy_payload_split(ent, req,
+							  cs.ring.copied_sz,
+							  pages_arg->size))
+				cs.ring.copied_sz += pages_arg->size;
+			else
+				err = fuse_copy_args(&cs, 1, 1,
+						     (struct fuse_arg *)pages_arg,
+						     0);
+		}
+	} else {
+		err = fuse_copy_args(&cs, num_args, args->in_pages,
+				     (struct fuse_arg *)in_args, 0);
+	}
 	if (err) {
 		pr_info_ratelimited("%s fuse_copy_args failed\n", __func__);
 		goto copy_finish;
