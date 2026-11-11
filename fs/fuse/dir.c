@@ -2334,6 +2334,20 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 			goto error;
 	}
 
+	/*
+	 * Without the writeback cache a folio is dirty only through a shared
+	 * mapping.  Write those back before a truncating SETATTR: the server's
+	 * truncate invalidates this client's page cache from inside its
+	 * SETATTR handler, fuse_reverse_inval_inode() launders what is still
+	 * dirty, the server applies those writes after the truncate, and the
+	 * file has its old size and contents again.  The wait keeps AS_EIO for
+	 * fuse_flush().
+	 */
+	if (is_truncate && !is_wb) {
+		filemap_fdatawrite(mapping);
+		filemap_fdatawait_keep_errors(mapping);
+	}
+
 	if (is_truncate)
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
