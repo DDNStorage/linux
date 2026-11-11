@@ -887,9 +887,8 @@ retry:
 
 	is_new_inode = inode_state_read_once(inode) & I_NEW;
 	if (is_new_inode) {
-		inode->i_flags |= S_NOATIME;
-		if (!fc->writeback_cache || !S_ISREG(attr->mode))
-			inode->i_flags |= S_NOCMTIME;
+		/* see fuse_cached_write_update_time() */
+		inode->i_flags |= S_NOATIME | S_NOCMTIME;
 		inode->i_generation = generation;
 		fuse_init_inode(inode, attr, fc);
 	} else if (fuse_stale_inode(inode, generation, attr)) {

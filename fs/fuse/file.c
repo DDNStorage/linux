@@ -1296,6 +1296,22 @@ static const struct iomap_ops fuse_iomap_ops = {
 	.iomap_begin	= fuse_iomap_begin,
 };
 
+/*
+ * With the writeback cache the server stamps everything it sees, so every fuse
+ * inode is S_NOCMTIME.  The exception is data going into the page cache: the
+ * server does not know about it until writeback, so stamp it here.  This only
+ * dirties the inode and never waits for the server.
+ */
+static void fuse_cached_write_update_time(struct inode *inode)
+{
+	struct timespec64 now = current_time(inode);
+	struct timespec64 mtime = inode_get_mtime(inode);
+	struct timespec64 ctime = inode_get_ctime(inode);
+
+	if (!timespec64_equal(&mtime, &now) || !timespec64_equal(&ctime, &now))
+		generic_update_time(inode, FS_UPD_CMTIME, 0);
+}
+
 typedef void (*fuse_args_end_fn)(struct fuse_mount *fm,
 				 struct fuse_args *args, int err);
 
@@ -2746,10 +2762,10 @@ static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
     }
 
 	/*
-	 * Kill suid/sgid and stamp the timestamps here, before the range
-	 * lock moves to LOCKED below, instead of leaving them next to the
-	 * write itself.  kiocb_modified() -> file_remove_privs() is the one
-	 * that reaches the server: without handle_killpriv[_v2]
+	 * Kill suid/sgid here, before the range lock moves to LOCKED below,
+	 * instead of leaving it next to the write itself.  S_NOCMTIME leaves
+	 * kiocb_modified() only file_remove_privs(), which reaches the
+	 * server: without handle_killpriv[_v2]
 	 * fuse_wb_setattr() kills the bits by asking it (a FUSE_GETATTR to
 	 * refresh the mode, then a FUSE_SETATTR, which for a writeback
 	 * inode first flushes and freezes writepages), and
@@ -2912,6 +2928,8 @@ static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
 						    &fuse_iomap_ops,
 						    &fuse_iomap_write_ops,
 						    file);
+		if (written > 0)
+			fuse_cached_write_update_time(inode);
 
 		/*
 		 * Reconcile the speculative extension with what was actually
@@ -3882,9 +3900,7 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	ff = __fuse_write_file_get(fi);
 	/*
 	 * With no names left and no writable open here, the server may already
-	 * have deleted the inode, and this node has written nothing whose times
-	 * need sending: the only dirty time is the ctime of the unlink. A
-	 * WRITEBACK_SETATTR would re-create the deleted inode on the server.
+	 * have deleted the inode. A WRITEBACK_SETATTR would re-create it there.
 	 * A writable open here keeps the server's inode alive until the last
 	 * close, so its times are still sent. O_TMPFILE (I_LINKABLE) is flushed
 	 * as before.
@@ -4338,7 +4354,6 @@ static vm_fault_t fuse_page_mkwrite_finish(struct vm_fault *vmf)
 	struct folio *folio = page_folio(vmf->page);
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 
-	file_update_time(vmf->vma->vm_file);
 	folio_lock(folio);
 	if (folio->mapping != inode->i_mapping) {
 		folio_unlock(folio);
@@ -4414,6 +4429,7 @@ static vm_fault_t fuse_wb_page_mkwrite(struct vm_fault *vmf)
 	if (!held)
 		return VM_FAULT_NOPAGE;
 
+	fuse_cached_write_update_time(inode);
 	return fuse_page_mkwrite_finish(vmf);
 }
 
@@ -5620,10 +5636,8 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 		goto out;
 
 	/* we could have extended the file */
-	if (!(mode & FALLOC_FL_KEEP_SIZE)) {
-		if (fuse_write_update_attr(inode, offset + length, length))
-			file_update_time(file);
-	}
+	if (!(mode & FALLOC_FL_KEEP_SIZE))
+		fuse_write_update_attr(inode, offset + length, length);
 
 	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
 		truncate_pagecache_range(inode, offset, offset + length - 1);
@@ -5639,8 +5653,6 @@ out:
 		filemap_invalidate_unlock(inode->i_mapping);
 
 	inode_unlock(inode);
-
-	fuse_flush_time_update(inode);
 
 	return err;
 }
@@ -5759,7 +5771,6 @@ fallback:
 				   ALIGN_DOWN(pos_out, PAGE_SIZE),
 				   ALIGN(pos_out + bytes_copied, PAGE_SIZE) - 1);
 
-	file_update_time(file_out);
 	fuse_write_update_attr(inode_out, pos_out + bytes_copied, bytes_copied);
 	fuse_cached_read_clear(inode_out);
 
@@ -5770,8 +5781,6 @@ out:
 
 	inode_unlock(inode_out);
 	file_accessed(file_in);
-
-	fuse_flush_time_update(inode_out);
 
 	return err;
 }

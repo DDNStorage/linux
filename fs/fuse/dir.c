@@ -1259,26 +1259,9 @@ static int fuse_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	return create_new_nondir(idmap, fm, &args, dir, entry, S_IFLNK);
 }
 
-void fuse_flush_time_update(struct inode *inode)
-{
-	int err = sync_inode_metadata(inode, 1);
-
-	mapping_set_error(inode->i_mapping, err);
-}
-
-static void fuse_update_ctime_in_cache(struct inode *inode)
-{
-	if (!IS_NOCMTIME(inode)) {
-		inode_set_ctime_current(inode);
-		mark_inode_dirty_sync(inode);
-		fuse_flush_time_update(inode);
-	}
-}
-
 void fuse_update_ctime(struct inode *inode)
 {
 	fuse_invalidate_attr_mask(inode, STATX_CTIME);
-	fuse_update_ctime_in_cache(inode);
 }
 
 static void fuse_entry_unlinked(struct dentry *entry)
@@ -1457,9 +1440,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
 	args.in_args[1].size = newent->d_name.len + 1;
 	args.in_args[1].value = newent->d_name.name;
 	err = create_new_nondir(&invalid_mnt_idmap, fm, &args, newdir, newent, inode->i_mode);
-	if (!err)
-		fuse_update_ctime_in_cache(inode);
-	else if (err == -EINTR)
+	if (err == -EINTR)
 		fuse_invalidate_attr(inode);
 
 	if (err == -ENOSYS)
@@ -2356,14 +2337,10 @@ static long fuse_dir_compat_ioctl(struct file *file, unsigned int cmd,
 				 FUSE_IOCTL_COMPAT | FUSE_IOCTL_DIR);
 }
 
-static bool update_mtime(unsigned ivalid, bool trust_local_mtime)
+static bool update_mtime(unsigned ivalid)
 {
 	/* Always update if mtime is explicitly set  */
 	if (ivalid & ATTR_MTIME_SET)
-		return true;
-
-	/* Or if kernel i_mtime is the official one */
-	if (trust_local_mtime)
 		return true;
 
 	/* If it's an open(O_TRUNC) or an ftruncate(), don't update */
@@ -2375,8 +2352,7 @@ static bool update_mtime(unsigned ivalid, bool trust_local_mtime)
 }
 
 static void iattr_to_fattr(struct mnt_idmap *idmap, struct fuse_conn *fc,
-			   struct iattr *iattr, struct fuse_setattr_in *arg,
-			   bool trust_local_cmtime)
+			   struct iattr *iattr, struct fuse_setattr_in *arg)
 {
 	unsigned ivalid = iattr->ia_valid;
 
@@ -2406,25 +2382,13 @@ static void iattr_to_fattr(struct mnt_idmap *idmap, struct fuse_conn *fc,
 		if (!(ivalid & ATTR_ATIME_SET))
 			arg->valid |= FATTR_ATIME_NOW;
 	}
-	/*
-	 * Under the writeback cache the DLM server's times win in the reply,
-	 * and the server stamps every other change, create included, with its
-	 * own clock.  Let it stamp "now" too: a client clock behind the
-	 * server's would set mtime before the create time.  Leaving out
-	 * FATTR_CTIME has the server stamp ctime as well.
-	 */
-	if ((ivalid & ATTR_MTIME) && update_mtime(ivalid, trust_local_cmtime)) {
+	/* The server stamps "now" and ctime with its own clock. */
+	if ((ivalid & ATTR_MTIME) && update_mtime(ivalid)) {
 		arg->valid |= FATTR_MTIME;
 		arg->mtime = iattr->ia_mtime.tv_sec;
 		arg->mtimensec = iattr->ia_mtime.tv_nsec;
 		if (!(ivalid & ATTR_MTIME_SET))
 			arg->valid |= FATTR_MTIME_NOW;
-	}
-	if ((ivalid & ATTR_CTIME) && trust_local_cmtime &&
-	    !(arg->valid & FATTR_MTIME_NOW)) {
-		arg->valid |= FATTR_CTIME;
-		arg->ctime = iattr->ia_ctime.tv_sec;
-		arg->ctimensec = iattr->ia_ctime.tv_nsec;
 	}
 }
 
@@ -2572,13 +2536,9 @@ static int fuse_setattr_begin(struct mnt_idmap *idmap, struct dentry *dentry,
 	return 0;
 }
 
-/*
- * Build, send and validate the SETATTR.  With @trust_local_cmtime the
- * times in @attr are the kernel's and are not replaced by the server's.
- */
+/* Build, send and validate the SETATTR. */
 static int fuse_setattr_send(struct mnt_idmap *idmap, struct inode *inode,
 			     struct iattr *attr, struct file *file,
-			     bool trust_local_cmtime,
 			     struct fuse_attr_out *outarg, u64 *attr_version)
 {
 	struct fuse_mount *fm = get_fuse_mount(inode);
@@ -2589,7 +2549,7 @@ static int fuse_setattr_send(struct mnt_idmap *idmap, struct inode *inode,
 
 	memset(&inarg, 0, sizeof(inarg));
 	memset(outarg, 0, sizeof(*outarg));
-	iattr_to_fattr(idmap, fc, attr, &inarg, trust_local_cmtime);
+	iattr_to_fattr(idmap, fc, attr, &inarg);
 	if (file) {
 		struct fuse_file *ff = file->private_data;
 
@@ -2737,7 +2697,7 @@ static int fuse_wt_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		spin_unlock(&fi->lock);
 	}
 
-	err = fuse_setattr_send(idmap, inode, attr, file, false, &outarg,
+	err = fuse_setattr_send(idmap, inode, attr, file, &outarg,
 				&attr_version);
 	if (err)
 		goto out;
@@ -2848,23 +2808,14 @@ static int fuse_wb_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		fuse_bump_size_gen(fi);
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 		spin_unlock(&fi->lock);
-		if (attr->ia_size != inode->i_size)
-			attr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
 	}
 
-	err = fuse_setattr_send(idmap, inode, attr, file, true, &outarg,
+	err = fuse_setattr_send(idmap, inode, attr, file, &outarg,
 				&attr_version);
 	if (err)
 		goto out;
 
 	spin_lock(&fi->lock);
-	/* the kernel maintains i_mtime locally */
-	if (attr->ia_valid & ATTR_MTIME)
-		inode_set_mtime_to_ts(inode, attr->ia_mtime);
-	if (attr->ia_valid & ATTR_CTIME)
-		inode_set_ctime_to_ts(inode, attr->ia_ctime);
-	/* FIXME: clear I_DIRTY_SYNC? */
-
 	if (fi->attr_version > attr_version) {
 		/*
 		 * Apply attributes, for example for fsnotify_change(), but set
