@@ -1637,34 +1637,28 @@ bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written)
 	return ret;
 }
 
-static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,
-				     struct kiocb *iocb, struct inode *inode,
-				     loff_t pos, size_t count)
+/* Page writes one fuse_perform_write() keeps in flight */
+#define FUSE_WRITE_PAGES_INFLIGHT 8
+
+struct fuse_write_pages_req {
+	struct fuse_io_args ia;
+	size_t count;
+	int err;
+	struct completion done;
+};
+
+static void fuse_write_pages_done(struct fuse_write_pages_req *wr, int err)
 {
-	struct fuse_args_pages *ap = &ia->ap;
-	struct file *file = iocb->ki_filp;
-	struct fuse_file *ff = file->private_data;
-	struct fuse_mount *fm = ff->fm;
+	struct fuse_args_pages *ap = &wr->ia.ap;
+	size_t count = wr->ia.write.out.size;
 	unsigned int offset, i;
 	bool short_write;
-	int err;
 
-	for (i = 0; i < ap->num_pages; i++)
-		fuse_wait_on_page_writeback(inode, ap->pages[i]->index);
-
-	fuse_write_args_fill(ia, ff, pos, count);
-	ia->write.in.flags = fuse_write_flags(iocb);
-	if (fm->fc->handle_killpriv_v2 && !capable(CAP_FSETID))
-		ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
-
-	ap->args.uring_critical = true;
-	err = fuse_simple_request(fm, &ap->args);
-	if (!err && ia->write.out.size > count)
+	if (!err && count > wr->count)
 		err = -EIO;
 
-	short_write = ia->write.out.size < count;
+	short_write = count < wr->count;
 	offset = ap->descs[0].offset;
-	count = ia->write.out.size;
 	for (i = 0; i < ap->num_pages; i++) {
 		struct page *page = ap->pages[i];
 
@@ -1680,12 +1674,58 @@ static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,
 			}
 			offset = 0;
 		}
-		if (ia->write.page_locked && (i == ap->num_pages - 1))
+		if (wr->ia.write.page_locked && (i == ap->num_pages - 1))
 			unlock_page(page);
 		put_page(page);
 	}
 
-	return err;
+	wr->err = err;
+	complete(&wr->done);
+}
+
+static void fuse_write_pages_end(struct fuse_mount *fm, struct fuse_args *args,
+				 int err)
+{
+	struct fuse_write_pages_req *wr =
+		container_of(args, typeof(*wr), ia.ap.args);
+
+	fuse_write_pages_done(wr, err);
+}
+
+/*
+ * Sends the write without waiting for the reply; fuse_write_pages_done()
+ * releases the pages and completes wr->done.
+ */
+static void fuse_send_write_pages(struct fuse_write_pages_req *wr,
+				  struct kiocb *iocb, loff_t pos)
+{
+	struct fuse_io_args *ia = &wr->ia;
+	struct fuse_args_pages *ap = &ia->ap;
+	struct file *file = iocb->ki_filp;
+	struct fuse_file *ff = file->private_data;
+	struct fuse_mount *fm = ff->fm;
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < ap->num_pages; i++)
+		fuse_wait_on_page_writeback(file_inode(file), ap->pages[i]->index);
+
+	fuse_write_args_fill(ia, ff, pos, wr->count);
+	ia->write.in.flags = fuse_write_flags(iocb);
+	if (fm->fc->handle_killpriv_v2 && !capable(CAP_FSETID))
+		ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
+
+	ap->args.uring_critical = true;
+	ap->args.end = fuse_write_pages_end;
+	err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
+	if (err)
+		fuse_write_pages_done(wr, err);
+}
+
+static void fuse_write_pages_free(struct fuse_write_pages_req *wr)
+{
+	kfree(wr->ia.ap.pages);
+	kfree(wr);
 }
 
 static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
@@ -1778,6 +1818,9 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_write_pages_req *inflight[FUSE_WRITE_PAGES_INFLIGHT];
+	unsigned int head = 0, nr = 0;
+	loff_t send_pos = iocb->ki_pos;
 	loff_t pos = iocb->ki_pos;
 	int err = 0;
 	ssize_t res = 0;
@@ -1785,40 +1828,71 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
 	if (inode->i_size < pos + iov_iter_count(ii))
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
-	do {
+	/*
+	 * Up to FUSE_WRITE_PAGES_INFLIGHT page writes are sent before the
+	 * oldest is waited for.  Replies are accounted in file order, so the
+	 * result covers only the bytes before the first failed or short write.
+	 */
+	while (nr || (!err && iov_iter_count(ii))) {
+		struct fuse_write_pages_req *wr;
+		unsigned int nr_pages;
 		ssize_t count;
-		struct fuse_io_args ia = {};
-		struct fuse_args_pages *ap = &ia.ap;
-		unsigned int nr_pages = fuse_wr_pages(pos, iov_iter_count(ii),
-						      fc->max_pages);
 
-		ia.write.in.write_flags |= write_flags;
-
-		ap->pages = fuse_pages_alloc(nr_pages, GFP_KERNEL, &ap->descs);
-		if (!ap->pages) {
-			err = -ENOMEM;
-			break;
-		}
-
-		count = fuse_fill_write_pages(&ia, mapping, ii, pos, nr_pages);
-		if (count <= 0) {
-			err = count;
-		} else {
-			err = fuse_send_write_pages(&ia, iocb, inode,
-						    pos, count);
+		if (nr == FUSE_WRITE_PAGES_INFLIGHT || err ||
+		    !iov_iter_count(ii)) {
+			wr = inflight[head];
+			head = (head + 1) % FUSE_WRITE_PAGES_INFLIGHT;
+			nr--;
+			wait_for_completion(&wr->done);
 			if (!err) {
-				size_t num_written = ia.write.out.size;
+				err = wr->err;
+				if (!err) {
+					size_t num_written = wr->ia.write.out.size;
 
-				res += num_written;
-				pos += num_written;
+					res += num_written;
+					pos += num_written;
 
-				/* break out of the loop on short write */
-				if (num_written != count)
-					err = -EIO;
+					/* stop accounting on a short write */
+					if (num_written != wr->count)
+						err = -EIO;
+				}
 			}
+			fuse_write_pages_free(wr);
+			continue;
 		}
-		kfree(ap->pages);
-	} while (!err && iov_iter_count(ii));
+
+		wr = kzalloc(sizeof(*wr), GFP_KERNEL);
+		if (!wr) {
+			err = -ENOMEM;
+			continue;
+		}
+		init_completion(&wr->done);
+		wr->ia.write.in.write_flags |= write_flags;
+
+		nr_pages = fuse_wr_pages(send_pos, iov_iter_count(ii),
+					 fc->max_pages);
+		wr->ia.ap.pages = fuse_pages_alloc(nr_pages, GFP_KERNEL,
+						   &wr->ia.ap.descs);
+		if (!wr->ia.ap.pages) {
+			kfree(wr);
+			err = -ENOMEM;
+			continue;
+		}
+
+		count = fuse_fill_write_pages(&wr->ia, mapping, ii, send_pos,
+					      nr_pages);
+		if (count <= 0) {
+			fuse_write_pages_free(wr);
+			err = count;
+			continue;
+		}
+
+		wr->count = count;
+		fuse_send_write_pages(wr, iocb, send_pos);
+		send_pos += count;
+		inflight[(head + nr) % FUSE_WRITE_PAGES_INFLIGHT] = wr;
+		nr++;
+	}
 
 	fuse_write_update_attr(inode, pos, res);
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
