@@ -2680,11 +2680,24 @@ static int fuse_wt_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	}
 
 	/*
-	 * The reply's size is applied as it is and the page cache truncated
-	 * to it, which would drop a staged splice copy the server has not
-	 * seen yet.  The wait keeps AS_EIO for fuse_flush_common().
+	 * Without the writeback cache a folio is dirty only through a shared
+	 * mapping or a staged splice copy.  Write those back before a SETATTR
+	 * whose reply decides what the page cache keeps:
+	 *
+	 * - The server's truncate invalidates this client's page cache from
+	 *   inside its SETATTR handler.  fuse_reverse_inval_inode() launders
+	 *   what is still dirty, the server applies those writes after the
+	 *   truncate, and the file has its old size and contents again.
+	 *   fuse_wb_do_setattr() writes back first for the same reason.
+	 *
+	 * - The reply's size is applied as it is and the page cache truncated
+	 *   to it, which would drop a staged splice copy the server has not
+	 *   seen yet.
+	 *
+	 * The wait keeps AS_EIO for fuse_flush_common().
 	 */
-	if (S_ISREG(inode->i_mode) && fuse_splice_staged_dirty(inode)) {
+	if (S_ISREG(inode->i_mode) &&
+	    (is_truncate || fuse_splice_staged_dirty(inode))) {
 		filemap_fdatawrite(mapping);
 		filemap_fdatawait_keep_errors(mapping);
 	}
