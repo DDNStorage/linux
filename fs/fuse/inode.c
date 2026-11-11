@@ -1069,6 +1069,27 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 				ierr = invalidate_inode_pages2_range(inode->i_mapping,
 								     pg_start, pg_end);
 
+			/*
+			 * A whole-file invalidation is how a sattr revoke
+			 * arrives.  Times are dirtied only under a write
+			 * grant, which holds sattr CW, so dirty times here
+			 * mean the CW being revoked is this node's.  Send them
+			 * now, while the server still sees that CW as granted
+			 * and lets the WRITEBACK SETATTR's CW past the pending
+			 * conflicting lock. If left dirty, close or the
+			 * flusher would send them after this node has
+			 * re-cached PR, and the server would have to revoke
+			 * this node's own PR for it.
+			 */
+			if (offset == 0 && len <= 0 &&
+			    (inode->i_state & (I_DIRTY_SYNC | I_DIRTY_TIME))) {
+				int serr = sync_inode_metadata(inode, 1);
+
+				if (serr)
+					pr_warn_ratelimited("FUSE: inode %llu times flush before invalidate failed: %d\n",
+							    nodeid, serr);
+			}
+
 			percpu_up_write(wb_sem);
 
 			if (ierr)
