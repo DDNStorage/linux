@@ -3044,11 +3044,19 @@ static ssize_t __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct fuse_file *ff = iocb->ki_filp->private_data;
 	ssize_t res;
 
-	if (!is_sync_kiocb(iocb)) {
+	/*
+	 * With async_dio a synchronous read also goes through
+	 * __fuse_direct_IO(), which sends all max_read pieces before waiting
+	 * for any of them.
+	 */
+	if (!is_sync_kiocb(iocb) || ff->fm->fc->async_dio) {
 		/* exclusive is unused on reads; rollback is write-only */
 		res = __fuse_direct_IO(iocb, to, true);
+		if (is_sync_kiocb(iocb) && res > 0)
+			iocb->ki_pos += res;
 	} else {
 		struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 
@@ -3089,8 +3097,11 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		pos = iocb->ki_pos;
 
 		task_io_account_write(res);
-		if (!is_sync_kiocb(iocb)) {
+		/* As for reads: async_dio sends the pieces of a sync write together */
+		if (!is_sync_kiocb(iocb) || ff->fm->fc->async_dio) {
 			res = __fuse_direct_IO(iocb, from, exclusive);
+			if (is_sync_kiocb(iocb) && res > 0)
+				iocb->ki_pos += res;
 		} else {
 			struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 
