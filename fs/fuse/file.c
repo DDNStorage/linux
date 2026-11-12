@@ -827,6 +827,13 @@ static void fuse_io_release(struct kref *kref)
 
 static ssize_t fuse_get_res_by_io(struct fuse_io_priv *io)
 {
+	ssize_t res;
+
+	if (io->sync_result) {
+		res = io->bytes < 0 ? io->size : io->bytes;
+		return res ?: io->err;
+	}
+
 	if (io->err)
 		return io->err;
 
@@ -872,7 +879,7 @@ static void fuse_aio_complete(struct fuse_io_priv *io, int err, ssize_t pos)
 	spin_lock(&io->lock);
 	if (err)
 		io->err = io->err ? : err;
-	else if (pos >= 0 && (io->bytes < 0 || pos < io->bytes))
+	if (pos >= 0 && (io->bytes < 0 || pos < io->bytes))
 		io->bytes = pos;
 
 	left = --io->reqs;
@@ -944,7 +951,10 @@ static void fuse_aio_complete_req(struct fuse_mount *fm, struct fuse_args *args,
 	size_t nres;
 
 	if (err) {
-		/* Nothing */
+		/* A synchronous call reports the bytes before this piece */
+		if (io->sync_result)
+			pos = (io->write ? ia->write.in.offset :
+				ia->read.in.offset) - io->offset;
 	} else if (io->write) {
 		if (ia->write.out.size > ia->write.in.size) {
 			err = -EIO;
@@ -1637,34 +1647,28 @@ bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written)
 	return ret;
 }
 
-static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,
-				     struct kiocb *iocb, struct inode *inode,
-				     loff_t pos, size_t count)
+/* Page writes one fuse_perform_write() keeps in flight */
+#define FUSE_WRITE_PAGES_INFLIGHT 8
+
+struct fuse_write_pages_req {
+	struct fuse_io_args ia;
+	size_t count;
+	int err;
+	struct completion done;
+};
+
+static void fuse_write_pages_done(struct fuse_write_pages_req *wr, int err)
 {
-	struct fuse_args_pages *ap = &ia->ap;
-	struct file *file = iocb->ki_filp;
-	struct fuse_file *ff = file->private_data;
-	struct fuse_mount *fm = ff->fm;
+	struct fuse_args_pages *ap = &wr->ia.ap;
+	size_t count = wr->ia.write.out.size;
 	unsigned int offset, i;
 	bool short_write;
-	int err;
 
-	for (i = 0; i < ap->num_pages; i++)
-		fuse_wait_on_page_writeback(inode, ap->pages[i]->index);
-
-	fuse_write_args_fill(ia, ff, pos, count);
-	ia->write.in.flags = fuse_write_flags(iocb);
-	if (fm->fc->handle_killpriv_v2 && !capable(CAP_FSETID))
-		ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
-
-	ap->args.uring_critical = true;
-	err = fuse_simple_request(fm, &ap->args);
-	if (!err && ia->write.out.size > count)
+	if (!err && count > wr->count)
 		err = -EIO;
 
-	short_write = ia->write.out.size < count;
+	short_write = count < wr->count;
 	offset = ap->descs[0].offset;
-	count = ia->write.out.size;
 	for (i = 0; i < ap->num_pages; i++) {
 		struct page *page = ap->pages[i];
 
@@ -1680,12 +1684,65 @@ static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,
 			}
 			offset = 0;
 		}
-		if (ia->write.page_locked && (i == ap->num_pages - 1))
+		if (wr->ia.write.page_locked && (i == ap->num_pages - 1))
 			unlock_page(page);
 		put_page(page);
 	}
 
-	return err;
+	wr->err = err;
+	complete(&wr->done);
+}
+
+static void fuse_write_pages_end(struct fuse_mount *fm, struct fuse_args *args,
+				 int err)
+{
+	struct fuse_write_pages_req *wr =
+		container_of(args, typeof(*wr), ia.ap.args);
+
+	fuse_write_pages_done(wr, err);
+}
+
+/*
+ * Ends the piece with fuse_write_pages_done(), from the reply when sent in the
+ * background, before returning otherwise.
+ */
+static void fuse_send_write_pages(struct fuse_write_pages_req *wr,
+				  struct kiocb *iocb, loff_t pos,
+				  bool background)
+{
+	struct fuse_io_args *ia = &wr->ia;
+	struct fuse_args_pages *ap = &ia->ap;
+	struct file *file = iocb->ki_filp;
+	struct fuse_file *ff = file->private_data;
+	struct fuse_mount *fm = ff->fm;
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < ap->num_pages; i++)
+		fuse_wait_on_page_writeback(file_inode(file), ap->pages[i]->index);
+
+	fuse_write_args_fill(ia, ff, pos, wr->count);
+	ia->write.in.flags = fuse_write_flags(iocb);
+	if (fm->fc->handle_killpriv_v2 && !capable(CAP_FSETID))
+		ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
+
+	ap->args.uring_critical = true;
+	if (!background) {
+		err = fuse_simple_request(fm, &ap->args);
+		fuse_write_pages_done(wr, err);
+		return;
+	}
+
+	ap->args.end = fuse_write_pages_end;
+	err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
+	if (err)
+		fuse_write_pages_done(wr, err);
+}
+
+static void fuse_write_pages_free(struct fuse_write_pages_req *wr)
+{
+	kfree(wr->ia.ap.pages);
+	kfree(wr);
 }
 
 static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
@@ -1778,53 +1835,120 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii,
 	struct inode *inode = mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_write_pages_req *inflight[FUSE_WRITE_PAGES_INFLIGHT];
+	unsigned int head = 0, nr = 0, max_inflight = FUSE_WRITE_PAGES_INFLIGHT;
+	loff_t send_pos = iocb->ki_pos;
 	loff_t pos = iocb->ki_pos;
+	bool killed = false;
 	int err = 0;
 	ssize_t res = 0;
+
+	/*
+	 * The pieces are uring_critical, as they hold page cache folios that
+	 * an invalidation may wait for.  Under DLM the server takes the DLM
+	 * lock for a piece without FUSE_WRITE_CACHE, as from a write dropping
+	 * suid/sgid, and that can wait on a revoke.  So with the writeback
+	 * cache such a writer keeps a single piece, and so a single critical
+	 * entry, in flight.
+	 */
+	if (fc->writeback_cache && !(write_flags & FUSE_WRITE_CACHE))
+		max_inflight = 1;
 
 	if (inode->i_size < pos + iov_iter_count(ii))
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
-	do {
+	/*
+	 * Up to max_inflight page writes are sent before the oldest is waited
+	 * for.  Replies are accounted in file order, so the result and ki_pos
+	 * cover only the bytes before the first failed or short piece.  The
+	 * pieces sent after that one were applied by the server all the same:
+	 * the server's file can hold data, and a size, past the returned
+	 * count, as after any write that fails part-way.
+	 *
+	 * A fatal signal stops sending.  The pieces in flight reference wr
+	 * and the folios, so they are still waited for, also those the server
+	 * has not received yet.
+	 */
+	while (nr || (!err && !killed && iov_iter_count(ii))) {
+		struct fuse_write_pages_req *wr;
+		unsigned int nr_pages;
 		ssize_t count;
-		struct fuse_io_args ia = {};
-		struct fuse_args_pages *ap = &ia.ap;
-		unsigned int nr_pages = fuse_wr_pages(pos, iov_iter_count(ii),
-						      fc->max_pages);
 
-		ia.write.in.write_flags |= write_flags;
-
-		ap->pages = fuse_pages_alloc(nr_pages, GFP_KERNEL, &ap->descs);
-		if (!ap->pages) {
-			err = -ENOMEM;
-			break;
-		}
-
-		count = fuse_fill_write_pages(&ia, mapping, ii, pos, nr_pages);
-		if (count <= 0) {
-			err = count;
-		} else {
-			err = fuse_send_write_pages(&ia, iocb, inode,
-						    pos, count);
-			if (!err) {
-				size_t num_written = ia.write.out.size;
-
-				res += num_written;
-				pos += num_written;
-
-				/* break out of the loop on short write */
-				if (num_written != count)
-					err = -EIO;
+		if (nr == max_inflight || err || killed ||
+		    !iov_iter_count(ii)) {
+			wr = inflight[head];
+			head = (head + 1) % FUSE_WRITE_PAGES_INFLIGHT;
+			nr--;
+			if (wait_for_completion_killable(&wr->done)) {
+				killed = true;
+				wait_for_completion(&wr->done);
 			}
+			if (!err) {
+				err = wr->err;
+				if (!err) {
+					size_t num_written = wr->ia.write.out.size;
+
+					res += num_written;
+					pos += num_written;
+
+					/* stop accounting on a short write */
+					if (num_written != wr->count)
+						err = -EIO;
+				}
+			}
+			fuse_write_pages_free(wr);
+			continue;
 		}
-		kfree(ap->pages);
-	} while (!err && iov_iter_count(ii));
+
+		if (fatal_signal_pending(current)) {
+			killed = true;
+			continue;
+		}
+
+		wr = kzalloc(sizeof(*wr), GFP_KERNEL);
+		if (!wr) {
+			err = -ENOMEM;
+			continue;
+		}
+		init_completion(&wr->done);
+		wr->ia.write.in.write_flags |= write_flags;
+
+		nr_pages = fuse_wr_pages(send_pos, iov_iter_count(ii),
+					 fc->max_pages);
+		wr->ia.ap.pages = fuse_pages_alloc(nr_pages, GFP_KERNEL,
+						   &wr->ia.ap.descs);
+		if (!wr->ia.ap.pages) {
+			kfree(wr);
+			err = -ENOMEM;
+			continue;
+		}
+
+		count = fuse_fill_write_pages(&wr->ia, mapping, ii, send_pos,
+					      nr_pages);
+		if (count <= 0) {
+			fuse_write_pages_free(wr);
+			err = count;
+			continue;
+		}
+
+		/*
+		 * A background request goes to the next CPU's queue, whose
+		 * ring task copies the payload, which pays off only when
+		 * another piece is sent behind it.
+		 */
+		wr->count = count;
+		fuse_send_write_pages(wr, iocb, send_pos,
+				      max_inflight > 1 && iov_iter_count(ii));
+		send_pos += count;
+		inflight[(head + nr) % FUSE_WRITE_PAGES_INFLIGHT] = wr;
+		nr++;
+	}
 
 	fuse_write_update_attr(inode, pos, res);
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
 	if (!res)
-		return err;
+		return killed && !err ? -EINTR : err;
 	iocb->ki_pos += res;
 	return res;
 }
@@ -2797,6 +2921,15 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		fl_owner_t owner = current->files;
 		size_t nbytes = min(count, nmax);
 
+		/*
+		 * A waiting caller's pieces go out in the background, where a
+		 * fatal signal ends none of them, so stop sending here.
+		 */
+		if (io->async && io->blocking && fatal_signal_pending(current)) {
+			err = -EINTR;
+			break;
+		}
+
 		err = fuse_get_user_pages(&ia->ap, iter, &nbytes, write,
 					  max_pages, fc->use_pages_for_kvec_io);
 		if (err && !nbytes)
@@ -2861,15 +2994,24 @@ static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 }
 
 static ssize_t __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
-				bool exclusive);
+				bool exclusive, bool sync_result);
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
+	struct fuse_file *ff = iocb->ki_filp->private_data;
 	ssize_t res;
 
-	if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
+	/*
+	 * With async_dio a synchronous read also goes through
+	 * __fuse_direct_IO(), which sends all max_read pieces before waiting
+	 * for any of them.
+	 */
+	if ((!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) ||
+	    (is_sync_kiocb(iocb) && ff->fm->fc->async_dio)) {
 		/* exclusive is unused on reads; rollback is write-only */
-		res = __fuse_direct_IO(iocb, to, true);
+		res = __fuse_direct_IO(iocb, to, true, is_sync_kiocb(iocb));
+		if (is_sync_kiocb(iocb) && res > 0)
+			iocb->ki_pos += res;
 	} else {
 		struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
 
@@ -2911,8 +3053,13 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		pos = iocb->ki_pos;
 
 		task_io_account_write(res);
-		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
-			res = __fuse_direct_IO(iocb, from, exclusive);
+		/* As for reads: async_dio sends the pieces of a sync write together */
+		if ((!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) ||
+		    (is_sync_kiocb(iocb) && ff->fm->fc->async_dio)) {
+			res = __fuse_direct_IO(iocb, from, exclusive,
+					       is_sync_kiocb(iocb));
+			if (is_sync_kiocb(iocb) && res > 0)
+				iocb->ki_pos += res;
 		} else {
 			res = fuse_direct_io(&io, from, &iocb->ki_pos,
 					     FUSE_DIO_WRITE |
@@ -5080,8 +5227,15 @@ static inline loff_t fuse_round_up(struct fuse_conn *fc, loff_t off)
 	return round_up(off, fc->max_pages << PAGE_SHIFT);
 }
 
+/*
+ * With @sync_result a synchronous caller gets what the one-piece-at-a-time
+ * path returned: the bytes before the first failed or short piece, or the
+ * error if there are none, and an extending write is not rolled back.  The
+ * pieces after the failed one were applied by the server all the same.
+ */
 static ssize_t
-__fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
+__fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive,
+		 bool sync_result)
 {
 	DECLARE_COMPLETION_ONSTACK(wait);
 	ssize_t ret = 0;
@@ -5135,6 +5289,7 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	io->async = async;
 	io->iocb = iocb;
 	io->blocking = is_sync_kiocb(iocb);
+	io->sync_result = sync_result;
 
 	/* optimization for short read */
 	if (eof_from_cache && io->async && !io->write &&
@@ -5178,6 +5333,11 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 		if (!blocking)
 			return -EIOCBQUEUED;
 
+		/*
+		 * A fatal signal only stopped sending.  The pieces in flight
+		 * are still waited for: the inode lock and the open file must
+		 * outlive them at the server.
+		 */
 		wait_for_completion(&wait);
 		ret = fuse_get_res_by_io(io);
 	}
@@ -5185,13 +5345,16 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	kref_put(&io->refcnt, fuse_io_release);
 
 	if (iov_iter_rw(iter) == WRITE) {
-		fuse_write_update_attr(inode, pos, ret);
+		/* a short synchronous result ends before the last piece sent */
+		fuse_write_update_attr(inode, ret > 0 ? offset + ret : pos,
+				       ret);
 		/*
 		 * Whole-file rollback is only safe under an exclusive lock.
 		 * Parallel writers commit i_size only on success (nothing to
 		 * undo); the server owns failed-extend cleanup.
 		 */
-		if (exclusive && ret < 0 && offset + count > i_size)
+		if (exclusive && !sync_result && ret < 0 &&
+		    offset + count > i_size)
 			fuse_do_truncate(file);
 	}
 
@@ -5204,7 +5367,7 @@ static ssize_t fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	 * Only reached via generic_file_direct_write/read()
 	 * (caching-mode O_DIRECT), which holds the inode lock exclusively.
 	 */
-	return __fuse_direct_IO(iocb, iter, true);
+	return __fuse_direct_IO(iocb, iter, true, false);
 }
 
 static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
