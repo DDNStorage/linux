@@ -775,6 +775,13 @@ static void fuse_io_release(struct kref *kref)
 
 static ssize_t fuse_get_res_by_io(struct fuse_io_priv *io)
 {
+	ssize_t res;
+
+	if (io->sync_result) {
+		res = io->bytes < 0 ? io->size : io->bytes;
+		return res ?: io->err;
+	}
+
 	if (io->err)
 		return io->err;
 
@@ -820,11 +827,12 @@ static void fuse_aio_complete(struct fuse_io_priv *io, int err, ssize_t pos)
 	spin_lock(&io->lock);
 	if (err)
 		io->err = io->err ? : err;
-	else if (pos >= 0 && (io->bytes < 0 || pos < io->bytes))
+	if (pos >= 0 && (io->bytes < 0 || pos < io->bytes))
 		io->bytes = pos;
 
 	left = --io->reqs;
-	if (!left && io->blocking)
+	/* done is cleared when a killed synchronous caller has left */
+	if (!left && io->blocking && io->done)
 		complete(io->done);
 	spin_unlock(&io->lock);
 
@@ -893,7 +901,10 @@ static void fuse_aio_complete_req(struct fuse_mount *fm, struct fuse_args *args,
 	fuse_release_user_pages(&ia->ap, io->should_dirty);
 
 	if (err) {
-		/* Nothing */
+		/* A synchronous call reports the bytes before this piece */
+		if (io->sync_result)
+			pos = (io->write ? ia->write.in.offset :
+				ia->read.in.offset) - io->offset;
 	} else if (io->write) {
 		if (ia->write.out.size > ia->write.in.size) {
 			err = -EIO;
@@ -2367,7 +2378,7 @@ static ssize_t __fuse_direct_read(struct fuse_io_priv *io,
 }
 
 static ssize_t __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
-				bool exclusive);
+				bool exclusive, bool sync_result);
 
 static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
@@ -2381,7 +2392,7 @@ static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 */
 	if ((!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) ||
 	    (is_sync_kiocb(iocb) && ff->fm->fc->async_dio)) {
-		res = __fuse_direct_IO(iocb, to, true);
+		res = __fuse_direct_IO(iocb, to, true, is_sync_kiocb(iocb));
 		if (is_sync_kiocb(iocb) && res > 0)
 			iocb->ki_pos += res;
 	} else {
@@ -2427,7 +2438,8 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		/* As for reads: async_dio sends the pieces of a sync write together */
 		if ((!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) ||
 		    (is_sync_kiocb(iocb) && ff->fm->fc->async_dio)) {
-			res = __fuse_direct_IO(iocb, from, exclusive);
+			res = __fuse_direct_IO(iocb, from, exclusive,
+					       is_sync_kiocb(iocb));
 			if (is_sync_kiocb(iocb) && res > 0)
 				iocb->ki_pos += res;
 		} else {
@@ -4226,8 +4238,15 @@ static inline loff_t fuse_round_up(struct fuse_conn *fc, loff_t off)
 	return round_up(off, fc->max_pages << PAGE_SHIFT);
 }
 
+/*
+ * With @sync_result a synchronous caller gets what the one-piece-at-a-time
+ * path returned: the bytes before the first failed or short piece, or the
+ * error if there are none, and an extending write is not rolled back.  The
+ * pieces after the failed one were applied by the server all the same.
+ */
 static ssize_t
-__fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
+__fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive,
+		 bool sync_result)
 {
 	DECLARE_COMPLETION_ONSTACK(wait);
 	ssize_t ret = 0;
@@ -4281,6 +4300,7 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 	io->async = async;
 	io->iocb = iocb;
 	io->blocking = is_sync_kiocb(iocb);
+	io->sync_result = sync_result;
 
 	/* optimization for short read */
 	if (eof_from_cache && io->async && !io->write &&
@@ -4324,16 +4344,35 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive)
 		if (!blocking)
 			return -EIOCBQUEUED;
 
-		wait_for_completion(&wait);
+		/*
+		 * On a fatal signal leave the pieces in flight to the
+		 * completions: they hold references on io, and the last one
+		 * frees it.  The caller's pages stay pinned until then.
+		 */
+		if (wait_for_completion_killable(&wait)) {
+			bool left;
+
+			spin_lock(&io->lock);
+			left = io->reqs;
+			if (left)
+				io->done = NULL;
+			spin_unlock(&io->lock);
+			if (left) {
+				kref_put(&io->refcnt, fuse_io_release);
+				return -EINTR;
+			}
+		}
 		ret = fuse_get_res_by_io(io);
 	}
 
 	kref_put(&io->refcnt, fuse_io_release);
 
 	if (iov_iter_rw(iter) == WRITE) {
-		fuse_write_update_attr(inode, pos, ret);
+		/* a short synchronous result ends before the last piece sent */
+		fuse_write_update_attr(inode, ret > 0 ? offset + ret : pos,
+				       ret);
 		/* For extending writes we already hold exclusive lock */
-		if (ret < 0 && offset + count > i_size)
+		if (!sync_result && ret < 0 && offset + count > i_size)
 			fuse_do_truncate(file);
 	}
 
@@ -4346,7 +4385,7 @@ static ssize_t fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 	 * Only reached via generic_file_direct_write/read() (caching-mode
 	 * O_DIRECT), which hold the inode lock exclusive.
 	 */
-	return __fuse_direct_IO(iocb, iter, true);
+	return __fuse_direct_IO(iocb, iter, true, false);
 }
 
 static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
