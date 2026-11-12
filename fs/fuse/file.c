@@ -854,7 +854,8 @@ static void fuse_unlock_file_owner(struct file *file, u32 lk_flags)
 
 /*
  * The server learns that an open file description is gone from RELEASE, and
- * drops the description's OFD locks there.  RELEASE is sent in the background
+ * drops the description's OFD locks there, and its flock() lock when RELEASE
+ * carries FUSE_RELEASE_FLOCK_UNLOCK.  RELEASE is sent in the background
  * after close() has returned, so for a moment another process still finds a
  * lock that is gone as far as the closing process can tell (generic/478).
  * RELEASE cannot be made synchronous: the final fput() can run on a thread of
@@ -868,7 +869,8 @@ static void fuse_unlock_file_owner(struct file *file, u32 lk_flags)
  * dropped here, with a request the caller waits for.
  *
  * A description that loses its last reference some other way (munmap() after
- * close(), completion of an aio) is unlocked by RELEASE, as before.
+ * close(), completion of an aio) is unlocked by RELEASE, as before.  RELEASE
+ * still asks for the flock() unlock; after this one it finds nothing to drop.
  */
 static void fuse_unlock_on_last_close(struct file *file)
 {
@@ -879,6 +881,8 @@ static void fuse_unlock_on_last_close(struct file *file)
 
 	if (READ_ONCE(ff->ofd_lock))
 		fuse_unlock_file_owner(file, 0);
+	if (ff->flock)
+		fuse_unlock_file_owner(file, FUSE_LK_FLOCK);
 }
 
 static int fuse_wt_flush_data(struct file *file, fl_owner_t id)
