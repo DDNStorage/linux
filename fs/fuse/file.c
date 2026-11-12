@@ -658,6 +658,30 @@ static void fuse_splice_stage_done(struct inode *inode)
 	smp_store_release(&fi->splice_stager, NULL);
 }
 
+/* Drop what the server holds for the owner that is @file itself, and wait. */
+static void fuse_unlock_file_owner(struct file *file, u32 lk_flags)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_file *ff = file->private_data;
+	struct fuse_lk_in inarg;
+	FUSE_ARGS(args);
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.fh = ff->fh;
+	inarg.owner = fuse_lock_owner_id(fm->fc, file);
+	inarg.lk.end = OFFSET_MAX;
+	inarg.lk.type = F_UNLCK;
+	inarg.lk_flags = lk_flags;
+	args.opcode = FUSE_SETLK;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.force = true;
+	fuse_simple_request(fm, &args);
+}
+
 /*
  * The server learns that an open file description is gone from RELEASE, and
  * drops the description's OFD locks there.  RELEASE is sent in the background
@@ -676,30 +700,15 @@ static void fuse_splice_stage_done(struct inode *inode)
  * A description that loses its last reference some other way (munmap() after
  * close(), completion of an aio) is unlocked by RELEASE, as before.
  */
-static void fuse_ofd_unlock_on_close(struct file *file)
+static void fuse_unlock_on_last_close(struct file *file)
 {
-	struct inode *inode = file_inode(file);
-	struct fuse_mount *fm = get_fuse_mount(inode);
 	struct fuse_file *ff = file->private_data;
-	struct fuse_lk_in inarg;
-	FUSE_ARGS(args);
 
-	if (!READ_ONCE(ff->ofd_lock) || file_count(file) != 1 ||
-	    fuse_is_bad(inode))
+	if (file_count(file) != 1 || fuse_is_bad(file_inode(file)))
 		return;
 
-	memset(&inarg, 0, sizeof(inarg));
-	inarg.fh = ff->fh;
-	inarg.owner = fuse_lock_owner_id(fm->fc, file);
-	inarg.lk.end = OFFSET_MAX;
-	inarg.lk.type = F_UNLCK;
-	args.opcode = FUSE_SETLK;
-	args.nodeid = get_node_id(inode);
-	args.in_numargs = 1;
-	args.in_args[0].size = sizeof(inarg);
-	args.in_args[0].value = &inarg;
-	args.force = true;
-	fuse_simple_request(fm, &args);
+	if (READ_ONCE(ff->ofd_lock))
+		fuse_unlock_file_owner(file, 0);
 }
 
 static int fuse_flush_data(struct file *file, fl_owner_t id)
@@ -770,7 +779,7 @@ static int fuse_flush(struct file *file, fl_owner_t id)
 	int err = fuse_flush_data(file, id);
 
 	/* after the data: the lock may be what orders it against a reader */
-	fuse_ofd_unlock_on_close(file);
+	fuse_unlock_on_last_close(file);
 	return err;
 }
 
@@ -5050,7 +5059,7 @@ static int fuse_file_lock(struct file *file, int cmd, struct file_lock *fl)
 		if (fc->no_lock) {
 			err = posix_lock_file(file, fl, NULL);
 		} else {
-			/* see fuse_ofd_unlock_on_close() */
+			/* see fuse_unlock_on_last_close() */
 			if ((fl->c.flc_flags & FL_OFDLCK) &&
 			    fl->c.flc_type != F_UNLCK) {
 				struct fuse_file *ff = file->private_data;
