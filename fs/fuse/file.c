@@ -1620,11 +1620,12 @@ static void fuse_write_pages_end(struct fuse_mount *fm, struct fuse_args *args,
 }
 
 /*
- * Sends the write without waiting for the reply; fuse_write_pages_done()
- * releases the pages and completes wr->done.
+ * Ends the piece with fuse_write_pages_done(), from the reply when sent in the
+ * background, before returning otherwise.
  */
 static void fuse_send_write_pages(struct fuse_write_pages_req *wr,
-				  struct kiocb *iocb, loff_t pos)
+				  struct kiocb *iocb, loff_t pos,
+				  bool background)
 {
 	struct fuse_io_args *ia = &wr->ia;
 	struct fuse_args_pages *ap = &ia->ap;
@@ -1641,6 +1642,12 @@ static void fuse_send_write_pages(struct fuse_write_pages_req *wr,
 	ia->write.in.flags = fuse_write_flags(iocb);
 	if (fm->fc->handle_killpriv_v2 && !capable(CAP_FSETID))
 		ia->write.in.write_flags |= FUSE_WRITE_KILL_SUIDGID;
+
+	if (!background) {
+		err = fuse_simple_request(fm, &ap->args);
+		fuse_write_pages_done(wr, err);
+		return;
+	}
 
 	ap->args.end = fuse_write_pages_end;
 	err = fuse_simple_background(fm, &ap->args, GFP_KERNEL);
@@ -1744,31 +1751,50 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_write_pages_req *inflight[FUSE_WRITE_PAGES_INFLIGHT];
-	unsigned int head = 0, nr = 0;
+	unsigned int head = 0, nr = 0, max_inflight = FUSE_WRITE_PAGES_INFLIGHT;
 	loff_t send_pos = iocb->ki_pos;
 	loff_t pos = iocb->ki_pos;
+	bool killed = false;
 	int err = 0;
 	ssize_t res = 0;
+
+	/*
+	 * Under DLM the server takes the DLM lock for a piece without
+	 * FUSE_WRITE_CACHE, as from a write dropping suid/sgid, and that can
+	 * wait on a revoke.  No piece sent from here carries FUSE_WRITE_CACHE,
+	 * so with the writeback cache a single piece is kept in flight.
+	 */
+	if (fc->writeback_cache)
+		max_inflight = 1;
 
 	if (inode->i_size < pos + iov_iter_count(ii))
 		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
 	/*
-	 * Up to FUSE_WRITE_PAGES_INFLIGHT page writes are sent before the
-	 * oldest is waited for.  Replies are accounted in file order, so the
-	 * result covers only the bytes before the first failed or short write.
+	 * Up to max_inflight page writes are sent before the oldest is waited
+	 * for.  Replies are accounted in file order, so the result and ki_pos
+	 * cover only the bytes before the first failed or short piece.  The
+	 * pieces sent after that one were applied by the server all the same:
+	 * the server's file can hold data, and a size, past the returned
+	 * count, as after any write that fails part-way.
+	 *
+	 * A fatal signal stops sending.  The pieces in flight reference wr
+	 * and the folios, so they are still waited for.
 	 */
-	while (nr || (!err && iov_iter_count(ii))) {
+	while (nr || (!err && !killed && iov_iter_count(ii))) {
 		struct fuse_write_pages_req *wr;
 		unsigned int nr_pages;
 		ssize_t count;
 
-		if (nr == FUSE_WRITE_PAGES_INFLIGHT || err ||
+		if (nr == max_inflight || err || killed ||
 		    !iov_iter_count(ii)) {
 			wr = inflight[head];
 			head = (head + 1) % FUSE_WRITE_PAGES_INFLIGHT;
 			nr--;
-			wait_for_completion(&wr->done);
+			if (wait_for_completion_killable(&wr->done)) {
+				killed = true;
+				wait_for_completion(&wr->done);
+			}
 			if (!err) {
 				err = wr->err;
 				if (!err) {
@@ -1811,8 +1837,14 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 			continue;
 		}
 
+		/*
+		 * A background request goes to the next CPU's queue, whose
+		 * ring task copies the payload, which pays off only when
+		 * another piece is sent behind it.
+		 */
 		wr->count = count;
-		fuse_send_write_pages(wr, iocb, send_pos);
+		fuse_send_write_pages(wr, iocb, send_pos,
+				      max_inflight > 1 && iov_iter_count(ii));
 		send_pos += count;
 		inflight[(head + nr) % FUSE_WRITE_PAGES_INFLIGHT] = wr;
 		nr++;
@@ -1822,7 +1854,7 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
 	if (!res)
-		return err;
+		return killed && !err ? -EINTR : err;
 	iocb->ki_pos += res;
 	return res;
 }
