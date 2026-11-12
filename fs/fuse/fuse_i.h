@@ -563,6 +563,8 @@ struct fuse_io_priv {
 	struct kiocb *iocb;
 	struct completion *done;
 	bool blocking;
+	/* return the bytes before the first failed piece, not the error */
+	bool sync_result;
 };
 
 #define FUSE_IO_PRIV_SYNC(i) \
