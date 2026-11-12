@@ -828,7 +828,51 @@ static int fuse_flush_common(struct file *file, fl_owner_t id)
 	return err;
 }
 
-static int fuse_wt_flush(struct file *file, fl_owner_t id)
+/*
+ * The server learns that an open file description is gone from RELEASE, and
+ * drops the description's OFD locks there.  RELEASE is sent in the background
+ * after close() has returned, so for a moment another process still finds a
+ * lock that is gone as far as the closing process can tell (generic/478).
+ * RELEASE cannot be made synchronous: the final fput() can run on a thread of
+ * the server.
+ *
+ * ->flush() runs in the closing task, before that fput().  If it holds the
+ * only reference to the file, the descriptor it was called for was the last
+ * one: the descriptor is out of the table already, and a mapping, an I/O in
+ * flight or a descriptor in transit would each hold a reference of its own.
+ * Nothing can take a new reference then, so the locks of the description are
+ * dropped here, with a request the caller waits for.
+ *
+ * A description that loses its last reference some other way (munmap() after
+ * close(), completion of an aio) is unlocked by RELEASE, as before.
+ */
+static void fuse_ofd_unlock_on_close(struct file *file)
+{
+	struct inode *inode = file_inode(file);
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_file *ff = file->private_data;
+	struct fuse_lk_in inarg;
+	FUSE_ARGS(args);
+
+	if (!READ_ONCE(ff->ofd_lock) || file_count(file) != 1 ||
+	    fuse_is_bad(inode))
+		return;
+
+	memset(&inarg, 0, sizeof(inarg));
+	inarg.fh = ff->fh;
+	inarg.owner = fuse_lock_owner_id(fm->fc, file);
+	inarg.lk.end = OFFSET_MAX;
+	inarg.lk.type = F_UNLCK;
+	args.opcode = FUSE_SETLK;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.force = true;
+	fuse_simple_request(fm, &args);
+}
+
+static int fuse_wt_flush_data(struct file *file, fl_owner_t id)
 {
 	struct fuse_file *ff = file->private_data;
 
@@ -858,6 +902,15 @@ static int fuse_wt_flush(struct file *file, fl_owner_t id)
 	return fuse_flush_common(file, id);
 }
 
+static int fuse_wt_flush(struct file *file, fl_owner_t id)
+{
+	int err = fuse_wt_flush_data(file, id);
+
+	/* after the data: the lock may be what orders it against a reader */
+	fuse_ofd_unlock_on_close(file);
+	return err;
+}
+
 static int fuse_wb_flush(struct file *file, fl_owner_t id)
 {
 	struct inode *inode = file_inode(file);
@@ -874,6 +927,9 @@ static int fuse_wb_flush(struct file *file, fl_owner_t id)
 	 */
 	if (!err)
 		fuse_invalidate_attr_mask(inode, STATX_BLOCKS);
+
+	/* after the data: the lock may be what orders it against a reader */
+	fuse_ofd_unlock_on_close(file);
 	return err;
 }
 
@@ -5142,10 +5198,18 @@ static int fuse_file_lock(struct file *file, int cmd, struct file_lock *fl)
 		} else
 			err = fuse_getlk(file, fl);
 	} else {
-		if (fc->no_lock)
+		if (fc->no_lock) {
 			err = posix_lock_file(file, fl, NULL);
-		else
+		} else {
+			/* see fuse_ofd_unlock_on_close() */
+			if ((fl->c.flc_flags & FL_OFDLCK) &&
+			    fl->c.flc_type != F_UNLCK) {
+				struct fuse_file *ff = file->private_data;
+
+				WRITE_ONCE(ff->ofd_lock, true);
+			}
 			err = fuse_setlk(file, fl, 0);
+		}
 	}
 	return err;
 }

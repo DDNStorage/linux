@@ -455,6 +455,12 @@ struct fuse_file {
 
 	/** Has flock been performed on this file? */
 	bool flock:1;
+
+	/**
+	 * Has an OFD lock been requested from the server through this file?
+	 * Not a bit next to flock: the two are set without a common lock.
+	 */
+	bool ofd_lock;
 };
 
 /** One input argument of a request */
