@@ -831,8 +831,7 @@ static void fuse_aio_complete(struct fuse_io_priv *io, int err, ssize_t pos)
 		io->bytes = pos;
 
 	left = --io->reqs;
-	/* done is cleared when a killed synchronous caller has left */
-	if (!left && io->blocking && io->done)
+	if (!left && io->blocking)
 		complete(io->done);
 	spin_unlock(&io->lock);
 
@@ -1779,7 +1778,8 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 	 * count, as after any write that fails part-way.
 	 *
 	 * A fatal signal stops sending.  The pieces in flight reference wr
-	 * and the folios, so they are still waited for.
+	 * and the folios, so they are still waited for, also those the server
+	 * has not received yet.
 	 */
 	while (nr || (!err && !killed && iov_iter_count(ii))) {
 		struct fuse_write_pages_req *wr;
@@ -1809,6 +1809,11 @@ static ssize_t fuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 				}
 			}
 			fuse_write_pages_free(wr);
+			continue;
+		}
+
+		if (fatal_signal_pending(current)) {
+			killed = true;
 			continue;
 		}
 
@@ -2345,6 +2350,15 @@ ssize_t fuse_direct_io(struct fuse_io_priv *io, struct iov_iter *iter,
 		ssize_t nres;
 		fl_owner_t owner = current->files;
 		size_t nbytes = min(count, nmax);
+
+		/*
+		 * A waiting caller's pieces go out in the background, where a
+		 * fatal signal ends none of them, so stop sending here.
+		 */
+		if (io->async && io->blocking && fatal_signal_pending(current)) {
+			err = -EINTR;
+			break;
+		}
 
 		err = fuse_get_user_pages(&ia->ap, iter, &nbytes, write,
 					  max_pages);
@@ -4377,23 +4391,11 @@ __fuse_direct_IO(struct kiocb *iocb, struct iov_iter *iter, bool exclusive,
 			return -EIOCBQUEUED;
 
 		/*
-		 * On a fatal signal leave the pieces in flight to the
-		 * completions: they hold references on io, and the last one
-		 * frees it.  The caller's pages stay pinned until then.
+		 * A fatal signal only stopped sending.  The pieces in flight
+		 * are still waited for: the inode lock and the open file must
+		 * outlive them at the server.
 		 */
-		if (wait_for_completion_killable(&wait)) {
-			bool left;
-
-			spin_lock(&io->lock);
-			left = io->reqs;
-			if (left)
-				io->done = NULL;
-			spin_unlock(&io->lock);
-			if (left) {
-				kref_put(&io->refcnt, fuse_io_release);
-				return -EINTR;
-			}
-		}
+		wait_for_completion(&wait);
 		ret = fuse_get_res_by_io(io);
 	}
 
