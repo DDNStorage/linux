@@ -1855,6 +1855,22 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
 	return 0;
 }
 
+/*
+ * With the writeback cache the server stamps everything it sees, so every fuse
+ * inode is S_NOCMTIME.  The exception is data going into the page cache: the
+ * server does not know about it until writeback, so stamp it here.  This only
+ * dirties the inode and never waits for the server.
+ */
+static void fuse_cached_write_update_time(struct inode *inode)
+{
+	struct timespec64 now = current_time(inode);
+	struct timespec64 mtime = inode_get_mtime(inode);
+	struct timespec64 ctime = inode_get_ctime(inode);
+
+	if (!timespec64_equal(&mtime, &now) || !timespec64_equal(&ctime, &now))
+		generic_update_time(inode, S_MTIME | S_CTIME);
+}
+
 static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -1985,6 +2001,8 @@ retry:
 		err = generic_write_checks(iocb, from);
 		if (err > 0)
 			err = __generic_file_write_iter(iocb, from);
+		if (err > 0)
+			fuse_cached_write_update_time(inode);
 
 wb_out:
 		if (wb_guard)
@@ -2538,9 +2556,7 @@ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc)
 	ff = __fuse_write_file_get(fi);
 	/*
 	 * With no names left and no writable open here, the server may already
-	 * have deleted the inode, and this node has written nothing whose times
-	 * need sending: the only dirty time is the ctime of the unlink. A
-	 * WRITEBACK_SETATTR would re-create the deleted inode on the server.
+	 * have deleted the inode. A WRITEBACK_SETATTR would re-create it there.
 	 * A writable open here keeps the server's inode alive until the last
 	 * close, so its times are still sent. O_TMPFILE (I_LINKABLE) is flushed
 	 * as before.
@@ -3134,7 +3150,8 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 		}
 	}
 
-	file_update_time(vmf->vma->vm_file);
+	if (fm->fc->writeback_cache)
+		fuse_cached_write_update_time(inode);
 	lock_page(page);
 	if (page->mapping != inode->i_mapping) {
 		unlock_page(page);
@@ -4297,10 +4314,8 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
 		goto out;
 
 	/* we could have extended the file */
-	if (!(mode & FALLOC_FL_KEEP_SIZE)) {
-		if (fuse_write_update_attr(inode, offset + length, length))
-			file_update_time(file);
-	}
+	if (!(mode & FALLOC_FL_KEEP_SIZE))
+		fuse_write_update_attr(inode, offset + length, length);
 
 	if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
 		truncate_pagecache_range(inode, offset, offset + length - 1);
@@ -4315,8 +4330,6 @@ out:
 		filemap_invalidate_unlock(inode->i_mapping);
 
 	inode_unlock(inode);
-
-	fuse_flush_time_update(inode);
 
 	return err;
 }
@@ -4412,7 +4425,6 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
 				   ALIGN_DOWN(pos_out, PAGE_SIZE),
 				   ALIGN(pos_out + outarg.size, PAGE_SIZE) - 1);
 
-	file_update_time(file_out);
 	fuse_write_update_attr(inode_out, pos_out + outarg.size, outarg.size);
 
 	err = outarg.size;
@@ -4422,8 +4434,6 @@ out:
 
 	inode_unlock(inode_out);
 	file_accessed(file_in);
-
-	fuse_flush_time_update(inode_out);
 
 	return err;
 }
