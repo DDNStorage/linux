@@ -492,14 +492,35 @@ struct fuse_file_lock {
 
 /**
  * Release flags
+ *
+ * FUSE_RELEASE_CACHED_READ: a read(2), splice, sendfile or read fault
+ *			     without O_NOATIME was served from the page cache
+ *			     of the inode, through any open file, and no
+ *			     FUSE_READ, DLM read lock request, write, truncate,
+ *			     fallocate or explicit atime followed, e.g. to
+ *			     stamp atime.  Also sent without DLM.  Reported
+ *			     once, by the first release after it.
  */
 #define FUSE_RELEASE_FLUSH	(1 << 0)
 #define FUSE_RELEASE_FLOCK_UNLOCK	(1 << 1)
+#define FUSE_RELEASE_CACHED_READ	(1U << 31)
 
 /**
  * Getattr flags
  */
 #define FUSE_GETATTR_FH		(1 << 0)
+
+/**
+ * Statx flags (fuse_statx_in.sx_flags), beside the AT_STATX_* values
+ *
+ * FUSE_STATX_LIGHT: the caller does not need cluster-coherent size, blocks,
+ *		     mtime and ctime.  The server may return its current
+ *		     values without recalling locks other clients hold.
+ *		     Such a reply must have a zero attr_valid: the client
+ *		     does not cache it.  A non-zero attr_valid says the
+ *		     values are coherent, and they are cached as usual.
+ */
+#define FUSE_STATX_LIGHT	(1U << 31)
 
 /**
  * Lock flags

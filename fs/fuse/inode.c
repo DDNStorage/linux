@@ -507,6 +507,17 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
 	inode->i_flags &= ~S_NOSEC;
 }
 
+static bool fuse_mapping_dirty(struct inode *inode)
+{
+	return mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+	       mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK);
+}
+
+/*
+ * With the writeback cache, writes may extend i_size locally, and stamp mtime
+ * and ctime locally while their data is in the page cache.  The server knows
+ * about none of it, so the cached values win.
+ */
 u32 fuse_get_cache_mask(struct inode *inode)
 {
 	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -514,16 +525,19 @@ u32 fuse_get_cache_mask(struct inode *inode)
 	if (!fc->writeback_cache || !S_ISREG(inode->i_mode))
 		return 0;
 
-	return STATX_MTIME | STATX_CTIME | STATX_SIZE;
+	if (fuse_mapping_dirty(inode))
+		return STATX_MTIME | STATX_CTIME | STATX_SIZE;
+
+	return STATX_SIZE;
 }
 
 /*
  * Whether a cached time stamp stays over the one the server reported.
  *
- * Without dlm the kernel owns the stamps of a writeback inode and the
- * server's are ignored.  With dlm the cached stamp is a placeholder set by
- * the local writes the server has not seen, not an authority: a later stamp
- * from the server records a modification the server did see, our own
+ * The cached stamp is considered only while the page cache is dirty, because
+ * the local writes set it and the server has not seen them.  Without dlm it
+ * then wins.  With dlm it is a placeholder, not an authority: a later
+ * stamp from the server records a modification the server did see, our own
  * earlier writeback or another node's write, and stat() has to report it.
  * The dirty data stamps again when it is written back.
  */
@@ -749,9 +763,8 @@ retry:
 
 	is_new_inode = inode->i_state & I_NEW;
 	if (is_new_inode) {
-		inode->i_flags |= S_NOATIME;
-		if (!fc->writeback_cache || !S_ISREG(attr->mode))
-			inode->i_flags |= S_NOCMTIME;
+		/* see fuse_cached_write_update_time() */
+		inode->i_flags |= S_NOATIME | S_NOCMTIME;
 		inode->i_generation = generation;
 		fuse_init_inode(inode, attr, fc);
 	} else if (fuse_stale_inode(inode, generation, attr)) {
@@ -979,7 +992,9 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 
 		if (wb_sem) {
 			bool hot, has_writer, latched = false;
-			int ierr;
+			loff_t wb_start = 0;
+			loff_t wb_end = LLONG_MAX;
+			int ierr, werr;
 
 			spin_lock(&fi->lock);
 			hot = fuse_notify_inval_hot(fi);
@@ -1016,6 +1031,33 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			}
 
 			/*
+			 * Write the range back in bulk before dropping it.
+			 * invalidate_inode_pages2_range() would otherwise
+			 * launder each dirty folio with its own synchronous
+			 * WRITE, and the server holds the conflicting grant
+			 * until that finishes.  The gate keeps cached writers
+			 * from dirtying the range again; anything left dirty
+			 * is still laundered below.  Wait with _keep_errors so
+			 * that a write-back error stays in AS_EIO/AS_ENOSPC
+			 * for fuse_flush() to report at close;
+			 * filemap_write_and_wait_range() would clear it.
+			 */
+			if (!fuse_inode_force_dio(inode)) {
+				wb_start = offset;
+				if (len > 0 && len - 1 <= LLONG_MAX - offset)
+					wb_end = offset + len - 1;
+			}
+			werr = filemap_fdatawrite_range(inode->i_mapping,
+							wb_start, wb_end);
+			ierr = filemap_fdatawait_range_keep_errors(inode->i_mapping,
+								   wb_start, wb_end);
+			if (werr)
+				ierr = werr;
+			if (ierr)
+				pr_warn_ratelimited("FUSE: inode %llu write-back before invalidate failed: %d\n",
+						    nodeid, ierr);
+
+			/*
 			 * Latched: drop the whole mapping (dirty folios
 			 * outside the notified range would be invisible to
 			 * the forced direct reads).  Otherwise just the
@@ -1026,6 +1068,27 @@ int fuse_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
 			else
 				ierr = invalidate_inode_pages2_range(inode->i_mapping,
 								     pg_start, pg_end);
+
+			/*
+			 * A whole-file invalidation is how a sattr revoke
+			 * arrives.  Times are dirtied only under a write
+			 * grant, which holds sattr CW, so dirty times here
+			 * mean the CW being revoked is this node's.  Send them
+			 * now, while the server still sees that CW as granted
+			 * and lets the WRITEBACK SETATTR's CW past the pending
+			 * conflicting lock. If left dirty, close or the
+			 * flusher would send them after this node has
+			 * re-cached PR, and the server would have to revoke
+			 * this node's own PR for it.
+			 */
+			if (offset == 0 && len <= 0 &&
+			    (inode->i_state & (I_DIRTY_SYNC | I_DIRTY_TIME))) {
+				int serr = sync_inode_metadata(inode, 1);
+
+				if (serr)
+					pr_warn_ratelimited("FUSE: inode %llu times flush before invalidate failed: %d\n",
+							    nodeid, serr);
+			}
 
 			percpu_up_write(wb_sem);
 

@@ -1043,26 +1043,9 @@ static int fuse_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	return create_new_entry(fm, &args, dir, entry, S_IFLNK);
 }
 
-void fuse_flush_time_update(struct inode *inode)
-{
-	int err = sync_inode_metadata(inode, 1);
-
-	mapping_set_error(inode->i_mapping, err);
-}
-
-static void fuse_update_ctime_in_cache(struct inode *inode)
-{
-	if (!IS_NOCMTIME(inode)) {
-		inode_set_ctime_current(inode);
-		mark_inode_dirty_sync(inode);
-		fuse_flush_time_update(inode);
-	}
-}
-
 void fuse_update_ctime(struct inode *inode)
 {
 	fuse_invalidate_attr_mask(inode, STATX_CTIME);
-	fuse_update_ctime_in_cache(inode);
 }
 
 static void fuse_entry_unlinked(struct dentry *entry)
@@ -1237,9 +1220,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
 	args.in_args[1].size = newent->d_name.len + 1;
 	args.in_args[1].value = newent->d_name.name;
 	err = create_new_entry(fm, &args, newdir, newent, inode->i_mode);
-	if (!err)
-		fuse_update_ctime_in_cache(inode);
-	else if (err == -EINTR)
+	if (err == -EINTR)
 		fuse_invalidate_attr(inode);
 
 	return err;
@@ -1318,14 +1299,51 @@ static void fuse_attr_to_statx(struct fuse_attr *attr, struct fuse_statx *sx, ui
 }
 
 /*
+ * A FUSE_STATX_LIGHT reply with a zero attr_valid may lag behind writes the
+ * server has not seen, so it does not update the inode: a stale size would
+ * shrink i_size and the page cache.  This node's own unflushed writes are
+ * still reported, by taking the larger size and the later stamps of the two.
+ */
+static void fuse_statx_light_merge(struct inode *inode, struct fuse_attr *attr,
+				   struct fuse_statx *sx)
+{
+	loff_t size = i_size_read(inode);
+	struct timespec64 cached, reported;
+
+	if ((sx->mask & STATX_SIZE) && size > (loff_t) attr->size)
+		attr->size = size;
+
+	if (sx->mask & STATX_MTIME) {
+		cached = inode_get_mtime(inode);
+		reported.tv_sec = attr->mtime;
+		reported.tv_nsec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
+		if (timespec64_compare(&cached, &reported) > 0) {
+			attr->mtime = cached.tv_sec;
+			attr->mtimensec = cached.tv_nsec;
+		}
+	}
+	if (sx->mask & STATX_CTIME) {
+		cached = inode_get_ctime(inode);
+		reported.tv_sec = attr->ctime;
+		reported.tv_nsec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
+		if (timespec64_compare(&cached, &reported) > 0) {
+			attr->ctime = cached.tv_sec;
+			attr->ctimensec = cached.tv_nsec;
+		}
+	}
+}
+
+/*
  * @param sx_mask request mask send to to fuse-server
  * @param mandatory_sx_mask subset of (or complete) sx_mask that the server
  * has to fulfill
  * @param srv_size where to report the size the server sent, or NULL
+ * @param light send FUSE_STATX_LIGHT; a reply without a timeout then only
+ * fills @stat
 */
 static int fuse_do_statx(struct inode *inode, struct file *file,
 			 struct kstat *stat, u32 sx_mask, u32 mandatory_sx_mask,
-			 loff_t *srv_size)
+			 loff_t *srv_size, bool light)
 {
 	int err;
 	struct fuse_attr attr;
@@ -1355,7 +1373,7 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 	 * For permission checks, we only need mode, uid, gid.
 	 * This is an optimization to avoid fetching all stats when not needed.
 	 */
-	inarg.sx_flags = 0;
+	inarg.sx_flags = light ? FUSE_STATX_LIGHT : 0;
 	inarg.sx_mask = sx_mask;
 	args.opcode = FUSE_STATX;
 	args.nodeid = get_node_id(inode);
@@ -1397,7 +1415,9 @@ static int fuse_do_statx(struct inode *inode, struct file *file,
 		*srv_size = sx->size;
 
 	fuse_statx_to_attr(&outarg.stat, &attr);
-	if (sx->mask & STATX_BASIC_STATS) {
+	if (light && !outarg.attr_valid && !outarg.attr_valid_nsec) {
+		fuse_statx_light_merge(inode, &attr, sx);
+	} else if (sx->mask & STATX_BASIC_STATS) {
 		fuse_change_attributes(inode, &attr, &outarg.stat,
 				       ATTR_TIMEOUT(&outarg), attr_version);
 	}
@@ -1455,6 +1475,143 @@ static int fuse_do_getattr(struct inode *inode, struct kstat *stat,
 	return err;
 }
 
+/*
+ * Ask the server for mtime and ctime alone, with the file handle.  The
+ * server computes neither size nor blocks for the two stamps.  Sets
+ * fc->no_statx and returns -ENOSYS where the server has no statx.
+ */
+static int fuse_statx_times(struct fuse_mount *fm, struct inode *inode,
+			    struct fuse_file *ff, struct fuse_statx_out *outarg)
+{
+	const u32 mask = STATX_MTIME | STATX_CTIME;
+	struct fuse_statx *sx = &outarg->stat;
+	struct fuse_statx_in inarg;
+	FUSE_ARGS(args);
+	int err;
+
+	memset(&inarg, 0, sizeof(inarg));
+	memset(outarg, 0, sizeof(*outarg));
+	inarg.getattr_flags = FUSE_GETATTR_FH;
+	inarg.fh = ff->fh;
+	inarg.sx_mask = mask;
+	args.opcode = FUSE_STATX;
+	args.nodeid = get_node_id(inode);
+	args.in_numargs = 1;
+	args.in_args[0].size = sizeof(inarg);
+	args.in_args[0].value = &inarg;
+	args.out_numargs = 1;
+	args.out_args[0].size = sizeof(*outarg);
+	args.out_args[0].value = outarg;
+	err = fuse_simple_request(fm, &args);
+	if (err == -ENOSYS)
+		fm->fc->no_statx = 1;
+	if (err)
+		return err;
+
+	if ((sx->mask & mask) != mask ||
+	    ((sx->mask & STATX_SIZE) && !fuse_valid_size(sx->size)) ||
+	    ((sx->mask & STATX_TYPE) && (!fuse_valid_type(sx->mode) ||
+					 inode_wrong_type(inode, sx->mode)))) {
+		fuse_make_bad(inode);
+		return -EIO;
+	}
+	return 0;
+}
+
+/* The GETATTR with the file handle for a server without statx. */
+static int fuse_getattr_times(struct fuse_mount *fm, struct inode *inode,
+			      struct fuse_file *ff, struct fuse_attr_out *outarg)
+{
+	struct fuse_getattr_in inarg;
+	FUSE_ARGS(args);
+	int err;
+
+	memset(&inarg, 0, sizeof(inarg));
+	memset(outarg, 0, sizeof(*outarg));
+	inarg.getattr_flags = FUSE_GETATTR_FH;
+	inarg.fh = ff->fh;
+	fuse_getattr_args_fill(&args, get_node_id(inode), &inarg, outarg);
+	err = fuse_simple_request(fm, &args);
+	if (err)
+		return err;
+
+	if (fuse_invalid_attr(&outarg->attr) ||
+	    inode_wrong_type(inode, outarg->attr.mode)) {
+		fuse_make_bad(inode);
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * Take the server's mtime and ctime after an O_TRUNC open.
+ *
+ * The server truncated and stamped the file on FUSE_OPEN and the page cache
+ * has just been emptied, so nothing local is newer than its stamps.  The
+ * attributes come with the open where the server supports the compound and
+ * are fetched here otherwise: the two stamps alone by a statx where the
+ * server has it, all of them by a GETATTR else.  fuse_change_attributes()
+ * keeps the cached stamps for a writeback inode, which predate the truncate,
+ * and drops a reply an update since has overtaken, so the stamps are set
+ * from the reply directly.  A failed request leaves the attributes
+ * invalidated for the next stat to ask again.
+ */
+void fuse_truncate_server_times(struct inode *inode, struct file *file)
+{
+	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct fuse_conn *fc = fm->fc;
+	struct fuse_inode *fi = get_fuse_inode(inode);
+	struct fuse_file *ff = file->private_data;
+	struct fuse_attr_out outarg;
+	struct fuse_statx_out sxarg;
+	struct fuse_attr *attr = &outarg.attr;
+	struct fuse_statx *sx = NULL;
+	struct timespec64 mtime, ctime;
+	bool fetched = ff->release_args && ff->release_args->attr_fetched;
+	u64 attr_version = 0;
+	u64 attr_valid;
+
+	if (fetched) {
+		outarg = ff->release_args->attr_outarg;
+		attr_valid = ATTR_TIMEOUT(&outarg);
+	} else {
+		int err = -ENOSYS;
+
+		attr_version = fuse_get_attr_version(fc);
+		if (!fc->no_statx) {
+			err = fuse_statx_times(fm, inode, ff, &sxarg);
+			if (!err) {
+				sx = &sxarg.stat;
+				fuse_statx_to_attr(sx, attr);
+				attr_valid = ATTR_TIMEOUT(&sxarg);
+			}
+		}
+		if (err == -ENOSYS) {
+			err = fuse_getattr_times(fm, inode, ff, &outarg);
+			attr_valid = ATTR_TIMEOUT(&outarg);
+		}
+		if (err)
+			return;
+	}
+
+	/* before fuse_change_attributes() rewrites them */
+	mtime.tv_sec = attr->mtime;
+	mtime.tv_nsec = min_t(u32, attr->mtimensec, NSEC_PER_SEC - 1);
+	ctime.tv_sec = attr->ctime;
+	ctime.tv_nsec = min_t(u32, attr->ctimensec, NSEC_PER_SEC - 1);
+
+	/* the open's reply went through fuse_change_attributes() already */
+	if (!fetched)
+		fuse_change_attributes(inode, attr, sx, attr_valid,
+				       attr_version);
+
+	spin_lock(&fi->lock);
+	fi->attr_version = atomic64_inc_return(&fc->attr_version);
+	inode_set_mtime_to_ts(inode, mtime);
+	inode_set_ctime_to_ts(inode, ctime);
+	spin_unlock(&fi->lock);
+}
+
 static int fuse_update_get_attr(struct inode *inode, struct file *file,
 				struct kstat *stat, u32 request_mask,
 				unsigned int flags, loff_t *srv_size)
@@ -1467,6 +1624,8 @@ static int fuse_update_get_attr(struct inode *inode, struct file *file,
 	u32 cache_mask = fuse_get_cache_mask(inode);
 	u32 mandatory_sx_mask = request_mask & STATX_BASIC_STATS;
 	u32 sx_mask = request_mask;
+	bool light = stat && fc->writeback_cache && S_ISREG(inode->i_mode) &&
+		     !(flags & AT_STATX_FORCE_SYNC);
 
 	/* FUSE only supports basic stats and possibly btime */
 	sx_mask &= STATX_BASIC_STATS | STATX_BTIME;
@@ -1489,7 +1648,7 @@ retry:
 		forget_all_cached_acls(inode);
 		if (!fc->no_statx) {
 			err = fuse_do_statx(inode, file, stat, sx_mask,
-					    mandatory_sx_mask, srv_size);
+					    mandatory_sx_mask, srv_size, light);
 			if (err == -ENOSYS) {
 				fc->no_statx = 1;
 				err = 0;
@@ -1929,14 +2088,10 @@ static long fuse_dir_compat_ioctl(struct file *file, unsigned int cmd,
 				 FUSE_IOCTL_COMPAT | FUSE_IOCTL_DIR);
 }
 
-static bool update_mtime(unsigned ivalid, bool trust_local_mtime)
+static bool update_mtime(unsigned ivalid)
 {
 	/* Always update if mtime is explicitly set  */
 	if (ivalid & ATTR_MTIME_SET)
-		return true;
-
-	/* Or if kernel i_mtime is the official one */
-	if (trust_local_mtime)
 		return true;
 
 	/* If it's an open(O_TRUNC) or an ftruncate(), don't update */
@@ -1948,7 +2103,7 @@ static bool update_mtime(unsigned ivalid, bool trust_local_mtime)
 }
 
 static void iattr_to_fattr(struct fuse_conn *fc, struct iattr *iattr,
-			   struct fuse_setattr_in *arg, bool trust_local_cmtime)
+			   struct fuse_setattr_in *arg)
 {
 	unsigned ivalid = iattr->ia_valid;
 
@@ -1967,17 +2122,13 @@ static void iattr_to_fattr(struct fuse_conn *fc, struct iattr *iattr,
 		if (!(ivalid & ATTR_ATIME_SET))
 			arg->valid |= FATTR_ATIME_NOW;
 	}
-	if ((ivalid & ATTR_MTIME) && update_mtime(ivalid, trust_local_cmtime)) {
+	/* The server stamps "now" and ctime with its own clock. */
+	if ((ivalid & ATTR_MTIME) && update_mtime(ivalid)) {
 		arg->valid |= FATTR_MTIME;
 		arg->mtime = iattr->ia_mtime.tv_sec;
 		arg->mtimensec = iattr->ia_mtime.tv_nsec;
-		if (!(ivalid & ATTR_MTIME_SET) && !trust_local_cmtime)
+		if (!(ivalid & ATTR_MTIME_SET))
 			arg->valid |= FATTR_MTIME_NOW;
-	}
-	if ((ivalid & ATTR_CTIME) && trust_local_cmtime) {
-		arg->valid |= FATTR_CTIME;
-		arg->ctime = iattr->ia_ctime.tv_sec;
-		arg->ctimensec = iattr->ia_ctime.tv_nsec;
 	}
 }
 
@@ -2092,7 +2243,6 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
 	loff_t oldsize;
 	int err;
-	bool trust_local_cmtime = is_wb && !fc->dlm;
 	bool fault_blocked = false;
 	u64 attr_version;
 
@@ -2165,15 +2315,25 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 			return err;
 	}
 
-	if (is_truncate) {
-		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
-		if (trust_local_cmtime && attr->ia_size != inode->i_size)
-			attr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
+	/*
+	 * Write dirty folios back before a truncating SETATTR, like the
+	 * atomic-O_TRUNC case in fuse_open(): under DLM the server's
+	 * truncate revokes this client's locks, and the invalidate that
+	 * follows would otherwise launder dirty folios with writes the
+	 * server holds behind the same truncate.
+	 */
+	if (is_truncate && is_wb && fc->dlm) {
+		err = filemap_write_and_wait(mapping);
+		if (err)
+			goto error;
 	}
+
+	if (is_truncate)
+		set_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
 
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outarg, 0, sizeof(outarg));
-	iattr_to_fattr(fc, attr, &inarg, trust_local_cmtime);
+	iattr_to_fattr(fc, attr, &inarg);
 	if (file) {
 		struct fuse_file *ff = file->private_data;
 		inarg.valid |= FATTR_FH;
@@ -2211,16 +2371,10 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		goto error;
 	}
 
-	spin_lock(&fi->lock);
-	/* the kernel maintains i_mtime locally */
-	if (trust_local_cmtime) {
-		if (attr->ia_valid & ATTR_MTIME)
-			inode_set_mtime_to_ts(inode, attr->ia_mtime);
-		if (attr->ia_valid & ATTR_CTIME)
-			inode_set_ctime_to_ts(inode, attr->ia_ctime);
-		/* FIXME: clear I_DIRTY_SYNC? */
-	}
+	if ((is_truncate || !is_wb) && S_ISREG(inode->i_mode))
+		fuse_zero_eof_gap(inode, outarg.attr.size);
 
+	spin_lock(&fi->lock);
 	if (fi->attr_version > attr_version) {
 		/*
 		 * Apply attributes, for example for fsnotify_change(), but set
@@ -2231,7 +2385,7 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 
 	fuse_change_attributes_common(inode, &outarg.attr, NULL,
 				      ATTR_TIMEOUT(&outarg),
-				      fuse_get_cache_mask(inode), 0);
+				      fuse_get_cache_mask(inode) & STATX_SIZE, 0);
 	oldsize = inode->i_size;
 	/* see the comment in fuse_change_attributes() */
 	if (!is_wb || is_truncate)
@@ -2338,6 +2492,10 @@ static int fuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
 		/* Directory mode changed, may need to revalidate access */
 		if (d_is_dir(entry) && (attr->ia_valid & ATTR_MODE))
 			fuse_invalidate_entry_cache(entry);
+
+		/* An explicit atime or a truncate supersedes the read */
+		if (attr->ia_valid & (ATTR_ATIME | ATTR_SIZE))
+			fuse_cached_read_clear(inode);
 	}
 	return ret;
 }

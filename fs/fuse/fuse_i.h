@@ -216,6 +216,13 @@ struct fuse_inode {
 			 */
 			unsigned long notify_stamp;
 			unsigned int notify_interval_ewma;
+
+			/*
+			 * A read the server did not see, through any open
+			 * file of the inode, see FUSE_RELEASE_CACHED_READ.
+			 * No lock: WRITE_ONCE() and xchg() only.
+			 */
+			bool cached_read;
 		};
 
 		/* readdir cache (directory only) */
@@ -291,6 +298,14 @@ enum {
 	 * the lock, see fuse_dlm_attr_timeout().
 	 */
 	FUSE_I_DLM_LOCKED,
+	/*
+	 * Has had a shared writable mapping.  Only such a mapping can leave
+	 * bytes past EOF in the last folio, so under DLM fuse_zero_eof_gap()
+	 * zeroes them only when this is set.  Set in fuse_file_mmap() and
+	 * never cleared for the life of the inode: the bytes can outlive the
+	 * mapping in the page cache.
+	 */
+	FUSE_I_SHARED_WRITE_MMAP,
 };
 
 struct fuse_conn;
@@ -403,6 +418,15 @@ struct fuse_args_pages {
 	unsigned int num_pages;
 };
 
+struct fuse_release_args {
+	struct fuse_args args;
+	struct fuse_release_in inarg;
+	struct inode *inode;
+	/* The attributes the open fetched with it, if any */
+	struct fuse_attr_out attr_outarg;
+	bool attr_fetched;
+};
+
 #define FUSE_ARGS(args) struct fuse_args args = {}
 
 /** The request IO state (for asynchronous processing) */
@@ -421,6 +445,8 @@ struct fuse_io_priv {
 	struct kiocb *iocb;
 	struct completion *done;
 	bool blocking;
+	/* return the bytes before the first failed piece, not the error */
+	bool sync_result;
 };
 
 #define FUSE_IO_PRIV_SYNC(i) \
@@ -1078,6 +1104,20 @@ static inline struct fuse_inode *get_fuse_inode(struct inode *inode)
 	return container_of(inode, struct fuse_inode, inode);
 }
 
+/* Record a read served from the page cache, see FUSE_RELEASE_CACHED_READ */
+static inline void fuse_cached_read_set(struct file *file)
+{
+	if (!(file->f_flags & O_NOATIME))
+		WRITE_ONCE(get_fuse_inode(file_inode(file))->cached_read, true);
+}
+
+/* A read or write the server saw supersedes the recorded read */
+static inline void fuse_cached_read_clear(struct inode *inode)
+{
+	if (S_ISREG(inode->i_mode))
+		WRITE_ONCE(get_fuse_inode(inode)->cached_read, false);
+}
+
 static inline u64 get_node_id(struct inode *inode)
 {
 	return get_fuse_inode(inode)->nodeid;
@@ -1420,10 +1460,10 @@ bool fuse_allow_current_process(struct fuse_conn *fc);
 
 u64 fuse_lock_owner_id(struct fuse_conn *fc, fl_owner_t id);
 
-void fuse_flush_time_update(struct inode *inode);
 void fuse_update_ctime(struct inode *inode);
 
 int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask);
+void fuse_truncate_server_times(struct inode *inode, struct file *file);
 int fuse_update_attributes_sync(struct inode *inode, struct file *file,
 				u32 mask);
 
@@ -1490,6 +1530,7 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait);
 int fuse_dev_release(struct inode *inode, struct file *file);
 
 bool fuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written);
+void fuse_zero_eof_gap(struct inode *inode, loff_t to);
 
 int fuse_flush_times(struct inode *inode, struct fuse_file *ff);
 int fuse_write_inode(struct inode *inode, struct writeback_control *wbc);
