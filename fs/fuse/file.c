@@ -2038,7 +2038,15 @@ static ssize_t fuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		if (err)
 			return err;
 
-		if (fc->handle_killpriv_v2 &&
+		/*
+		 * A write that drops suid/sgid stays off the writeback path.
+		 * With handle_killpriv_v2 the server does the killing from the
+		 * WRITE itself.  Under DLM without it, file_remove_privs()
+		 * sends a SETATTR, and a NOTIFY_INVAL_INODE the server has to
+		 * send while handling it would wait on the coherency gate
+		 * held across the cached write.
+		 */
+		if ((fc->handle_killpriv_v2 || fc->dlm) &&
 		    setattr_should_drop_suidgid(&nop_mnt_idmap,
 						file_inode(file))) {
 			goto writethrough;
@@ -2151,23 +2159,16 @@ writethrough:
 	inode_lock(inode);
 
 	/*
-	 * The forced-direct-IO latch feature is active under writeback+dlm;
-	 * hold the coherency gate (wb_inval_rwsem) for read across the
-	 * page-cache dirtying so a concurrent NOTIFY_INVAL_INODE -- which takes
-	 * the write side (blocking, with priority) around its invalidate + latch
-	 * set -- cannot strand the folios we are about to write.  Re-check the
-	 * latch under it and re-route to the direct path if set.  No DLM
-	 * re-validation here: this path never requested a DLM lock (the
-	 * writeback branch above returns before reaching it).
+	 * Under DLM with the writeback cache only a write dropping suid/sgid
+	 * gets here.  It holds no grant and its WRITE goes out without
+	 * FUSE_WRITE_CACHE, so the server takes the DLM lock for it and may
+	 * revoke a grant of this node first.  The NOTIFY_INVAL_INODE for that
+	 * takes the coherency gate's write side, so the gate is not held
+	 * across the write.  The latch is re-checked under the inode lock.
 	 */
-	wb_guard = !!wb_sem;
-	if (wb_guard) {
-		percpu_down_read(wb_sem);
-		if (fuse_inode_force_dio(inode)) {
-			percpu_up_read(wb_sem);
-			inode_unlock(inode);
-			return fuse_direct_write_iter(iocb, from);
-		}
+	if (fuse_inode_force_dio(inode)) {
+		inode_unlock(inode);
+		return fuse_direct_write_iter(iocb, from);
 	}
 
 	err = generic_write_checks(iocb, from);
@@ -2192,8 +2193,6 @@ writethrough:
 		written = fuse_perform_write(iocb, from);
 	}
 out:
-	if (wb_guard)
-		percpu_up_read(wb_sem);
 	inode_unlock(inode);
 	if (written > 0)
 		written = generic_write_sync(iocb, written);
