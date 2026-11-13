@@ -2092,7 +2092,7 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
 	loff_t oldsize;
 	int err;
-	bool trust_local_cmtime = is_wb && !fc->dlm;
+	bool trust_local_cmtime = is_wb;
 	bool fault_blocked = false;
 	u64 attr_version;
 
