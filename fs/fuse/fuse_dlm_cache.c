@@ -4,6 +4,8 @@
  */
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
+#include "fuse_qlease.h"
+#include "fuse_trace.h"
 
 #include <linux/list.h>
 #include <linux/types.h>
@@ -717,8 +719,12 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
 	 * goes on to consider the range usable. Any other error fails the
 	 * IO instead, and the caller releases the still-INIT rlock directly
 	 * without ever touching the page cache under it, so leave it alone.
+	 * A quota_lease connection always has a DLM: fuse_get_dlm_lock()
+	 * fails its -ENOSYS with -EIO, so that one is left alone as well.
 	 */
 	if (error && error != -ENOSYS)
+		return;
+	if (error && get_fuse_conn(&dargs->fi->inode)->quota_lease)
 		return;
 
 	fuse_range_lock_mark_ready(dargs->fi, dargs->rlock);
@@ -739,17 +745,67 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
  *  one LOCKED (fencing further revokes) before being trusted; if a
  *  concurrent invalidate is found to have revoked it, @rlock is put
  *  back in INIT and a fresh grant is requested below instead.
+ * @admit:  the caller admits a write: the grant check of a buffered write
+ *	in fuse_cache_write_iter() or of a store fault in
+ *	fuse_filemap_fault(). Every other caller takes a grant only and
+ *	passes false: grant-ahead, a load fault and reads. On a quota_lease
+ *	connection its write lock request carries FUSE_DLM_LOCK_NO_ADMIT,
+ *	so redfsd skips the owner lookup and the voucher fetch and answers
+ *	an empty lease part. Whatever lease part comes back is still
+ *	applied, but its result is ignored (fuse_qlease_apply() returns 0
+ *	for a part without a lease that was not wanted).
+ *	fuse_write_run_advance() requests nothing.
+ *
+ * With @admit, a WRITE request on a quota enabled session checks the
+ * inode's quota lease at the grant check, with @rlock LOCKED (D10):
+ *
+ * - valid: nothing for quota; a cached grant returns at once, a missing
+ *   one sends the lock upcall, whose reply can extend the lease;
+ * - rejected within its hold time: -EDQUOT;
+ * - expired, or rejected past its hold time: renew it first, single-flight
+ *   per lease (fuse_qlease_renew(): flush, FUSE_QUOTA_ADMIT with
+ *   FUSE_QADMIT_RENEW), or wait for the renewal in flight;
+ * - no lease, or the owner changed: on a cached grant a first-admission
+ *   FUSE_QUOTA_ADMIT (fuse_qlease_first_admit()), on a miss the lock
+ *   upcall, whose reply carries the lease.
+ *
+ * Every request, the lock upcall and an admit alike, is sent with @rlock
+ * moved back to INIT, invisible to invalidation, and the inode lock of a
+ * writer still held. After an admit, and after a lock reply that was the
+ * write's first admission, @rlock is marked LOCKED again and the grant and
+ * the lease are checked again: a revoke may have dropped the grant
+ * meanwhile, and the lease linked may be expired or rejected. A lease
+ * request that went through admits the write even if the lease is still
+ * not valid at the next check (a reserved QUOTA_OFF reply, a TTL that
+ * lapsed since), so each call sends at most one first admission and one
+ * renewal of its own; waiting for another task's renewal does not count.
+ * redfsd retries a lease request itself and never answers -EAGAIN: a first
+ * admission, a renewal or a lock reply's lease part answered -EAGAIN fails
+ * with -EIO. One interrupted by a signal (-EINTR), and a lease lock upcall
+ * failed with -EINTR, fail with -ERESTARTSYS while the signal is pending
+ * and with -EIO otherwise. A buffered write then restarts the syscall, and
+ * a store fault that may retry returns VM_FAULT_RETRY without a SIGBUS
+ * mark; a store fault that cannot retry fails with SIGBUS (vmf_error()),
+ * which a GUP caller sees as -EFAULT.
+ *
+ * On a quota_lease connection a -ENOSYS reply to the lock upcall fails with
+ * -EIO and leaves fc->dlm set: redfsd offered leases, so it has a DLM, and
+ * clearing fc->dlm would turn admission off for the session.
+ * A grant that could not be recorded is trusted only until @rlock goes
+ * back to INIT for an admit or a renewal; after that a fresh grant is
+ * requested.
  *
  * Return: 0 when the range is covered by a recorded grant on return,
  * FUSE_DLM_GRANT_UNRECORDED when the server granted the lock but
  * recording it failed (covered cluster-wide, invisible to
  * fuse_dlm_lock_is_held()), a negative error code otherwise.  Callers
  * re-validating the grant must not re-request on a nonzero return or
- * they would spin.
+ * they would spin. With @admit, -EDQUOT or another admission error can
+ * come back with the grant recorded; @rlock is then INIT, READY or LOCKED.
  */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		      size_t length, enum fuse_page_lock_mode mode,
-		      struct fuse_range_lock *rlock)
+		      struct fuse_range_lock *rlock, bool admit)
 {
 	struct fuse_file *ff = file->private_data;
 	struct inode *inode = file_inode(file);
@@ -757,109 +813,245 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 	struct fuse_inode *fi = get_fuse_inode(inode);
 	struct fuse_mount *fm = ff->fm;
 
-	struct fuse_dlm_lock_args dargs = { .fi = fi, .rlock = rlock };
+	struct fuse_dlm_lock_args dargs;
 	struct fuse_args *args = &dargs.args;
 	struct fuse_dlm_lock_in inarg;
-	struct fuse_dlm_lock_out outarg;
+	struct fuse_dlm_lock_lease_out outarg;
+	bool lease = fc->quota_lease && mode == FUSE_PAGE_LOCK_WRITE;
+	/* a QUOTA OFF session checks no lease */
+	bool check = admit && lease && !fuse_qlease_quota_off(fc);
+	bool admitted = false;	/* a lease request of this call went through */
+	bool unrecorded = false;
+	/* sent since the last check, for trace_fuse_qlease_recheck() */
+	enum fuse_qlease_sent sent = FUSE_QLEASE_SENT_NONE;
+	int sent_err = 0;
+	ktime_t init_at = 0;
 	int err;
 
 	/* An empty range needs no lock. */
 	if (!length)
 		return 0;
 
-	/*
-	 * note that this can be run from different processes
-	 * at the same time. It is intentionally not protected
-	 * since a DLM implementation in the FUSE server should take care
-	 * of any races in lock requests.
-	 * The early exit uses the same helper the callers re-validate
-	 * with, so this check and a later fuse_dlm_lock_is_held() can
-	 * never disagree about what counts as covered.
-	 *
-	 * rlock is still INIT here, invisible to invalidation. Move
-	 * it to LOCKED, which blocks until any invalidate that is
-	 * concurrently draining an overlapping range (one that got
-	 * past its own conflict check while we were INIT) has fully
-	 * revoked the grant and released, then re-check: only once
-	 * LOCKED, which fences any further revoke, can is_held() be
-	 * trusted. If the grant was revoked, undo back to INIT (never
-	 * blocks) and fall through to request a fresh grant below.
-	 */
-	if (rlock) {
-		err = fuse_range_lock_mark_locked(fi, rlock);
+	for (;;) {
+		struct fuse_qlease *l = NULL;
+		bool wanted = false;
+		bool held;
+		int state = 0;
+
+		/*
+		 * note that this can be run from different processes
+		 * at the same time. It is intentionally not protected
+		 * since a DLM implementation in the FUSE server should take
+		 * care of any races in lock requests.
+		 * The early exit uses the same helper the callers re-validate
+		 * with, so this check and a later fuse_dlm_lock_is_held() can
+		 * never disagree about what counts as covered.
+		 *
+		 * rlock is still INIT here, invisible to invalidation (or
+		 * READY, after a lock reply). Move it to LOCKED, which blocks
+		 * until any invalidate that is concurrently draining an
+		 * overlapping range (one that got past its own conflict check
+		 * while we were INIT) has fully revoked the grant and
+		 * released, then re-check: only once LOCKED, which fences any
+		 * further revoke, can is_held() be trusted. If the grant was
+		 * revoked, undo back to INIT (never blocks) and fall through
+		 * to request a fresh grant below.
+		 */
+		if (rlock) {
+			err = fuse_range_lock_mark_locked(fi, rlock);
+			if (err)
+				return err;
+		}
+		/* An unrecorded grant is covered, though is_held() misses it */
+		held = unrecorded ||
+		       fuse_dlm_lock_is_held(fi, offset, length, mode);
+		if (sent && trace_fuse_qlease_recheck_enabled())
+			trace_fuse_qlease_recheck(inode, sent, sent_err,
+						   ktime_us_delta(ktime_get(),
+								  init_at),
+						   held);
+		sent = FUSE_QLEASE_SENT_NONE;
+
+		if (check) {
+			state = fuse_qlease_check(inode, admitted ? NULL : &l);
+			if (state < 0)
+				return state;	/* -EDQUOT, the hold applies */
+			/* One lease request of our own per call, see above */
+			if (admitted)
+				state = 0;
+			wanted = state == FUSE_QLEASE_NONE;
+		}
+
+		/*
+		 * Renew an expired lease before the grant is handled, so a
+		 * renewal never rides on the lock upcall; a cached grant with
+		 * no lease takes its first admission from a dedicated admit.
+		 * Both with rlock in INIT, like the lock upcall below.
+		 */
+		if (state == FUSE_QLEASE_RENEW || (wanted && held)) {
+			if (rlock)
+				fuse_range_lock_mark_init(fi, rlock);
+			/*
+			 * A revoke can complete while rlock is INIT, and an
+			 * unrecorded grant leaves it nothing to drop: trust
+			 * only what is_held() shows after this, so the next
+			 * pass asks for a fresh grant.
+			 */
+			unrecorded = false;
+			if (trace_fuse_qlease_recheck_enabled())
+				init_at = ktime_get();
+			if (state == FUSE_QLEASE_RENEW) {
+				err = fuse_qlease_renew(l, inode, false);
+				fuse_qlease_put(l);
+				sent = err == FUSE_QLEASE_WAITED ?
+				       FUSE_QLEASE_SENT_WAIT :
+				       FUSE_QLEASE_SENT_RENEW;
+				if (err == FUSE_QLEASE_WAITED)
+					err = FUSE_QLEASE_RESTART;
+			} else {
+				err = fuse_qlease_first_admit(inode);
+				sent = FUSE_QLEASE_SENT_ADMIT;
+			}
+			sent_err = err;
+			if (!err)
+				admitted = true;
+			else if (err != FUSE_QLEASE_RESTART)
+				return err;
+			/* same errno as the killable wait in renew */
+			else if (fatal_signal_pending(current))
+				return -ERESTARTSYS;
+			cond_resched();
+			continue;
+		}
+
+		if (held)	/* we already have this area locked */
+			return unrecorded ? FUSE_DLM_GRANT_UNRECORDED : 0;
+		if (rlock)
+			fuse_range_lock_mark_init(fi, rlock);
+		if (wanted && trace_fuse_qlease_recheck_enabled())
+			init_at = ktime_get();
+
+		/* The server counts a read lock request as a read itself */
+		if (mode == FUSE_PAGE_LOCK_READ)
+			fuse_cached_read_clear(inode);
+
+		memset(&dargs, 0, sizeof(dargs));
+		dargs.fi = fi;
+		dargs.rlock = rlock;
+		memset(&inarg, 0, sizeof(inarg));
+		memset(&outarg, 0, sizeof(outarg));
+		inarg.fh = ff->fh;
+
+		/*
+		 * note that the offset and length don't have to be page
+		 * aligned here but since we only get here on writeback
+		 * caching we will send out page aligned requests
+		 */
+		inarg.start = offset & PAGE_MASK;
+		inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
+		inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
+			FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
+		/* A lease write request that admits nothing: no voucher */
+		inarg.flags = (lease && !admit) ? FUSE_DLM_LOCK_NO_ADMIT : 0;
+
+		args->opcode = FUSE_DLM_WB_LOCK;
+		args->nodeid = get_node_id(inode);
+		args->in_numargs = 1;
+		args->in_args[0].size = sizeof(inarg);
+		args->in_args[0].value = &inarg;
+		args->out_numargs = 1;
+		/* Only a quota_lease write request gets the lease part back */
+		args->out_args[0].size = lease ? sizeof(outarg) :
+						 sizeof(outarg.lock);
+		args->out_args[0].value = &outarg;
+		args->complete = fuse_get_dlm_lock_complete;
+		err = fuse_simple_request(fm, args);
+		if (err == -ENOSYS && fc->quota_lease) {
+			/*
+			 * redfsd offered quota leases, so it has a DLM: a
+			 * broken reply. Clearing fc->dlm would turn admission
+			 * off for the session while redfsd keeps charging
+			 * writeback to the system quota.
+			 */
+			return -EIO;
+		}
+		if (err == -ENOSYS) {
+			/* fuse server does not support dlm, save the info */
+			fc->dlm = 0;
+			return err;
+		}
+		/*
+		 * redfsd answers a lease lock request interrupted while it
+		 * retried with -EINTR, after releasing its locks: map it as
+		 * fuse_qlease_reply_error() maps a lease part's -EINTR.
+		 */
+		if (err == -EINTR && lease)
+			return signal_pending(current) ? -ERESTARTSYS : -EIO;
+
 		if (err)
 			return err;
+
+		fuse_dlm_attr_timeout(fi);
+
+		if (inarg.start < outarg.lock.start ||
+		    inarg.end > outarg.lock.end) {
+			/* fuse server is seriously broken */
+			pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",
+				inarg.start, inarg.end, outarg.lock.start,
+				outarg.lock.end);
+			fuse_abort_conn(fc);
+			return -EIO;
+		}
+
+		/*
+		 * The server granted the lock; record it so
+		 * fuse_dlm_lock_is_held() sees it.
+		 *
+		 * A failure to record (small-allocation -ENOMEM) does not
+		 * undo the grant: coverage exists cluster-wide, only the
+		 * local bookkeeping is missing.  Report that as
+		 * FUSE_DLM_GRANT_UNRECORDED so callers neither fail an IO
+		 * that is actually covered nor keep re-requesting a grant
+		 * that will not become visible.  (rlock, if any, was already
+		 * moved to READY by fuse_get_dlm_lock_complete() while
+		 * processing the reply.)
+		 */
+		if (fuse_dlm_lock_range(fi, outarg.lock.start,
+					 outarg.lock.end, mode))
+			unrecorded = true;
+
+		/*
+		 * The lease part is applied after the grant is recorded, so a
+		 * -EDQUOT or FUSE_QLEASE_RESTART result still leaves the
+		 * grant cached for the check that follows. A first admission
+		 * that linked the inode is checked again, like an admit: the
+		 * lease it names may be expired or being renewed (RESTART),
+		 * and a revoke may have dropped the grant since the reply.
+		 */
+		if (lease) {
+			int qerr = fuse_qlease_apply(inode, &outarg.lease,
+						      wanted);
+
+			if (wanted) {
+				sent = FUSE_QLEASE_SENT_LOCK;
+				sent_err = qerr;
+			}
+			if (check && qerr == FUSE_QLEASE_RESTART) {
+				/* a lease linked: the next pass renews it */
+				if (fatal_signal_pending(current))
+					return -ERESTARTSYS;
+				cond_resched();
+				continue;
+			}
+			if (check && qerr)
+				return qerr;
+			if (wanted) {
+				admitted = true;
+				continue;
+			}
+		}
+		return unrecorded ? FUSE_DLM_GRANT_UNRECORDED : 0;
 	}
-	if (fuse_dlm_lock_is_held(fi, offset, length, mode))
-		return 0; /* we already have this area locked */
-	if (rlock)
-		fuse_range_lock_mark_init(fi, rlock);
-
-	/* The server counts a read lock request as a read itself */
-	if (mode == FUSE_PAGE_LOCK_READ)
-		fuse_cached_read_clear(inode);
-
-	memset(&inarg, 0, sizeof(inarg));
-	inarg.fh = ff->fh;
-
-	/*
-	 * note that the offset and length don't have to be page aligned
-	 * here but since we only get here on writeback caching we will
-	 * send out page aligned requests
-	 */
-	inarg.start = offset & PAGE_MASK;
-	inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
-	inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
-		FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
-
-	args->opcode = FUSE_DLM_WB_LOCK;
-	args->nodeid = get_node_id(inode);
-	args->in_numargs = 1;
-	args->in_args[0].size = sizeof(inarg);
-	args->in_args[0].value = &inarg;
-	args->out_numargs = 1;
-	args->out_args[0].size = sizeof(outarg);
-	args->out_args[0].value = &outarg;
-	args->complete = fuse_get_dlm_lock_complete;
-	err = fuse_simple_request(fm, args);
-	if (err == -ENOSYS) {
-		/* fuse server does not support dlm, save the info */
-		fc->dlm = 0;
-		return err;
-	}
-
-	if (err)
-		return err;
-
-	fuse_dlm_attr_timeout(fi);
-
-	if (inarg.start < outarg.start || inarg.end > outarg.end) {
-		/* fuse server is seriously broken */
-		pr_warn("fuse: dlm lock request for %llu:%llu returned %llu:%llu bytes\n",
-			inarg.start, inarg.end, outarg.start, outarg.end);
-		fuse_abort_conn(fc);
-		return -EIO;
-	}
-
-	/*
-	 * The server granted the lock; record it so
-	 * fuse_dlm_lock_is_held() sees it.
-	 */
-	err = fuse_dlm_lock_range(fi, outarg.start, outarg.end, mode);
-
-	/*
-	 * A failure to record (small-allocation -ENOMEM) does not undo
-	 * the grant: coverage exists cluster-wide, only the local
-	 * bookkeeping is missing.  Report that as
-	 * FUSE_DLM_GRANT_UNRECORDED so callers neither fail an IO that
-	 * is actually covered nor keep re-requesting a grant that will
-	 * not become visible.  (rlock, if any, was already moved to READY
-	 * by fuse_get_dlm_lock_complete() while processing the reply.)
-	 */
-	if (err)
-		return FUSE_DLM_GRANT_UNRECORDED;
-
-	return 0;
 }
 
 /*

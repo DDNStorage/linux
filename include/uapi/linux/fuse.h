@@ -235,6 +235,11 @@
  *
  *  7.44
  *  - add FUSE_NOTIFY_INC_EPOCH
+ *  - add FUSE_QUOTA_LEASE and FUSE_QUOTA_ENABLED INIT flags and
+ *    FUSE_QUOTA_ADMIT (fuse-private)
+ *  - add flags and FUSE_DLM_LOCK_NO_ADMIT to fuse_dlm_lock_in; struct
+ *    fuse_quota_lease orders replies by tsd_seq and ug_seq (40 bytes),
+ *    add FUSE_QLEASE_NO_UG (fuse-private)
  */
 
 #ifndef _LINUX_FUSE_H
@@ -462,6 +467,12 @@ struct fuse_file_lock {
  *			 to register between 1 and nr-core io-uring queues
  * FUSE_SETATTR_WRITEBACK: kernel marks writeback-initiated SETATTR requests
  *			   with FATTR_WRITEBACK
+ * FUSE_QUOTA_LEASE: admit writeback-cache writes against quota leases;
+ *		      write lock replies carry struct fuse_quota_lease and
+ *		      FUSE_QUOTA_ADMIT admits or renews a lease
+ * FUSE_QUOTA_ENABLED: offered with FUSE_QUOTA_LEASE; in the reply, only
+ *			together with it, quota is enabled at INIT. Without
+ *			it the session is QUOTA OFF for its whole life.
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -511,6 +522,8 @@ struct fuse_file_lock {
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
 
 #define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
+#define FUSE_QUOTA_ENABLED	(1ULL << 55)
+#define FUSE_QUOTA_LEASE	(1ULL << 56)
 #define FUSE_SETATTR_WRITEBACK	(1ULL << 58)
 #define FUSE_URING_REDUCED_Q	(1ULL << 59)
 #define FUSE_INVAL_INODE_ENTRY  (1ULL << 60)
@@ -724,6 +737,7 @@ enum fuse_opcode {
 
 	/* Extented lookup operation */
 	FUSE_LOOKUPX		= 102,
+	FUSE_QUOTA_ADMIT	= 103,
 
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
@@ -1325,14 +1339,22 @@ enum fuse_dlm_lock_type {
  * @offset: offset into the file
  * @size: size of the locked region
  * @type: type of lock
+ * @flags: FUSE_DLM_LOCK_* request flags
  */
 struct fuse_dlm_lock_in {
 	uint64_t    fh;
 	uint64_t    start;
 	uint64_t    end;
 	uint32_t    type;
-	uint32_t    reserved;
+	uint32_t    flags;
 };
+
+/*
+ * A write lock request that admits no write (grant-ahead, a load fault in a
+ * shared-writable mapping): on a FUSE_QUOTA_LEASE connection the server
+ * looks up no owner and fetches no voucher, and answers an empty lease part.
+ */
+#define FUSE_DLM_LOCK_NO_ADMIT	(1 << 0)
 
 
 /**
@@ -1346,6 +1368,58 @@ struct fuse_dlm_lock_out {
 	uint64_t end;
 	uint64_t reserved;
 };
+
+/*
+ * Quota lease part of a write lock reply (40 bytes). The seqs order the
+ * replies for one lease: a reply is newer than the state the kernel holds
+ * when neither seq it used is older and at least one is newer.
+ */
+struct fuse_quota_lease {
+	uint64_t	lease_id;	/* 0: no lease, see flags and error */
+	uint64_t	tsd_seq;	/* mint GTX of the TSD voucher the part
+					 * was decided from */
+	uint64_t	ug_seq;		/* mint GTX of the UG voucher; unused
+					 * with FUSE_QLEASE_NO_UG */
+	int32_t		ttl_ms;		/* lease_id != 0: > 0 */
+	uint32_t	flags;		/* FUSE_QLEASE_* */
+	int32_t		error;		/* lease_id == 0 without QUOTA_OFF:
+					 * negative errno */
+	uint32_t	reserved;
+};
+
+#define FUSE_QLEASE_REJECTED	(1 << 0)
+/*
+ * Quota is off for the session: no lease. Reserved: redfsd sends it only to
+ * a session that started QUOTA OFF; the kernel accepts it and changes nothing.
+ */
+#define FUSE_QLEASE_QUOTA_OFF	(1 << 1)
+/*
+ * Decided without a UG voucher (a per-dataset lease, or a per-owner lease
+ * admitted on TSD alone): ug_seq is unused.
+ */
+#define FUSE_QLEASE_NO_UG	(1 << 2)
+
+/* 64 bytes: the lease part starts at offset 24 */
+struct fuse_dlm_lock_lease_out {
+	struct fuse_dlm_lock_out	lock;
+	struct fuse_quota_lease	lease;
+};
+
+/**
+ * struct fuse_quota_admit_in - FUSE_QUOTA_ADMIT request
+ * @flags:	FUSE_QADMIT_RENEW: renewal of an expired lease or a background
+ *		renewal, sent after starting writeback of the lease's linked
+ *		inodes; without it, a first admission of an inode whose write
+ *		grant is cached
+ * @reserved:	0
+ */
+struct fuse_quota_admit_in {
+	uint32_t	flags;
+	uint32_t	reserved;
+};
+
+/* The admit renews a lease; redfsd always refreshes the voucher */
+#define FUSE_QADMIT_RENEW	(1 << 0)
 
 /*
  * Compound request header

@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
+#include "fuse_qlease.h"
 #include "fuse_dev_i.h"
 #include "dev_uring_i.h"
 #include "fuse_trace.h"
@@ -254,6 +255,12 @@ static void fuse_evict_inode(struct inode *inode)
 		WARN_ON(!list_empty(&fi->queued_writes));
 		fuse_dlm_cache_release_locks(fi);
 	}
+	/*
+	 * Also for a bad regular inode: it may still be linked to a lease,
+	 * and the link must not outlive the inode.
+	 */
+	if (S_ISREG(inode->i_mode))
+		fuse_qlease_inode_evict(fi);
 }
 
 static int fuse_reconfigure(struct fs_context *fsc)
@@ -1674,6 +1681,7 @@ void fuse_conn_init(struct fuse_conn *fc, struct fuse_mount *fm,
 	fc->compound_open_getattr = enable_compound;
 
 	xa_init(&fc->dlm_retry_tasks);
+	fuse_qlease_conn_init(fc);
 	atomic64_set(&fc->attr_version, 1);
 	atomic64_set(&fc->evict_ctr, 1);
 	get_random_bytes(&fc->scramble_key, sizeof(fc->scramble_key));
@@ -1723,6 +1731,7 @@ void fuse_conn_put(struct fuse_conn *fc)
 		}
 		if (IS_ENABLED(CONFIG_FUSE_PASSTHROUGH))
 			fuse_backing_files_free(fc);
+		fuse_qlease_conn_destroy(fc);
 		xa_destroy(&fc->dlm_retry_tasks);
 		call_rcu(&fc->rcu, delayed_release);
 	}
@@ -2152,6 +2161,11 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
 				fc->expire_inode_entries = 1;
 			if (flags & FUSE_SETATTR_WRITEBACK)
 				fc->setattr_writeback = 1;
+			if ((flags & FUSE_QUOTA_LEASE) && fc->writeback_cache) {
+				fc->quota_lease = 1;
+				/* FUSE_QUOTA_ENABLED counts only with it */
+				fuse_qlease_conn_start(fc, flags & FUSE_QUOTA_ENABLED);
+			}
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
@@ -2206,7 +2220,8 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
 		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
 		FUSE_REQUEST_TIMEOUT | FUSE_INVAL_INODE_ENTRY |
 		FUSE_EXPIRE_INODE_ENTRY | FUSE_URING_REDUCED_Q |
-		FUSE_SETATTR_WRITEBACK;
+		FUSE_SETATTR_WRITEBACK | FUSE_QUOTA_LEASE |
+		FUSE_QUOTA_ENABLED;
 #ifdef CONFIG_FUSE_DAX
 	if (fm->fc->dax)
 		flags |= FUSE_MAP_ALIGNMENT;
@@ -2804,6 +2819,8 @@ void fuse_conn_destroy(struct fuse_mount *fm)
 
 	fuse_abort_conn(fc);
 	fuse_wait_aborted(fc);
+	/* before kill_*_super() evicts the inodes the lease work may hold */
+	fuse_qlease_conn_shutdown(fc);
 
 	if (!list_empty(&fc->entry)) {
 		mutex_lock(&fuse_mutex);

@@ -27,10 +27,12 @@
 #include <linux/rbtree.h>
 #include <linux/poll.h>
 #include <linux/workqueue.h>
+#include <linux/llist.h>
 #include <linux/kref.h>
 #include <linux/xattr.h>
 #include <linux/pid_namespace.h>
 #include <linux/refcount.h>
+#include <linux/hashtable.h>
 #include <linux/user_namespace.h>
 #include "fuse_dlm_cache.h"
 
@@ -274,6 +276,24 @@ struct fuse_inode {
 			 * No lock: WRITE_ONCE() and xchg() only.
 			 */
 			bool cached_read;
+
+			/*
+			 * Quota admission lease link, see fuse_qlease.c.
+			 * Written under fc->qlease_lock. qlease is RCU
+			 * protected: the write fast path reads it, and
+			 * qlease_uid/gid with READ_ONCE(), under
+			 * rcu_read_lock() only.
+			 */
+			struct fuse_qlease __rcu *qlease;
+			struct list_head qlease_node;
+			kuid_t qlease_uid;
+			kgid_t qlease_gid;
+			/*
+			 * Allocated by the first shared-writable mmap of a
+			 * quota enabled lease session (cmpxchg()), freed at
+			 * eviction; NULL until then. See fuse_qlease.h.
+			 */
+			struct fuse_qlease_mmap *qlease_mmap;
 		};
 
 		/* readdir cache (directory only) */
@@ -985,6 +1005,9 @@ struct fuse_conn {
 	/*  mark writeback-initiated SETATTR requests with FATTR_WRITEBACK */
 	unsigned setattr_writeback:1;
 
+	/** Quota admission leases negotiated (FUSE_QUOTA_LEASE) */
+	unsigned int quota_lease:1;
+
 	/*
 	 * The following bitfields are only for optimization purposes
 	 * and hence races in setting them will not cause malfunction
@@ -1232,6 +1255,30 @@ struct fuse_conn {
 	 * Temporary workaround for iomap write deadlock.
 	 */
 	struct xarray dlm_retry_tasks;
+
+	/**
+	 * Quota admission leases by lease_id (fuse_qlease.c). qlease_lock
+	 * protects the hash and the inode links only (fi->qlease,
+	 * qlease_node, qlease_uid/gid, lease->inodes); a lease's state has
+	 * its own lock, taken after this one. See fuse_qlease.h.
+	 */
+	spinlock_t qlease_lock;
+	DECLARE_HASHTABLE(qlease_hash, 6);
+
+	/**
+	 * Inode references a foreground renewal's flush took, dropped by
+	 * qlease_iput_work holding no lock (fuse_qlease_renew())
+	 */
+	struct llist_head qlease_iputs;
+	struct work_struct qlease_iput_work;
+
+	/**
+	 * Session quota state, valid with quota_lease: nonzero while the
+	 * session is QUOTA OFF and every admission step is skipped. Set
+	 * once from the INIT reply (FUSE_QUOTA_ENABLED) and constant after
+	 * that; a lease part never changes it. See fuse_qlease_quota_off().
+	 */
+	unsigned int qlease_quota_off;
 };
 
 /*
@@ -1338,6 +1385,12 @@ static inline void fuse_bump_size_gen(struct fuse_inode *fi)
 static inline u64 fuse_get_evict_ctr(struct fuse_conn *fc)
 {
 	return atomic64_read(&fc->evict_ctr);
+}
+
+/* The session is QUOTA OFF: writes, faults and page_mkwrite skip admission */
+static inline bool fuse_qlease_quota_off(struct fuse_conn *fc)
+{
+	return READ_ONCE(fc->qlease_quota_off);
 }
 
 static inline bool fuse_stale_inode(const struct inode *inode, int generation,
