@@ -306,12 +306,23 @@ bool fuse_dlm_write_grant_exists(struct fuse_inode *inode);
  * fuse_get_dlm_lock_complete() in fuse_dlm_cache.c); moved directly to
  * LOCKED instead when the already-held fast path applies (no round
  * trip).  Either way, the caller still promotes it the rest of the way
- * to LOCKED before touching the page cache.  Left at INIT on a hard
- * error, since the caller will not touch the page cache and releases it
- * directly.
+ * to LOCKED before touching the page cache.  On an error it is left
+ * INIT, READY or LOCKED (INIT for a failed request, READY or LOCKED for
+ * an admission error after a grant), and the caller releases it without
+ * touching the page cache.
+ *
+ * @admit: the grant check of a buffered write or of a store fault, which
+ * on a quota enabled FUSE_QUOTA_LEASE connection also checks the inode's
+ * quota lease there, and renews it or sends its first admission with the
+ * range lock in INIT (see fuse_get_dlm_lock() in fuse_dlm_cache.c). Such
+ * a request can also return -EDQUOT (the owner is over quota) or another
+ * admission error, with the grant possibly recorded. It does not return
+ * FUSE_QLEASE_RESTART: it checks the grant and the lease again itself.
+ * Grant-ahead, load faults and reads pass false; fuse_write_run_advance()
+ * requests no grant at all.
  */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		      size_t length, enum fuse_page_lock_mode mode,
-		      struct fuse_range_lock *rlock);
+		      struct fuse_range_lock *rlock, bool admit);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */
