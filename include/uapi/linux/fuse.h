@@ -235,6 +235,8 @@
  *
  *  7.44
  *  - add FUSE_NOTIFY_INC_EPOCH
+ *  - add FUSE_QUOTA_LEASE and FUSE_QUOTA_ENABLED INIT flags and
+ *    FUSE_QUOTA_ADMIT (fuse-private)
  */
 
 #ifndef _LINUX_FUSE_H
@@ -462,6 +464,12 @@ struct fuse_file_lock {
  *			 to register between 1 and nr-core io-uring queues
  * FUSE_SETATTR_WRITEBACK: kernel marks writeback-initiated SETATTR requests
  *			   with FATTR_WRITEBACK
+ * FUSE_QUOTA_LEASE: admit writeback-cache writes against quota leases;
+ *		      write lock replies carry struct fuse_quota_lease and
+ *		      FUSE_QUOTA_ADMIT admits or renews a lease
+ * FUSE_QUOTA_ENABLED: offered with FUSE_QUOTA_LEASE; in the reply, only
+ *			together with it, quota is enabled at INIT. Without
+ *			it the session is QUOTA OFF for its whole life.
  */
 #define FUSE_ASYNC_READ		(1 << 0)
 #define FUSE_POSIX_LOCKS	(1 << 1)
@@ -511,6 +519,8 @@ struct fuse_file_lock {
 #define FUSE_REQUEST_TIMEOUT	(1ULL << 42)
 
 #define FUSE_ALIGN_PG_ORDER	(1ULL << 50)
+#define FUSE_QUOTA_ENABLED	(1ULL << 55)
+#define FUSE_QUOTA_LEASE	(1ULL << 56)
 /* FUSE_DATASET_DEV: report a separate st_dev per dataset slot */
 #define FUSE_DATASET_DEV	(1ULL << 57)
 #define FUSE_SETATTR_WRITEBACK	(1ULL << 58)
@@ -736,6 +746,7 @@ enum fuse_opcode {
 
 	/* Extented lookup operation */
 	FUSE_LOOKUPX		= 102,
+	FUSE_QUOTA_ADMIT	= 103,
 
 	/* CUSE specific operations */
 	CUSE_INIT		= 4096,
@@ -1358,6 +1369,44 @@ struct fuse_dlm_lock_out {
 	uint64_t end;
 	uint64_t reserved;
 };
+
+struct fuse_quota_lease {
+	uint64_t	lease_id;	/* 0: no lease, see flags and error */
+	uint64_t	gen;		/* reply order: voucher install generation */
+	int32_t		ttl_ms;		/* lease_id != 0: > 0 */
+	uint32_t	flags;		/* FUSE_QLEASE_* */
+	int32_t		error;		/* lease_id == 0 without QUOTA_OFF:
+					 * negative errno */
+	uint32_t	reserved;
+};
+
+#define FUSE_QLEASE_REJECTED	(1 << 0)
+/*
+ * Quota is off for the session: no lease. Reserved: redfsd sends it only to
+ * a session that started QUOTA OFF; the kernel accepts it and changes nothing.
+ */
+#define FUSE_QLEASE_QUOTA_OFF	(1 << 1)
+
+struct fuse_dlm_lock_lease_out {
+	struct fuse_dlm_lock_out	lock;
+	struct fuse_quota_lease	lease;
+};
+
+/**
+ * struct fuse_quota_admit_in - FUSE_QUOTA_ADMIT request
+ * @flags:	FUSE_QADMIT_RENEW: renewal of an expired lease or a background
+ *		renewal, sent after starting writeback of the lease's linked
+ *		inodes; without it, a first admission of an inode whose write
+ *		grant is cached
+ * @reserved:	0
+ */
+struct fuse_quota_admit_in {
+	uint32_t	flags;
+	uint32_t	reserved;
+};
+
+/* The admit renews a lease; redfsd always refreshes the voucher */
+#define FUSE_QADMIT_RENEW	(1 << 0)
 
 /*
  * Compound request header
