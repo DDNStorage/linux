@@ -75,8 +75,20 @@ uint64_t fuse_dlm_covered_end(struct fuse_inode *inode, uint64_t start,
 bool fuse_dlm_lock_is_held(struct fuse_inode *inode, loff_t offset,
 			   size_t length, enum fuse_page_lock_mode mode);
 
-/* This is the interface to the filesystem */
+/*
+ * This is the interface to the filesystem
+ *
+ * @admit: the grant check of a buffered write or of a store fault, which
+ * on a quota enabled FUSE_QUOTA_LEASE connection also checks the inode's
+ * quota lease there, and renews it or sends its first admission (see
+ * fuse_get_dlm_lock() in fuse_dlm_cache.c). Such a request can also
+ * return -EDQUOT (the owner is over quota) or another admission error,
+ * with the grant possibly recorded. It does not return
+ * FUSE_QLEASE_RESTART: it checks the grant and the lease again itself.
+ * Load faults and reads pass false.
+ */
 int fuse_get_dlm_lock(struct file *file, loff_t offset,
-		      size_t length, enum fuse_page_lock_mode mode);
+		      size_t length, enum fuse_page_lock_mode mode,
+		      bool admit);
 
 #endif /* _FS_FUSE_DLM_CACHE_H */
