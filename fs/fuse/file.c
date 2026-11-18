@@ -8,6 +8,7 @@
 
 #include "fuse_i.h"
 #include "fuse_dlm_cache.h"
+#include "fuse_qlease.h"
 #include "fuse_trace.h"
 
 #include <linux/pagemap.h>
@@ -1852,7 +1853,7 @@ static ssize_t fuse_wb_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	 * right below.
 	 */
 	fuse_get_dlm_lock(file, iocb->ki_pos, count, FUSE_PAGE_LOCK_READ,
-			  &rlock);
+			  &rlock, false);
 
 	/*
 	 * Ensure the range lock is LOCKED before touching the page cache:
@@ -1946,7 +1947,7 @@ static ssize_t fuse_wb_cache_read_iter(struct kiocb *iocb, struct iov_iter *to)
 			if (!window)
 				break;
 			fuse_get_dlm_lock(file, iocb->ki_pos, remain,
-					  FUSE_PAGE_LOCK_READ, &rlock);
+					  FUSE_PAGE_LOCK_READ, &rlock, false);
 			err = fuse_range_lock_mark_locked(fi, &rlock);
 			if (err) {
 				res = err;
@@ -2490,6 +2491,12 @@ static void fuse_cache_wr_unlock(struct inode *inode, bool exclusive)
  * cache would be dirtied without DLM coverage - the caller must fail the
  * write instead.  A granted-but-unrecorded lock (positive return) is covered
  * cluster-wide; proceed regardless.
+ * This is the write's own grant check, so it admits the write: on a quota
+ * enabled quota_lease connection fuse_get_dlm_lock() checks the quota lease
+ * there and renews it or sends its first admission with @rlock in INIT and
+ * the inode lock held, and checks the grant and the lease again itself
+ * after each request. -EDQUOT (over quota) and any other admission error
+ * are passed through.
  *
  * @rlock: passed straight through to fuse_get_dlm_lock(), which may
  * leave it READY or LOCKED; the caller must not wait for the server
@@ -2499,8 +2506,10 @@ static int fuse_cache_wr_dlm_lock(struct file *file, loff_t pos, size_t len,
 				  struct fuse_range_lock *rlock)
 {
 	int err = fuse_get_dlm_lock(file, pos, len, FUSE_PAGE_LOCK_WRITE,
-				    rlock);
+				    rlock, true);
 
+	/* admit set: fuse_get_dlm_lock() checks again, never restarts */
+	WARN_ON_ONCE(err == FUSE_QLEASE_RESTART);
 	return err < 0 ? err : 0;
 }
 
@@ -2830,6 +2839,14 @@ static ssize_t fuse_wb_cache_write_iter(struct kiocb *iocb,
 		}
 	}
 
+	/*
+	 * Quota admission runs at the grant checks below (D10), in
+	 * fuse_get_dlm_lock(): a renewal or a first admission is sent there
+	 * with the range lock in INIT and the inode lock held, and the grant
+	 * and the lease are checked again after it.  All four DLM requests
+	 * below run before a byte is copied, so nothing is written yet when
+	 * one fails with -EDQUOT or another admission error.
+	 */
 	exclusive = fuse_cache_wr_exclusive_lock(iocb, writeback);
 
 	if (exclusive)
@@ -3700,7 +3717,9 @@ MODULE_PARM_DESC(dlm_grant_ahead,
  * aligned to the window.
  *
  * Only a hint: the write path still requests its own range under its own
- * range lock, which is what covers the data.  The range lock taken here
+ * range lock, which is what covers the data, and its own grant check admits
+ * the write against quota, so this one checks no lease (called before the
+ * inode lock).  The range lock taken here
  * covers the whole request, so an invalidate cannot pass the reply before
  * the grant is recorded.  It is only tried, never waited for: a hint is not
  * worth stalling the writer behind other IO or an invalidate draining
@@ -3760,7 +3779,7 @@ static void fuse_write_grant_ahead(struct file *out, loff_t pos, size_t len)
 	 */
 	if (fuse_range_lock_try_mark_locked(fi, &rlock))
 		fuse_get_dlm_lock(out, pos, end - pos, FUSE_PAGE_LOCK_WRITE,
-				  &rlock);
+				  &rlock, false);
 	fuse_range_lock_release(fi, &rlock);
 }
 
@@ -4623,6 +4642,7 @@ static vm_fault_t fuse_wb_page_mkwrite(struct vm_fault *vmf)
 	struct fuse_range_lock rlock;
 	loff_t pos = vmf->pgoff << PAGE_SHIFT;
 	bool held = false;
+	vm_fault_t ret;
 
 	fuse_cached_read_clear(inode);
 
@@ -4642,6 +4662,15 @@ static vm_fault_t fuse_wb_page_mkwrite(struct vm_fault *vmf)
 
 	if (!held)
 		return VM_FAULT_NOPAGE;
+
+	/*
+	 * Quota admission, without blocking either: a page whose lease is not
+	 * valid is unmapped and refaults through fuse_wb_filemap_fault(),
+	 * which admits with mmap_lock dropped.
+	 */
+	ret = fuse_qlease_page_mkwrite(inode, vmf->pgoff);
+	if (ret)
+		return ret;
 
 	fuse_cached_write_update_time(inode);
 	return fuse_page_mkwrite_finish(vmf);
@@ -4849,6 +4878,7 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 	enum fuse_page_lock_mode mode = FUSE_PAGE_LOCK_READ;
 	enum fuse_range_lock_mode range_mode = FUSE_RANGE_LOCK_READ;
 	vm_fault_t ret;
+	bool qlease = false;
 	int tries;
 	int err;
 
@@ -4856,6 +4886,13 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 	    (VM_SHARED | VM_MAYWRITE)) {
 		mode = FUSE_PAGE_LOCK_WRITE;
 		range_mode = FUSE_RANGE_LOCK_WRITE;
+		/*
+		 * Only a store takes a lease.  A load maps the page
+		 * read-only (writenotify), so its first store still
+		 * comes through fuse_wb_page_mkwrite(), which admits.
+		 */
+		qlease = fc->quota_lease && !fuse_qlease_quota_off(fc) &&
+			 (vmf->flags & FAULT_FLAG_WRITE);
 	}
 
 	/* Cleared again by a fill or a read lock request */
@@ -4873,9 +4910,12 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 	 * from issuing a synchronous READ with the range LOCKED:
 	 * nothing held once LOCKED may wait on the server (see the
 	 * blocking path below), so a missing folio falls through
-	 * to the slow path, which populates it under INIT.
+	 * to the slow path, which populates it under INIT.  So
+	 * does a WRITE fault without a valid quota lease: getting
+	 * one may wait for the server.
 	 */
-	if (fuse_range_lock_try_acquire_init(fi, &rlock, pos,
+	if ((!qlease || fuse_qlease_valid(fi)) &&
+	    fuse_range_lock_try_acquire_init(fi, &rlock, pos,
 					     pos + PAGE_SIZE - 1,
 					     range_mode)) {
 		if (fuse_range_lock_try_mark_locked(fi, &rlock) &&
@@ -4929,7 +4969,19 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 	if (!READ_ONCE(fc->connected))
 		return VM_FAULT_SIGBUS;
 
+	/*
+	 * Same reason for quota admission: an error found with
+	 * the fault lock dropped is recorded there (see
+	 * fuse_qlease_mark()) and turned into SIGBUS here, by
+	 * the retried fault.
+	 */
+	if (qlease && fuse_qlease_take_mark(fi))
+		return VM_FAULT_SIGBUS;
+
 	if (vmf->flags & FAULT_FLAG_ALLOW_RETRY) {
+		bool marked = false;
+		bool backoff = false;
+
 		if (vmf->flags & FAULT_FLAG_RETRY_NOWAIT)
 			return VM_FAULT_RETRY;
 
@@ -4945,17 +4997,41 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 			 * cannot be with the fault lock dropped:
 			 * the retried fault meets it again.  A
 			 * lost connection ends at the check above.
+			 * Under quota admission it is recorded
+			 * instead: a store fault admits at this
+			 * grant check (renewal with its flush, or
+			 * first admission, with the range lock in
+			 * INIT and only the file held), the result
+			 * may be the lease's -EDQUOT, and a failing
+			 * request would otherwise refault forever.
+			 * An error other than -EDQUOT, retried
+			 * until the mark is set, backs off below
+			 * rather than spin on the server.  A load
+			 * (!qlease) checks no lease: its grant is
+			 * all it takes.
 			 */
-			fuse_get_dlm_lock(file, bpos, blen, mode, &rlock);
+			err = fuse_get_dlm_lock(file, bpos, blen, mode, &rlock,
+						qlease);
+			if (qlease && err != -EINTR && err != -ERESTARTSYS) {
+				if (err >= 0) {
+					fuse_qlease_mark_clear(fi);
+				} else {
+					fuse_qlease_mark(fi, err);
+					marked = true;
+					backoff = err != -EDQUOT;
+				}
+			}
 			/*
 			 * Populate the folios too, or the retried
 			 * fault's fast path would refuse the grant
 			 * it just recorded (missing folio) and come
 			 * straight back here.  Read under INIT,
 			 * install under LOCKED; see the blocking
-			 * path below.
+			 * path below.  Not for a fault that will
+			 * end in SIGBUS.
 			 */
-			if (fuse_fault_needs_read(inode, vmf->pgoff)) {
+			if (!marked &&
+			    fuse_fault_needs_read(inode, vmf->pgoff)) {
 				struct folio *folios[FUSE_FAULT_BATCH_PAGES];
 				pgoff_t fbase;
 				int nr, i;
@@ -4976,6 +5052,9 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 			}
 			fuse_range_lock_release(fi, &rlock);
 		}
+		/* range lock released: only the file is held */
+		if (backoff)
+			msleep_interruptible(10);
 		fput(file);
 		return VM_FAULT_RETRY;
 	}
@@ -5006,6 +5085,12 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 	 * revoke notification (the server revokes the requester's
 	 * grant to serve the READ) cannot drop the folio before
 	 * the PTE is mapped; see fuse_fault_install_folio().
+	 *
+	 * Quota admission blocks in place too, at the grant check
+	 * with the range lock in INIT (a renewal waits for the
+	 * server and starts writeback, under mmap_lock, which
+	 * writeback does not take); any error, -EDQUOT included,
+	 * is SIGBUS.
 	 */
 	err = fuse_range_lock_acquire_init(fi, &rlock, bpos, bpos + blen - 1,
 					   range_mode);
@@ -5017,7 +5102,12 @@ static vm_fault_t fuse_wb_filemap_fault(struct vm_fault *vmf)
 		pgoff_t fbase;
 		int nr, i;
 
-		err = fuse_get_dlm_lock(file, bpos, blen, mode, &rlock);
+		/*
+		 * A store admits here; a load in a WRITE-mode VMA
+		 * checks no lease and takes the grant only.
+		 */
+		err = fuse_get_dlm_lock(file, bpos, blen, mode, &rlock,
+					qlease);
 		if (err < 0) {
 			fuse_range_lock_release(fi, &rlock);
 			return vmf_error(err);
@@ -5231,9 +5321,26 @@ static int fuse_wt_mmap(struct file *file, struct vm_area_struct *vma)
 static int fuse_wb_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	const struct vm_operations_struct *vm_ops = &fuse_wb_file_vm_ops;
+	struct inode *inode = file_inode(file);
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	int rc;
 
-	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE))
+	if ((vma->vm_flags & VM_SHARED) && (vma->vm_flags & VM_MAYWRITE)) {
 		vm_ops = &fuse_wb_dlm_vm_ops;
+
+		/*
+		 * A shared-writable mapping on a quota enabled lease session
+		 * needs the inode's mmap state for quota admission (the
+		 * fault's mark and page_mkwrite's unmap). Allocated before
+		 * any io mode changes in fuse_file_mmap_common(), so -ENOMEM
+		 * leaves nothing to undo; kept until eviction.
+		 */
+		if (fc->quota_lease && !fuse_qlease_quota_off(fc)) {
+			rc = fuse_qlease_mmap_prepare(get_fuse_inode(inode));
+			if (rc)
+				return rc;
+		}
+	}
 
 	return fuse_file_mmap_common(file, vma, vm_ops);
 }
@@ -6249,6 +6356,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	INIT_LIST_HEAD(&fi->queued_writes);
 	fuse_dlm_cache_init(fi);
 	fuse_range_lock_tree_init(fi);
+	fuse_qlease_inode_init(fi);
 	fi->writectr = 0;
 	fi->iocachectr = 0;
 	init_waitqueue_head(&fi->page_waitq);
