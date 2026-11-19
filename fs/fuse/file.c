@@ -1785,7 +1785,7 @@ static void fuse_send_write_pages(struct fuse_write_pages_req *wr,
 	int err;
 
 	for (i = 0; i < ap->num_pages; i++)
-		fuse_wait_on_page_writeback(file_inode(file), ap->pages[i]->index);
+		fuse_wait_on_page_writeback(file_inode(file), page_folio(ap->pages[i])->index);
 
 	fuse_write_args_fill(ia, ff, pos, wr->count);
 	ia->write.in.flags = fuse_write_flags(iocb);
@@ -1827,6 +1827,7 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 
 	do {
 		size_t tmp;
+		struct folio *folio;
 		struct page *page;
 		pgoff_t index = pos >> PAGE_SHIFT;
 		size_t bytes = min_t(size_t, PAGE_SIZE - offset,
@@ -1840,9 +1841,11 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 			break;
 
 		err = -ENOMEM;
-		page = grab_cache_page_write_begin(mapping, index);
-		if (!page)
+		folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
+					    mapping_gfp_mask(mapping));
+		if (IS_ERR(folio))
 			break;
+		page = &folio->page;
 
 		if (mapping_writably_mapped(mapping))
 			flush_dcache_page(page);
@@ -3850,7 +3853,8 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct page *page,
 		return true;
 
 	/* Discontinuity */
-	if (ap->pages[ap->num_pages - 1]->index + 1 != page->index)
+	if (page_folio(ap->pages[ap->num_pages - 1])->index + 1 !=
+	    page_folio(page)->index)
 		return true;
 
 	/* Need to grow the pages array?  If so, did the expansion fail? */
@@ -3858,12 +3862,12 @@ static bool fuse_writepage_need_send(struct fuse_conn *fc, struct page *page,
 		return true;
 
 	/* Reached alignment */
-	if (fc->alignment_pages && !(page->index % fc->alignment_pages)) {
+	if (fc->alignment_pages && !(page_folio(page)->index % fc->alignment_pages)) {
 		pgoff_t end_page_index = (wbc->range_end + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
 		/* we are at a point where we would write aligned
 		 * check if we potentially could reach the next alignment */
-		if (page->index + fc->alignment_pages > end_page_index)
+		if (page_folio(page)->index + fc->alignment_pages > end_page_index)
 			return true;
 
 		if (ap->num_pages + fc->alignment_pages > fc->max_pages)
@@ -3959,9 +3963,11 @@ out:
  * It's worthy to make sure that space is reserved on disk for the write,
  * but how to implement it without killing performance need more thinking.
  */
-static int fuse_write_begin(struct file *file, struct address_space *mapping,
-		loff_t pos, unsigned len, struct folio **foliop, void **fsdata)
+static int fuse_write_begin(const struct kiocb *iocb,
+		struct address_space *mapping, loff_t pos, unsigned len,
+		struct folio **foliop, void **fsdata)
 {
+	struct file *file = iocb->ki_filp;
 	pgoff_t index = pos >> PAGE_SHIFT;
 	struct fuse_conn *fc = get_fuse_conn(file_inode(file));
 	struct folio *folio;
@@ -4035,8 +4041,9 @@ error:
 	return err;
 }
 
-static int fuse_write_end(struct file *file, struct address_space *mapping,
-		loff_t pos, unsigned len, unsigned copied,
+static int fuse_write_end(const struct kiocb *iocb,
+		struct address_space *mapping, loff_t pos, unsigned len,
+		unsigned copied,
 		struct folio *folio, void *fsdata)
 {
 	struct inode *inode = folio->mapping->host;
@@ -4293,7 +4300,7 @@ static vm_fault_t fuse_page_mkwrite(struct vm_fault *vmf)
 		return VM_FAULT_NOPAGE;
 	}
 
-	fuse_wait_on_page_writeback(inode, page->index);
+	fuse_wait_on_page_writeback(inode, page_folio(page)->index);
 	return VM_FAULT_LOCKED;
 }
 
@@ -4370,7 +4377,7 @@ static int fuse_fault_read_private_folios(struct file *file,
 
 	for (i = 0; i < nr; i++) {
 		folios[i] = filemap_alloc_folio(
-			mapping_gfp_mask(inode->i_mapping), 0);
+			mapping_gfp_mask(inode->i_mapping), 0, NULL);
 		if (!folios[i])
 			break;
 		pages[i] = &folios[i]->page;

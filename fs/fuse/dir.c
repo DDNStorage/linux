@@ -576,29 +576,29 @@ static int get_security_context(struct dentry *entry, umode_t mode,
 {
 	struct fuse_secctx *fctx;
 	struct fuse_secctx_header *header;
-	void *ctx = NULL, *ptr;
-	u32 ctxlen, total_len = sizeof(*header);
+	struct lsm_context lsmctx = { };
+	void *ptr;
+	u32 total_len = sizeof(*header);
 	int err, nr_ctx = 0;
-	const char *name;
-	size_t namelen;
+	const char *name = NULL;
+	size_t namesize;
 
 	err = security_dentry_init_security(entry, mode, &entry->d_name,
-					    &name, &ctx, &ctxlen);
-	if (err) {
-		if (err != -EOPNOTSUPP)
-			goto out_err;
-		/* No LSM is supporting this security hook. Ignore error */
-		ctxlen = 0;
-		ctx = NULL;
-	}
+					    &name, &lsmctx);
 
-	if (ctxlen) {
+	/* If no LSM is supporting this security hook ignore error */
+	if (err && err != -EOPNOTSUPP)
+		goto out_err;
+
+	if (lsmctx.len) {
 		nr_ctx = 1;
-		namelen = strlen(name) + 1;
+		namesize = strlen(name) + 1;
 		err = -EIO;
-		if (WARN_ON(namelen > XATTR_NAME_MAX + 1 || ctxlen > S32_MAX))
+		if (WARN_ON(namesize > XATTR_NAME_MAX + 1 ||
+		    lsmctx.len > S32_MAX))
 			goto out_err;
-		total_len += FUSE_REC_ALIGN(sizeof(*fctx) + namelen + ctxlen);
+		total_len += FUSE_REC_ALIGN(sizeof(*fctx) + namesize +
+					    lsmctx.len);
 	}
 
 	err = -ENOMEM;
@@ -611,19 +611,20 @@ static int get_security_context(struct dentry *entry, umode_t mode,
 	ptr += sizeof(*header);
 	if (nr_ctx) {
 		fctx = ptr;
-		fctx->size = ctxlen;
+		fctx->size = lsmctx.len;
 		ptr += sizeof(*fctx);
 
-		strcpy(ptr, name);
-		ptr += namelen;
+		strscpy(ptr, name, namesize);
+		ptr += namesize;
 
-		memcpy(ptr, ctx, ctxlen);
+		memcpy(ptr, lsmctx.context, lsmctx.len);
 	}
 	ext->size = total_len;
 	ext->value = header;
 	err = 0;
 out_err:
-	kfree(ctx);
+	if (nr_ctx)
+		security_release_secctx(&lsmctx);
 	return err;
 }
 
@@ -893,9 +894,9 @@ no_open:
 /*
  * Code shared between mknod, mkdir, symlink and link
  */
-static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
-			    struct fuse_args *args, struct inode *dir,
-			    struct dentry *entry, umode_t mode)
+static struct dentry *create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+				       struct fuse_args *args, struct inode *dir,
+				       struct dentry *entry, umode_t mode)
 {
 	struct fuse_entry_out outarg;
 	struct inode *inode;
@@ -905,11 +906,11 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
 	u64 evict_ctr;
 
 	if (fuse_is_bad(dir))
-		return -EIO;
+		return ERR_PTR(-EIO);
 
 	forget = fuse_alloc_forget();
 	if (!forget)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
 	memset(&outarg, 0, sizeof(outarg));
 	args->nodeid = get_node_id(dir);
@@ -941,29 +942,43 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
 			  &outarg.attr, ATTR_TIMEOUT(&outarg), 0, evict_ctr);
 	if (!inode) {
 		fuse_queue_forget(fm->fc, forget, outarg.nodeid, 1);
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 	}
 	kfree(forget);
 
 	d_drop(entry);
 	d = d_splice_alias(inode, entry);
 	if (IS_ERR(d))
-		return PTR_ERR(d);
+		return d;
 
-	if (d) {
+	if (d)
 		fuse_change_entry_timeout(d, &outarg);
-		dput(d);
-	} else {
+	else
 		fuse_change_entry_timeout(entry, &outarg);
-	}
 	fuse_dir_changed(dir);
-	return 0;
+	return d;
 
  out_put_forget_req:
 	if (err == -EEXIST)
 		fuse_invalidate_entry(entry);
 	kfree(forget);
-	return err;
+	return ERR_PTR(err);
+}
+
+static int create_new_nondir(struct mnt_idmap *idmap, struct fuse_mount *fm,
+			     struct fuse_args *args, struct inode *dir,
+			     struct dentry *entry, umode_t mode)
+{
+	/*
+	 * Note that when creating anything other than a directory we
+	 * can be sure create_new_entry() will NOT return an alternate
+	 * dentry as d_splice_alias() only returns an alternate dentry
+	 * for directories.  So we don't need to check for that case
+	 * when passing back the result.
+	 */
+	WARN_ON_ONCE(S_ISDIR(mode));
+
+	return PTR_ERR(create_new_entry(idmap, fm, args, dir, entry, mode));
 }
 
 static int fuse_mknod(struct mnt_idmap *idmap, struct inode *dir,
@@ -986,7 +1001,7 @@ static int fuse_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = entry->d_name.len + 1;
 	args.in_args[1].value = entry->d_name.name;
-	return create_new_entry(idmap, fm, &args, dir, entry, mode);
+	return create_new_nondir(idmap, fm, &args, dir, entry, mode);
 }
 
 static int fuse_create(struct mnt_idmap *idmap, struct inode *dir,
@@ -1013,8 +1028,8 @@ static int fuse_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	return err;
 }
 
-static int fuse_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-		      struct dentry *entry, umode_t mode)
+static struct dentry *fuse_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				 struct dentry *entry, umode_t mode)
 {
 	struct fuse_mkdir_in inarg;
 	struct fuse_mount *fm = get_fuse_mount(dir);
@@ -1049,7 +1064,7 @@ static int fuse_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	args.in_args[1].value = entry->d_name.name;
 	args.in_args[2].size = len;
 	args.in_args[2].value = link;
-	return create_new_entry(idmap, fm, &args, dir, entry, S_IFLNK);
+	return create_new_nondir(idmap, fm, &args, dir, entry, S_IFLNK);
 }
 
 void fuse_update_ctime(struct inode *inode)
@@ -1232,7 +1247,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = newent->d_name.len + 1;
 	args.in_args[1].value = newent->d_name.name;
-	err = create_new_entry(&invalid_mnt_idmap, fm, &args, newdir, newent, inode->i_mode);
+	err = create_new_nondir(&invalid_mnt_idmap, fm, &args, newdir, newent, inode->i_mode);
 	if (err == -EINTR)
 		fuse_invalidate_attr(inode);
 
