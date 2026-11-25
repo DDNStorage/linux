@@ -160,7 +160,8 @@ TRACE_EVENT(fuse_qlease_reply,
 		__field(dev_t,		connection)
 		__field(uint64_t,	nodeid)
 		__field(uint64_t,	lease_id)
-		__field(uint64_t,	gen)
+		__field(uint64_t,	tsd_seq)
+		__field(uint64_t,	ug_seq)
 		__field(int32_t,	ttl_ms)
 		__field(uint32_t,	flags)
 		__field(int32_t,	error)
@@ -170,15 +171,17 @@ TRACE_EVENT(fuse_qlease_reply,
 		__entry->connection	= get_fuse_conn(inode)->dev;
 		__entry->nodeid		= get_fuse_inode(inode)->nodeid;
 		__entry->lease_id	= ql->lease_id;
-		__entry->gen		= ql->gen;
+		__entry->tsd_seq	= ql->tsd_seq;
+		__entry->ug_seq		= ql->ug_seq;
 		__entry->ttl_ms		= ql->ttl_ms;
 		__entry->flags		= ql->flags;
 		__entry->error		= ql->error;
 		__entry->wanted		= wanted;
 	),
-	TP_printk("connection %u nodeid %llu lease %llx gen %llu ttl %d flags %x error %d wanted %d",
+	TP_printk("connection %u nodeid %llu lease %llx tsd_seq %llu ug_seq %llu ttl %d flags %x error %d wanted %d",
 		  __entry->connection, __entry->nodeid, __entry->lease_id,
-		  __entry->gen, __entry->ttl_ms, __entry->flags,
+		  __entry->tsd_seq, __entry->ug_seq, __entry->ttl_ms,
+		  __entry->flags,
 		  __entry->error, __entry->wanted)
 );
 
@@ -188,20 +191,22 @@ DECLARE_EVENT_CLASS(fuse_qlease_class,
 	TP_STRUCT__entry(
 		__field(dev_t,		connection)
 		__field(uint64_t,	lease_id)
-		__field(uint64_t,	gen)
+		__field(uint64_t,	tsd_seq)
+		__field(uint64_t,	ug_seq)
 		__field(long,		left_ms)
 		__field(bool,		rejected)
 	),
 	TP_fast_assign(
 		__entry->connection	= l->fc->dev;
 		__entry->lease_id	= l->lease_id;
-		__entry->gen		= l->gen;
+		__entry->tsd_seq	= l->tsd_seq;
+		__entry->ug_seq		= l->ug_seq;
 		__entry->left_ms	= (long)(l->deadline - jiffies) * 1000 / HZ;
 		__entry->rejected	= l->rejected;
 	),
-	TP_printk("connection %u lease %llx gen %llu left %ld ms rejected %d",
-		  __entry->connection, __entry->lease_id, __entry->gen,
-		  __entry->left_ms, __entry->rejected)
+	TP_printk("connection %u lease %llx tsd_seq %llu ug_seq %llu left %ld ms rejected %d",
+		  __entry->connection, __entry->lease_id, __entry->tsd_seq,
+		  __entry->ug_seq, __entry->left_ms, __entry->rejected)
 );
 
 DEFINE_EVENT(fuse_qlease_class, fuse_qlease_install,
@@ -253,9 +258,10 @@ TRACE_EVENT(fuse_qlease_renew,
 );
 
 /*
- * A renewal's admit reply after the generation check: installed, or dropped
+ * A renewal's admit reply after the voucher seq check: installed, or dropped
  * because a newer reply was applied while the renewal was in flight. The
- * lease fields are the resulting state.
+ * reply_* fields and flags are the reply's; the other lease fields are the
+ * resulting state.
  */
 TRACE_EVENT(fuse_qlease_renew_reply,
 	TP_PROTO(struct fuse_qlease *l, const struct fuse_quota_lease *ql,
@@ -264,8 +270,10 @@ TRACE_EVENT(fuse_qlease_renew_reply,
 	TP_STRUCT__entry(
 		__field(dev_t,		connection)
 		__field(uint64_t,	lease_id)
-		__field(uint64_t,	reply_gen)
-		__field(uint64_t,	gen)
+		__field(uint64_t,	reply_tsd_seq)
+		__field(uint64_t,	reply_ug_seq)
+		__field(uint64_t,	tsd_seq)
+		__field(uint64_t,	ug_seq)
 		__field(uint32_t,	flags)
 		__field(long,		left_ms)
 		__field(bool,		rejected)
@@ -274,17 +282,20 @@ TRACE_EVENT(fuse_qlease_renew_reply,
 	TP_fast_assign(
 		__entry->connection	= l->fc->dev;
 		__entry->lease_id	= l->lease_id;
-		__entry->reply_gen	= ql->gen;
-		__entry->gen		= l->gen;
+		__entry->reply_tsd_seq	= ql->tsd_seq;
+		__entry->reply_ug_seq	= ql->ug_seq;
+		__entry->tsd_seq	= l->tsd_seq;
+		__entry->ug_seq		= l->ug_seq;
 		__entry->flags		= ql->flags;
 		__entry->left_ms	= (long)(l->deadline - jiffies) * 1000 / HZ;
 		__entry->rejected	= l->rejected;
 		__entry->installed	= installed;
 	),
-	TP_printk("connection %u lease %llx reply gen %llu flags %x installed %d gen %llu left %ld ms rejected %d",
-		  __entry->connection, __entry->lease_id, __entry->reply_gen,
-		  __entry->flags, __entry->installed, __entry->gen,
-		  __entry->left_ms, __entry->rejected)
+	TP_printk("connection %u lease %llx reply tsd_seq %llu ug_seq %llu flags %x installed %d tsd_seq %llu ug_seq %llu left %ld ms rejected %d",
+		  __entry->connection, __entry->lease_id,
+		  __entry->reply_tsd_seq, __entry->reply_ug_seq,
+		  __entry->flags, __entry->installed, __entry->tsd_seq,
+		  __entry->ug_seq, __entry->left_ms, __entry->rejected)
 );
 
 /* The session quota state, fired once from the INIT reply */

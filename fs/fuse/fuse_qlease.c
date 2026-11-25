@@ -18,6 +18,16 @@ module_param(qlease_reject_hold_ms, uint, 0644);
 MODULE_PARM_DESC(qlease_reject_hold_ms,
 		 "Time a rejected quota lease fails writes locally (ms)");
 
+/*
+ * redfsd gives a sys voucher ttl_ms INT32_MAX (~24.8 days). The server's
+ * longest real voucher TTL is 100 s, so the 120 s cap only clips that case,
+ * and a lease is renewed at least every minute.
+ */
+static unsigned int qlease_max_ttl_ms = 120000;
+module_param(qlease_max_ttl_ms, uint, 0644);
+MODULE_PARM_DESC(qlease_max_ttl_ms,
+		 "Longest TTL a quota lease is installed with (ms); caps a server TTL");
+
 unsigned int fuse_qlease_mmap_retry_ms = 5000;
 module_param_named(qlease_mmap_retry_ms, fuse_qlease_mmap_retry_ms, uint,
 		   0644);
@@ -42,9 +52,9 @@ struct fuse_qlease_iputs {
 void fuse_qlease_conn_init(struct fuse_conn *fc)
 {
 	/* wire layouts shared with redfsd (src/fuse/fuse.hpp) */
-	BUILD_BUG_ON(sizeof(struct fuse_quota_lease) != 32);
+	BUILD_BUG_ON(sizeof(struct fuse_quota_lease) != 40);
 	BUILD_BUG_ON(sizeof(struct fuse_quota_admit_in) != 8);
-	BUILD_BUG_ON(sizeof(struct fuse_dlm_lock_lease_out) != 56);
+	BUILD_BUG_ON(sizeof(struct fuse_dlm_lock_lease_out) != 64);
 	BUILD_BUG_ON(offsetof(struct fuse_dlm_lock_lease_out, lease) != 24);
 
 	spin_lock_init(&fc->qlease_lock);
@@ -466,6 +476,54 @@ bool fuse_qlease_valid(struct fuse_inode *fi)
 }
 
 /*
+ * The TTL a lease part is installed with: the server's TTL capped at
+ * qlease_max_ttl_ms. redfsd gives a sys voucher ttl_ms INT32_MAX (~24.8
+ * days); the server's longest real voucher TTL is 100 s, so the 120 s
+ * default only clips that case, and a lease is renewed at least every
+ * minute.
+ */
+static unsigned long fuse_qlease_ttl(const struct fuse_quota_lease *ql)
+{
+	u32 cap = READ_ONCE(qlease_max_ttl_ms);
+
+	return msecs_to_jiffies(min_t(u32, ql->ttl_ms > 0 ? ql->ttl_ms : 0,
+				      cap));
+}
+
+/*
+ * Whether lease part @ql is newer than the state @l holds. A reply is newer
+ * when neither voucher seq it used is older and at least one is newer. A
+ * reply newer in one seq and older in the other was decided from vouchers
+ * of different ages (two sthreads racing) and is not applied over a valid
+ * lease: applying a stale "valid" would drop a correct rejection, and a
+ * stale REJECTED would fail an owner under quota. The next renewal settles
+ * it. ug_seq counts only when the reply used a UG voucher.
+ */
+static bool fuse_qlease_reply_newer(const struct fuse_qlease *l,
+				    const struct fuse_quota_lease *ql)
+{
+	bool tsd_older = ql->tsd_seq < l->tsd_seq;
+	bool tsd_newer = ql->tsd_seq > l->tsd_seq;
+	bool ug_used = !(ql->flags & FUSE_QLEASE_NO_UG);
+	bool ug_older = ug_used && ql->ug_seq < l->ug_seq;
+	bool ug_newer = ug_used && ql->ug_seq > l->ug_seq;
+
+	return !tsd_older && !ug_older && (tsd_newer || ug_newer);
+}
+
+/*
+ * Raise the voucher seqs @l holds to those of @ql; never move one back.
+ * ug_seq is raised only when the reply used a UG voucher.
+ */
+static void fuse_qlease_raise_seqs(struct fuse_qlease *l,
+				   const struct fuse_quota_lease *ql)
+{
+	l->tsd_seq = max(l->tsd_seq, ql->tsd_seq);
+	if (!(ql->flags & FUSE_QLEASE_NO_UG))
+		l->ug_seq = max(l->ug_seq, ql->ug_seq);
+}
+
+/*
  * Install the state of lease part @ql in @l, whatever @l holds. Callers
  * order replies first: a new lease, fuse_qlease_reject_applies() for a
  * REJECTED part, and fuse_qlease_apply_renewal() for a renewal's reply.
@@ -474,12 +532,12 @@ bool fuse_qlease_valid(struct fuse_inode *fi)
 static void fuse_qlease_set_reply(struct fuse_qlease *l,
 				   const struct fuse_quota_lease *ql)
 {
-	unsigned long ttl = msecs_to_jiffies(ql->ttl_ms > 0 ? ql->ttl_ms : 0);
+	unsigned long ttl = fuse_qlease_ttl(ql);
 
 	lockdep_assert_held(&l->lock);
 	write_seqcount_begin(&l->seq);
-	/* Never move the generation backwards */
-	l->gen = max(l->gen, ql->gen);
+	/* Never move a voucher seq backwards */
+	fuse_qlease_raise_seqs(l, ql);
 	if (ql->flags & FUSE_QLEASE_REJECTED) {
 		l->rejected = true;
 		l->reject_until = jiffies +
@@ -515,8 +573,9 @@ static int fuse_qlease_reply_error(int32_t error)
 }
 
 /*
- * Whether a REJECTED lease part may be applied to @l. A rejection older
- * than the reply that last renewed a valid lease is stale: a lock reply
+ * Whether a REJECTED lease part may be applied to @l. A rejection that is
+ * not newer (fuse_qlease_reply_newer()) than the reply that last renewed a
+ * valid lease is stale, or decided from vouchers of mixed ages: a lock reply
  * that was in flight across a renewal must not reject the renewed lease,
  * and a renewal's reply must not reject a lease that a newer lock reply
  * extended.
@@ -525,7 +584,8 @@ static bool fuse_qlease_reject_applies(struct fuse_qlease *l,
 					const struct fuse_quota_lease *ql)
 {
 	lockdep_assert_held(&l->lock);
-	return ql->gen > l->gen || l->rejected || fuse_qlease_expired(l);
+	return fuse_qlease_reply_newer(l, ql) || l->rejected ||
+	       fuse_qlease_expired(l);
 }
 
 /*
@@ -657,12 +717,11 @@ int fuse_qlease_apply(struct inode *inode, const struct fuse_quota_lease *ql,
 		if (fuse_qlease_reject_applies(l, ql))
 			fuse_qlease_set_reply(l, ql);
 	} else if (!l->rejected && !fuse_qlease_expired(l) &&
-		   ql->gen > l->gen) {
+		   fuse_qlease_reply_newer(l, ql)) {
 		/* Extend a valid lease; never revive, never re-arm (D5) */
 		write_seqcount_begin(&l->seq);
-		l->gen = ql->gen;
-		l->deadline = jiffies +
-			      msecs_to_jiffies(ql->ttl_ms > 0 ? ql->ttl_ms : 0);
+		fuse_qlease_raise_seqs(l, ql);
+		l->deadline = jiffies + fuse_qlease_ttl(ql);
 		write_seqcount_end(&l->seq);
 		trace_fuse_qlease_extend(l);
 	}
@@ -875,9 +934,10 @@ out:
  *
  * A REJECTED part is applied only when fuse_qlease_reject_applies(): it
  * never rejects a lease that a newer reply renewed. A granted part installs
- * its deadline and renew_at when it is newer than the installed state, or
- * when the lease is not valid (expired, or rejected past its hold time):
- * that revives the lease, which only a renewal may do.
+ * its deadline and renew_at when it is newer than the installed state
+ * (fuse_qlease_reply_newer()), or when the lease is not valid (expired, or
+ * rejected past its hold time): that revives the lease, which only a
+ * renewal may do.
  *
  * Otherwise the newer state is kept: a newer rejection within its hold time
  * stays, and a valid lease keeps the deadline a newer lock reply gave it.
@@ -896,7 +956,7 @@ static void fuse_qlease_apply_renewal(struct fuse_qlease *l,
 	if (ql->flags & FUSE_QLEASE_REJECTED)
 		install = fuse_qlease_reject_applies(l, ql);
 	else
-		install = ql->gen > l->gen ||
+		install = fuse_qlease_reply_newer(l, ql) ||
 			  ((l->rejected || fuse_qlease_expired(l)) &&
 			   !fuse_qlease_rejected_now(l));
 	if (install) {
@@ -916,12 +976,14 @@ static void fuse_qlease_apply_renewal(struct fuse_qlease *l,
  * FUSE_QLEASE_WAITED; a background caller returns 0 and leaves it to the
  * renewer.
  *
- * The reply is applied by fuse_qlease_apply_renewal(), under the generation
- * rules of a lock reply: a reply older than one applied while the renewal
- * was in flight neither moves the deadline back nor rejects a valid lease.
+ * The reply is applied by fuse_qlease_apply_renewal(), under the voucher
+ * seq ordering of a lock reply (fuse_qlease_reply_newer()): a reply that is
+ * not newer than one applied while the renewal was in flight neither moves
+ * the deadline back nor rejects a valid lease.
  * The work is armed, and the result chosen, from the resulting lease state:
  * renew_at for a valid lease, reject_until for a rejected one. A -EDQUOT
- * request error carries no generation and always moves the lease to REJECTED.
+ * request error carries no voucher seqs and always moves the lease to
+ * REJECTED.
  *
  * Returns 0 (the lease is valid after the reply, or the reply carried
  * QUOTA_OFF and the lease was left unchanged and unarmed),
@@ -1012,7 +1074,7 @@ int fuse_qlease_renew(struct fuse_qlease *l, struct inode *via,
 		}
 	} else if (err == -EDQUOT) {
 		/*
-		 * No lease part, so no generation to order it by. It answers
+		 * No lease part, so no voucher seqs to order it by. It answers
 		 * the newest request this renewer sent, after a voucher
 		 * refresh, and a rejection only shortens admission: apply it.
 		 */
@@ -1282,6 +1344,57 @@ bool fuse_qlease_take_mark(struct fuse_inode *fi)
 }
 
 /*
+ * One-shot admission token, the success twin of the error mark. A fault
+ * that admitted with mmap_lock dropped returns VM_FAULT_RETRY, and the
+ * retried fault and its page_mkwrite require a valid lease again. If the
+ * lease went invalid in between (a short TTL lapsed, or a reserved
+ * QUOTA_OFF reply that changes no lease), they would admit again, with no
+ * bound on the loop. So each admission lets one store through even if the
+ * lease lapsed before the refault. The token is per inode and expires after
+ * a second, like a mark, so it over-admits by at most one TTL, which the
+ * design already bounds. No mmap state means no token.
+ */
+void fuse_qlease_mark_admitted(struct fuse_inode *fi)
+{
+	struct fuse_qlease_mmap *m = fuse_qlease_mmap(fi);
+
+	if (!m)
+		return;
+	/* pairs with the xchg() in fuse_qlease_take_admitted() */
+	WRITE_ONCE(m->admitted_at, jiffies ?: 1);
+}
+
+/* Whether @at is a token recorded no longer than a second ago */
+static bool fuse_qlease_admitted_fresh(unsigned long at)
+{
+	return at && !time_after(jiffies, at + HZ);
+}
+
+/*
+ * Whether a fresh admission token is pending, without taking it: the fault
+ * fast path, under mmap_lock, lets the retried fault map the page, and
+ * page_mkwrite takes the token for the store.
+ */
+bool fuse_qlease_admitted_recent(struct fuse_inode *fi)
+{
+	struct fuse_qlease_mmap *m = fuse_qlease_mmap(fi);
+
+	return m && fuse_qlease_admitted_fresh(READ_ONCE(m->admitted_at));
+}
+
+/* Take the admission token: true for one store when it was fresh */
+static bool fuse_qlease_take_admitted(struct fuse_inode *fi)
+{
+	struct fuse_qlease_mmap *m = fuse_qlease_mmap(fi);
+	unsigned long at;
+
+	if (!m || !READ_ONCE(m->admitted_at))
+		return false;
+	at = xchg(&m->admitted_at, 0);	/* full barrier */
+	return fuse_qlease_admitted_fresh(at);
+}
+
+/*
  * The writeback-cache page_mkwrite, under mmap_lock (or the per-VMA lock),
  * after the WRITE grant was verified, with the folio not locked yet. Never
  * sends and takes no lease lock: with a valid lease the page may be dirtied;
@@ -1301,7 +1414,12 @@ vm_fault_t fuse_qlease_page_mkwrite(struct inode *inode, pgoff_t index)
 	if (fuse_qlease_quota_off(fc))
 		return 0;
 
-	if (fuse_qlease_valid_use(fi, true)) {
+	/*
+	 * A valid lease, or the token of the admission that sent this store
+	 * back through the fault (fuse_qlease_mark_admitted()): one store
+	 * goes through even if the lease lapsed since.
+	 */
+	if (fuse_qlease_valid_use(fi, true) || fuse_qlease_take_admitted(fi)) {
 		fuse_qlease_mark_clear(fi);
 		return 0;
 	}
