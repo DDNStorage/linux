@@ -52,8 +52,9 @@ enum fuse_qlease_sent {
  * fc->qlease_lock protects the hash (hnode) and the inode links: fi->qlease,
  * fi->qlease_node, fi->qlease_uid/gid and l->inodes. Nothing else.
  *
- * l->lock protects the lease state: gen, deadline, reject_until, renew_at,
- * rejected, renewing, dying, the reset of used, and the arming of the work.
+ * l->lock protects the lease state: tsd_seq, ug_seq, deadline, reject_until,
+ * renew_at, rejected, renewing, dying, the reset of used, and the arming of
+ * the work.
  * Every change of deadline, reject_until or rejected is made in a
  * write_seqcount_begin(&l->seq) section under l->lock, so the write fast
  * path (fuse_qlease_check(), fuse_qlease_valid()) reads them with a
@@ -78,7 +79,8 @@ struct fuse_qlease {
 	u64			lease_id;	/* constant */
 	spinlock_t		lock;
 	seqcount_spinlock_t	seq;		/* deadline, rejected, ... */
-	u64			gen;
+	u64			tsd_seq;	/* newest TSD voucher seq applied */
+	u64			ug_seq;		/* newest UG voucher seq applied */
 	unsigned long		deadline;	/* jiffies */
 	unsigned long		reject_until;	/* jiffies, valid if rejected */
 	unsigned long		renew_at;	/* jiffies, half TTL */
@@ -107,6 +109,8 @@ struct fuse_qlease_mmap {
 	int			err;
 	unsigned long		err_at;		/* jiffies */
 	unsigned long		err_since;
+	/* one-shot admission token, see fuse_qlease_mark_admitted() */
+	unsigned long		admitted_at;	/* jiffies, 0: none */
 	/* unmap range, empty if first > last; lock is a leaf lock */
 	spinlock_t		lock;
 	pgoff_t			unmap_first;
@@ -138,5 +142,7 @@ vm_fault_t fuse_qlease_page_mkwrite(struct inode *inode, pgoff_t index);
 void fuse_qlease_mark(struct fuse_inode *fi, int err);
 void fuse_qlease_mark_clear(struct fuse_inode *fi);
 bool fuse_qlease_take_mark(struct fuse_inode *fi);
+void fuse_qlease_mark_admitted(struct fuse_inode *fi);
+bool fuse_qlease_admitted_recent(struct fuse_inode *fi);
 
 #endif /* _FS_FUSE_QLEASE_H */
