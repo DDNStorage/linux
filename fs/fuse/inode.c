@@ -57,7 +57,7 @@ MODULE_PARM_DESC(enable_notify_dio,
  * the server, so a GETATTR goes out at most this long after the lock.
  * 0 leaves the server's timeout alone.
  */
-static unsigned int __read_mostly dlm_attr_timeout = 30;
+static unsigned int __read_mostly dlm_attr_timeout;
 module_param(dlm_attr_timeout, uint, 0644);
 MODULE_PARM_DESC(dlm_attr_timeout,
 		 "Seconds until the attributes of an inode a DLM lock was taken on are fetched again (0 = server's timeout)");
