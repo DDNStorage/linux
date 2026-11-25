@@ -4573,9 +4573,14 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 		 * blocking path below), so a missing folio falls through
 		 * to the slow path, which populates it under INIT.  So
 		 * does a WRITE fault without a valid quota lease: getting
-		 * one may wait for the server.
+		 * one may wait for the server.  The token of an admission
+		 * that just sent this fault back with VM_FAULT_RETRY
+		 * stands in for the lease (fuse_qlease_mark_admitted()),
+		 * or a lease that lapsed before the refault would admit
+		 * again, with no bound on the loop.
 		 */
-		if ((!qlease || fuse_qlease_valid(fi)) &&
+		if ((!qlease || fuse_qlease_valid(fi) ||
+		     fuse_qlease_admitted_recent(fi)) &&
 		    fuse_range_lock_try_acquire_init(fi, &rlock, pos,
 						     pos + PAGE_SIZE - 1,
 						     range_mode)) {
@@ -4677,6 +4682,7 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 				    err != -ERESTARTSYS) {
 					if (err >= 0 || err == -ENOSYS) {
 						fuse_qlease_mark_clear(fi);
+						fuse_qlease_mark_admitted(fi);
 					} else {
 						fuse_qlease_mark(fi, err);
 						marked = true;
@@ -4776,6 +4782,12 @@ static vm_fault_t fuse_filemap_fault(struct vm_fault *vmf)
 				fuse_range_lock_release(fi, &rlock);
 				return vmf_error(err);
 			}
+			/*
+			 * Admitted: page_mkwrite lets this store through
+			 * even if the lease lapses before it runs.
+			 */
+			if (qlease)
+				fuse_qlease_mark_admitted(fi);
 			err = fuse_range_lock_mark_locked(fi, &rlock);
 			if (err) {
 				fuse_range_lock_release(fi, &rlock);
