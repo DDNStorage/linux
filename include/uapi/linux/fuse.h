@@ -242,6 +242,9 @@
  *  - add FUSE_NOTIFY_PRUNE
  *  - add FUSE_QUOTA_LEASE and FUSE_QUOTA_ENABLED INIT flags and
  *    FUSE_QUOTA_ADMIT (fuse-private)
+ *  - add flags and FUSE_DLM_LOCK_NO_ADMIT to fuse_dlm_lock_in; struct
+ *    fuse_quota_lease orders replies by tsd_seq and ug_seq (40 bytes),
+ *    add FUSE_QLEASE_NO_UG (fuse-private)
  */
 
 #ifndef _LINUX_FUSE_H
@@ -1364,14 +1367,22 @@ enum fuse_dlm_lock_type {
  * @offset: offset into the file
  * @size: size of the locked region
  * @type: type of lock
+ * @flags: FUSE_DLM_LOCK_* request flags
  */
 struct fuse_dlm_lock_in {
 	uint64_t    fh;
 	uint64_t    start;
 	uint64_t    end;
 	uint32_t    type;
-	uint32_t    reserved;
+	uint32_t    flags;
 };
+
+/*
+ * A write lock request that admits no write (grant-ahead, a load fault in a
+ * shared-writable mapping): on a FUSE_QUOTA_LEASE connection the server
+ * looks up no owner and fetches no voucher, and answers an empty lease part.
+ */
+#define FUSE_DLM_LOCK_NO_ADMIT	(1 << 0)
 
 
 /**
@@ -1386,9 +1397,17 @@ struct fuse_dlm_lock_out {
 	uint64_t reserved;
 };
 
+/*
+ * Quota lease part of a write lock reply (40 bytes). The seqs order the
+ * replies for one lease: a reply is newer than the state the kernel holds
+ * when neither seq it used is older and at least one is newer.
+ */
 struct fuse_quota_lease {
 	uint64_t	lease_id;	/* 0: no lease, see flags and error */
-	uint64_t	gen;		/* reply order: voucher install generation */
+	uint64_t	tsd_seq;	/* mint GTX of the TSD voucher the part
+					 * was decided from */
+	uint64_t	ug_seq;		/* mint GTX of the UG voucher; unused
+					 * with FUSE_QLEASE_NO_UG */
 	int32_t		ttl_ms;		/* lease_id != 0: > 0 */
 	uint32_t	flags;		/* FUSE_QLEASE_* */
 	int32_t		error;		/* lease_id == 0 without QUOTA_OFF:
@@ -1402,7 +1421,13 @@ struct fuse_quota_lease {
  * a session that started QUOTA OFF; the kernel accepts it and changes nothing.
  */
 #define FUSE_QLEASE_QUOTA_OFF	(1 << 1)
+/*
+ * Decided without a UG voucher (a per-dataset lease, or a per-owner lease
+ * admitted on TSD alone): ug_seq is unused.
+ */
+#define FUSE_QLEASE_NO_UG	(1 << 2)
 
+/* 64 bytes: the lease part starts at offset 24 */
 struct fuse_dlm_lock_lease_out {
 	struct fuse_dlm_lock_out	lock;
 	struct fuse_quota_lease	lease;

@@ -746,9 +746,13 @@ static void fuse_get_dlm_lock_complete(struct fuse_mount *fm,
  * @admit:  the caller admits a write: the grant check of a buffered write
  *	in fuse_wb_cache_write_iter() or of a store fault in
  *	fuse_wb_filemap_fault(). Every other caller takes a grant only and
- *	passes false: grant-ahead, a load fault and reads. The lease part of
- *	its write lock reply is still applied, for later writes, but its
- *	result is ignored. fuse_write_run_advance() requests nothing.
+ *	passes false: grant-ahead, a load fault and reads. On a quota_lease
+ *	connection its write lock request carries FUSE_DLM_LOCK_NO_ADMIT,
+ *	so redfsd skips the owner lookup and the voucher fetch and answers
+ *	an empty lease part. Whatever lease part comes back is still
+ *	applied, but its result is ignored (fuse_qlease_apply() returns 0
+ *	for a part without a lease that was not wanted).
+ *	fuse_write_run_advance() requests nothing.
  *
  * With @admit, a WRITE request on a quota enabled session checks the
  * inode's quota lease at the grant check, with @rlock LOCKED (D10):
@@ -942,6 +946,8 @@ int fuse_get_dlm_lock(struct file *file, loff_t offset,
 		inarg.end = (offset + length - 1) | (PAGE_SIZE - 1);
 		inarg.type = (mode == FUSE_PAGE_LOCK_WRITE) ?
 			FUSE_DLM_LOCK_WRITE : FUSE_DLM_LOCK_READ;
+		/* A lease write request that admits nothing: no voucher */
+		inarg.flags = (lease && !admit) ? FUSE_DLM_LOCK_NO_ADMIT : 0;
 
 		args->opcode = FUSE_DLM_WB_LOCK;
 		args->nodeid = get_node_id(inode);
